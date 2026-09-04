@@ -1,0 +1,23 @@
+[package]
+name = "crypto"
+description = "Cryptomator command line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "crypto"
+path = "src/main.rs"
+
+[dependencies]
+cryptomator-core = { path = "../cryptomator-core" }
+cryptomator-app = { path = "../cryptomator-app" }
+cryptomator-mount = { path = "../cryptomator-mount" }
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true

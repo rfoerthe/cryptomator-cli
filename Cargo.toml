@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cryptomator-core",
+    "crates/cryptomator-app",
+    "crates/cryptomator-mount",
+    "crates/crypto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/rfoerthe/cryptomator-cli"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aes-siv = "0.8"
+aes-gcm = "0.11"
+aes = "0.9"
+ctr = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+scrypt = "0.12"
+aes-kw = "0.3"
+data-encoding = "2.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1.9", features = ["derive"] }
+getrandom = "0.4"
+crc32fast = "1.5"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+fuser = { version = "0.18", default-features = false, features = ["macos-no-mount"] }
+libloading = "0.9"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

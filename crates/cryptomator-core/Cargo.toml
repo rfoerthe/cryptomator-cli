@@ -1,0 +1,30 @@
+[package]
+name = "cryptomator-core"
+description = "Cryptomator vault format 8 (port of cryptolib/cryptofs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes-siv.workspace = true
+aes-gcm.workspace = true
+aes.workspace = true
+ctr.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+scrypt.workspace = true
+aes-kw.workspace = true
+data-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "cryptomator-mount"
+description = "Mount services (FUSE, WebDAV) for the crypto CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser", "dep:libloading"]
+
+[dependencies]
+cryptomator-core = { path = "../cryptomator-core" }
+fuser = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }

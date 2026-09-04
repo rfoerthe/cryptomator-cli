@@ -1,0 +1,14 @@
+[package]
+name = "cryptomator-app"
+description = "Settings, keychain, daemon and vault registry for the crypto CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cryptomator-core = { path = "../cryptomator-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
