@@ -42,7 +42,6 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// The io helpers not yet used are consumed by the modules added in later tasks.
 mod io_errors {
     use super::*;
 
@@ -70,7 +69,6 @@ mod io_errors {
             format!("{path}: is a directory"),
         )
     }
-    #[allow(dead_code)]
     pub(crate) fn directory_not_empty(path: impl Display) -> io::Error {
         io::Error::new(
             io::ErrorKind::DirectoryNotEmpty,
@@ -107,7 +105,6 @@ mod io_errors {
     }
 }
 
-#[allow(unused_imports)]
 pub(crate) use io_errors::{
     already_exists, directory_not_empty, fs_loop, invalid_data, invalid_input, is_a_directory,
     name_too_long, not_a_directory, not_a_link, not_found, read_only_fs,

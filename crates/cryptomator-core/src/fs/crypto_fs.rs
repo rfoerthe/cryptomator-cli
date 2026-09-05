@@ -1,7 +1,7 @@
 //! `CryptoFileSystemImpl`: the cleartext view of a vault. Every method takes `&self`; the caches
 //! and open files are protected by mutexes so the same instance can serve a FUSE session.
 use super::attrs::{attributes_of, FileAttributes};
-use super::ciphertext_path::CiphertextFileType;
+use super::ciphertext_path::{CiphertextFilePath, CiphertextFileType};
 use super::dir_id::{write_dir_id_backup, DirIdLoader};
 use super::dir_stream::{DirEntry, DirectoryLister};
 use super::events::{discard_events, EventSink};
@@ -11,12 +11,15 @@ use super::path::CleartextPath;
 use super::path_mapper::CryptoPathMapper;
 use super::stats::CryptoFsStats;
 use super::symlinks::Symlinks;
+use crate::constants::DIR_ID_BACKUP_FILE_NAME;
 use crate::crypto::rng::{OsRng, Rng};
 use crate::vault::open::OpenedVault;
 use crate::{Cryptor, VaultConfig};
+use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// `CryptoFileSystemProperties.DEFAULT_MAX_CLEARTEXT_NAME_LENGTH`
 pub const DEFAULT_MAX_CLEARTEXT_NAME_LENGTH: usize = 10 * 1024;
@@ -434,6 +437,315 @@ impl CryptoFs {
     }
 }
 
+/// `DeletingFileVisitor` without the DOS/POSIX write-protection dance (unlink on Unix needs
+/// directory permissions, not file permissions).
+fn remove_recursively(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn is_not_empty_error(e: &io::Error) -> bool {
+    // ENOTEMPTY, or EEXIST on some platforms
+    matches!(
+        e.kind(),
+        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+    )
+}
+
+impl CryptoFs {
+    /// `delete`: files and symlinks always, directories only when empty.
+    pub fn delete(&self, path: &CleartextPath) -> io::Result<()> {
+        self.assert_writable()?;
+        if path.is_root() {
+            return Err(super::invalid_input(
+                "The filesystem root cannot be deleted.",
+            ));
+        }
+        let file_type = self.mapper.ciphertext_file_type(path)?;
+        let ciphertext = self.mapper.ciphertext_file_path(path)?;
+        match file_type {
+            CiphertextFileType::Directory => self.delete_directory(path, &ciphertext),
+            CiphertextFileType::File | CiphertextFileType::Symlink => {
+                self.open_files.delete(&ciphertext.file_path());
+                remove_recursively(ciphertext.raw_path())
+            }
+        }
+    }
+
+    /// Depth-first delete of a whole subtree (convenience for `fs rm -r`).
+    pub fn delete_recursive(&self, path: &CleartextPath) -> io::Result<()> {
+        if self.symlink_metadata(path)?.is_dir() {
+            for entry in self.read_dir(path)? {
+                self.delete_recursive(
+                    &path
+                        .join(&entry.cleartext_name)
+                        .map_err(|e| super::invalid_input(e.to_string()))?,
+                )?;
+            }
+        }
+        self.delete(path)
+    }
+
+    fn delete_directory(
+        &self,
+        path: &CleartextPath,
+        ciphertext: &CiphertextFilePath,
+    ) -> io::Result<()> {
+        let ciphertext_dir = self.mapper.ciphertext_dir(path)?.path;
+        let dir_file = ciphertext.dir_file_path();
+        let result = self
+            .delete_ciphertext_dir_including_non_ciphertext_files(&ciphertext_dir, path)
+            .and_then(|_| remove_recursively(ciphertext.raw_path()));
+        match result {
+            Ok(()) => {
+                self.mapper.invalidate_path_mapping(path);
+                self.dir_ids.delete(&dir_file);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(super::not_found(path)),
+            Err(e) if is_not_empty_error(&e) => Err(super::directory_not_empty(path)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `CiphertextDirectoryDeleter`: a content dir that only holds non-ciphertext leftovers
+    /// (`dirid.c9r`, `.DS_Store`, …) is emptied and removed; real content keeps it.
+    fn delete_ciphertext_dir_including_non_ciphertext_files(
+        &self,
+        ciphertext_dir: &Path,
+        cleartext_dir: &CleartextPath,
+    ) -> io::Result<()> {
+        match std::fs::remove_dir(ciphertext_dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) if is_not_empty_error(&e) => {
+                let ciphertext_files: HashSet<PathBuf> = self
+                    .lister()
+                    .list(cleartext_dir)?
+                    .into_iter()
+                    .map(|n| n.ciphertext_path)
+                    .collect();
+                let mut deleted_some = false;
+                for entry in std::fs::read_dir(ciphertext_dir)? {
+                    let p = entry?.path();
+                    if !ciphertext_files.contains(&p) {
+                        deleted_some = true;
+                        remove_recursively(&p)?;
+                    }
+                }
+                if deleted_some {
+                    std::fs::remove_dir(ciphertext_dir)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `move`: renames the ciphertext node; directories keep their content dir.
+    pub fn rename(
+        &self,
+        src: &CleartextPath,
+        dst: &CleartextPath,
+        replace_existing: bool,
+    ) -> io::Result<()> {
+        self.assert_writable()?;
+        self.assert_cleartext_name_length_allowed(dst)?;
+        if src.is_root() {
+            return Err(super::invalid_input("Filesystem root cannot be moved."));
+        }
+        if dst.is_root() {
+            return Err(super::already_exists(dst));
+        }
+        if src == dst {
+            return Ok(());
+        }
+        let file_type = self.mapper.ciphertext_file_type(src)?;
+        if !replace_existing {
+            self.mapper.assert_non_existing(dst)?;
+        }
+        match file_type {
+            CiphertextFileType::Symlink => self.move_symlink(src, dst),
+            CiphertextFileType::File => self.move_file(src, dst, replace_existing),
+            CiphertextFileType::Directory => self.move_directory(src, dst, replace_existing),
+        }
+    }
+
+    fn move_symlink(&self, src: &CleartextPath, dst: &CleartextPath) -> io::Result<()> {
+        let s = self.mapper.ciphertext_file_path(src)?;
+        let d = self.mapper.ciphertext_file_path(dst)?;
+        let two_phase = self
+            .open_files
+            .prepare_move(&s.symlink_file_path(), &d.symlink_file_path())?;
+        remove_recursively(d.raw_path())?; // replace: an existing node was allowed by the caller
+        std::fs::rename(s.raw_path(), d.raw_path())?;
+        if d.is_shortened() {
+            d.persist_long_file_name()?;
+        } else {
+            remove_file_if_exists(&d.inflated_name_path())?;
+        }
+        two_phase.commit();
+        Ok(())
+    }
+
+    fn move_file(
+        &self,
+        src: &CleartextPath,
+        dst: &CleartextPath,
+        replace_existing: bool,
+    ) -> io::Result<()> {
+        let s = self.mapper.ciphertext_file_path(src)?;
+        let d = self.mapper.ciphertext_file_path(dst)?;
+        let two_phase = self
+            .open_files
+            .prepare_move(&s.file_path(), &d.file_path())?;
+        if !replace_existing && std::fs::symlink_metadata(d.file_path()).is_ok() {
+            return Err(super::already_exists(dst)); // std::fs::rename would replace silently
+        }
+        if d.is_shortened() {
+            std::fs::create_dir_all(d.raw_path())?;
+            d.persist_long_file_name()?;
+        }
+        std::fs::rename(s.file_path(), d.file_path())?;
+        if s.is_shortened() {
+            remove_recursively(s.raw_path())?;
+        }
+        two_phase.commit();
+        Ok(())
+    }
+
+    fn move_directory(
+        &self,
+        src: &CleartextPath,
+        dst: &CleartextPath,
+        replace_existing: bool,
+    ) -> io::Result<()> {
+        let s = self.mapper.ciphertext_file_path(src)?;
+        let d = self.mapper.ciphertext_file_path(dst)?;
+        if replace_existing && std::fs::symlink_metadata(d.raw_path()).is_ok() {
+            if self.mapper.ciphertext_file_type(dst)? != CiphertextFileType::Directory {
+                remove_recursively(d.raw_path())?;
+            } else {
+                let target_content_dir = self.mapper.ciphertext_dir(dst)?.path;
+                let mut target_exists = true;
+                match std::fs::read_dir(&target_content_dir) {
+                    Ok(entries) => {
+                        if entries
+                            .filter_map(|e| e.ok())
+                            .any(|e| e.file_name() != DIR_ID_BACKUP_FILE_NAME)
+                        {
+                            return Err(super::directory_not_empty(dst));
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => target_exists = false,
+                    Err(e) => return Err(e),
+                }
+                remove_recursively(d.raw_path())?;
+                if target_exists {
+                    remove_recursively(&target_content_dir)?;
+                }
+                self.mapper.invalidate_path_mapping(dst);
+                self.dir_ids.delete(&d.dir_file_path());
+            }
+        }
+        std::fs::rename(s.raw_path(), d.raw_path())?;
+        if d.is_shortened() {
+            d.persist_long_file_name()?;
+        } else {
+            remove_file_if_exists(&d.inflated_name_path())?;
+        }
+        self.dir_ids.move_id(&s.dir_file_path(), &d.dir_file_path());
+        self.mapper.move_path_mapping(src, dst);
+        Ok(())
+    }
+
+    /// `copy` (non-recursive for directories, like `Files.copy`): ciphertext files are copied as
+    /// they are (same key, same header), symlinks copy their `symlink.c9r`.
+    pub fn copy(
+        &self,
+        src: &CleartextPath,
+        dst: &CleartextPath,
+        replace_existing: bool,
+    ) -> io::Result<()> {
+        self.assert_writable()?;
+        self.assert_cleartext_name_length_allowed(dst)?;
+        if src == dst {
+            return Ok(());
+        }
+        if dst.is_root() {
+            return Err(super::invalid_input(
+                "The filesystem root cannot be replaced.",
+            ));
+        }
+        let file_type = self.mapper.ciphertext_file_type(src)?;
+        if !replace_existing {
+            self.mapper.assert_non_existing(dst)?;
+        }
+        let s = self.mapper.ciphertext_file_path(src)?;
+        let d = self.mapper.ciphertext_file_path(dst)?;
+        match file_type {
+            CiphertextFileType::File => {
+                if d.is_shortened() {
+                    std::fs::create_dir_all(d.raw_path())?;
+                }
+                std::fs::copy(s.file_path(), d.file_path())?;
+                d.persist_long_file_name()
+            }
+            CiphertextFileType::Symlink => {
+                remove_recursively(d.raw_path())?;
+                std::fs::create_dir_all(d.raw_path())?;
+                std::fs::copy(s.symlink_file_path(), d.symlink_file_path())?;
+                d.persist_long_file_name()
+            }
+            CiphertextFileType::Directory => {
+                if std::fs::symlink_metadata(d.raw_path()).is_err() {
+                    self.create_dir(dst)
+                } else if self.read_dir(dst)?.is_empty() {
+                    Ok(()) // keep the existing empty directory
+                } else {
+                    Err(super::directory_not_empty(dst))
+                }
+            }
+        }
+    }
+
+    /// `setTimes` (follows symlinks): updates an open file's mtime and the ciphertext node's times.
+    pub fn set_times(
+        &self,
+        path: &CleartextPath,
+        modified: Option<SystemTime>,
+        accessed: Option<SystemTime>,
+    ) -> io::Result<()> {
+        self.assert_writable()?;
+        let resolved = self.symlinks.resolve_recursively(path)?;
+        let file_type = self.mapper.ciphertext_file_type(&resolved)?;
+        let ciphertext_path = self.ciphertext_path_for(&resolved, file_type)?;
+        if let (Some(modified), Some(open)) = (modified, self.open_files.get(&ciphertext_path)) {
+            super::lock(&open).set_last_modified(modified);
+        }
+        let mut times = std::fs::FileTimes::new();
+        if let Some(m) = modified {
+            times = times.set_modified(m);
+        }
+        if let Some(a) = accessed {
+            times = times.set_accessed(a);
+        }
+        std::fs::File::open(&ciphertext_path)?.set_times(times)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +914,263 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(fs.copy_to_writer(&p, &mut out).unwrap(), 200_000);
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn delete_semantics_match_java() {
+        let (_dir, fs) = test_fs(220, false);
+        let d = CleartextPath::parse("/d");
+        fs.create_dir(&d).unwrap();
+        fs.write_file(&d.join("f").unwrap(), b"1", false).unwrap();
+        fs.create_symlink(&d.join("l").unwrap(), "f").unwrap();
+        assert_eq!(
+            fs.delete(&CleartextPath::root()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            fs.delete(&d).unwrap_err().kind(),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        fs.delete(&d.join("l").unwrap()).unwrap();
+        fs.delete(&d.join("f").unwrap()).unwrap();
+        assert_eq!(
+            fs.delete(&d.join("f").unwrap()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // stray non-ciphertext files inside the content dir do not block the delete
+        std::fs::write(
+            fs.mapper()
+                .ciphertext_dir(&d)
+                .unwrap()
+                .path
+                .join(".DS_Store"),
+            b"x",
+        )
+        .unwrap();
+        let content_dir = fs.mapper().ciphertext_dir(&d).unwrap().path;
+        fs.delete(&d).unwrap();
+        assert!(!content_dir.exists());
+        assert_eq!(
+            fs.mapper().ciphertext_file_type(&d).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs.create_dir_all(&CleartextPath::parse("/x/y/z")).unwrap();
+        fs.write_file(&CleartextPath::parse("/x/y/z/f"), b"deep", false)
+            .unwrap();
+        fs.delete_recursive(&CleartextPath::parse("/x")).unwrap();
+        assert!(fs.read_dir(&CleartextPath::root()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_files_symlinks_and_directories() {
+        let (_dir, fs) = test_fs(220, false);
+        fs.create_dir_all(&CleartextPath::parse("/a/sub")).unwrap();
+        fs.write_file(&CleartextPath::parse("/a/sub/f"), b"content", false)
+            .unwrap();
+        fs.create_symlink(&CleartextPath::parse("/a/l"), "sub/f")
+            .unwrap();
+        fs.rename(
+            &CleartextPath::parse("/a/sub/f"),
+            &CleartextPath::parse("/a/g"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/a/g")).unwrap(),
+            b"content"
+        );
+        fs.write_file(&CleartextPath::parse("/a/h"), b"other", false)
+            .unwrap();
+        assert_eq!(
+            fs.rename(
+                &CleartextPath::parse("/a/g"),
+                &CleartextPath::parse("/a/h"),
+                false
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs.rename(
+            &CleartextPath::parse("/a/g"),
+            &CleartextPath::parse("/a/h"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/a/h")).unwrap(),
+            b"content"
+        );
+        // long name target: contents.c9r inside .c9s; back to a short name removes name.c9s
+        let long = CleartextPath::root().join(&"L".repeat(200)).unwrap();
+        fs.rename(&CleartextPath::parse("/a/h"), &long, false)
+            .unwrap();
+        assert!(fs.ciphertext_path(&long).unwrap().ends_with("contents.c9r"));
+        fs.rename(&long, &CleartextPath::parse("/a/h"), false)
+            .unwrap();
+        assert!(fs
+            .ciphertext_path(&CleartextPath::parse("/a/h"))
+            .unwrap()
+            .extension()
+            .is_some_and(|e| e == "c9r"));
+        fs.rename(
+            &CleartextPath::parse("/a/l"),
+            &CleartextPath::parse("/a/m"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.read_link(&CleartextPath::parse("/a/m")).unwrap(),
+            "sub/f"
+        );
+        // directory rename keeps the content dir (same dir id), moves the cached mapping
+        let content = fs
+            .mapper()
+            .ciphertext_dir(&CleartextPath::parse("/a"))
+            .unwrap();
+        fs.rename(
+            &CleartextPath::parse("/a"),
+            &CleartextPath::parse("/b"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.mapper()
+                .ciphertext_dir(&CleartextPath::parse("/b"))
+                .unwrap(),
+            content
+        );
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/b/h")).unwrap(),
+            b"content"
+        );
+        assert_eq!(
+            fs.mapper()
+                .ciphertext_file_type(&CleartextPath::parse("/a"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        fs.create_dir(&CleartextPath::parse("/empty")).unwrap();
+        assert_eq!(
+            fs.rename(
+                &CleartextPath::parse("/b"),
+                &CleartextPath::parse("/empty"),
+                false
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs.rename(
+            &CleartextPath::parse("/b"),
+            &CleartextPath::parse("/empty"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/empty/h")).unwrap(),
+            b"content"
+        );
+        fs.create_dir(&CleartextPath::parse("/full")).unwrap();
+        fs.write_file(&CleartextPath::parse("/full/x"), b"", false)
+            .unwrap();
+        assert_eq!(
+            fs.rename(
+                &CleartextPath::parse("/empty"),
+                &CleartextPath::parse("/full"),
+                true
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        assert!(fs
+            .rename(&CleartextPath::root(), &CleartextPath::parse("/r"), false)
+            .is_err());
+        fs.rename(
+            &CleartextPath::parse("/empty"),
+            &CleartextPath::parse("/empty"),
+            false,
+        )
+        .unwrap();
+        // an open file survives a rename
+        let h = fs
+            .open_file(&CleartextPath::parse("/empty/h"), OpenOptions::read_write())
+            .unwrap();
+        fs.rename(
+            &CleartextPath::parse("/empty/h"),
+            &CleartextPath::parse("/moved"),
+            false,
+        )
+        .unwrap();
+        h.write_all_at(b"X", 0).unwrap();
+        h.close().unwrap();
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/moved")).unwrap(),
+            b"Xontent"
+        );
+    }
+
+    #[test]
+    fn copy_and_set_times() {
+        let (_dir, fs) = test_fs(220, false);
+        fs.write_file(&CleartextPath::parse("/f"), b"data", false)
+            .unwrap();
+        fs.copy(
+            &CleartextPath::parse("/f"),
+            &CleartextPath::parse("/g"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs.read_file(&CleartextPath::parse("/g")).unwrap(), b"data");
+        assert_eq!(
+            fs.copy(
+                &CleartextPath::parse("/f"),
+                &CleartextPath::parse("/g"),
+                false
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs.write_file(&CleartextPath::parse("/f"), b"new", true)
+            .unwrap();
+        fs.copy(
+            &CleartextPath::parse("/f"),
+            &CleartextPath::parse("/g"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(fs.read_file(&CleartextPath::parse("/g")).unwrap(), b"new");
+        fs.create_symlink(&CleartextPath::parse("/l"), "f").unwrap();
+        fs.copy(
+            &CleartextPath::parse("/l"),
+            &CleartextPath::parse("/l2"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs.read_link(&CleartextPath::parse("/l2")).unwrap(), "f");
+        fs.create_dir(&CleartextPath::parse("/d")).unwrap();
+        fs.copy(
+            &CleartextPath::parse("/d"),
+            &CleartextPath::parse("/d2"),
+            false,
+        )
+        .unwrap();
+        assert!(fs.metadata(&CleartextPath::parse("/d2")).unwrap().is_dir());
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        fs.set_times(&CleartextPath::parse("/g"), Some(t), None)
+            .unwrap();
+        assert_eq!(
+            fs.metadata(&CleartextPath::parse("/g")).unwrap().modified,
+            Some(t)
+        );
+        fs.set_times(&CleartextPath::parse("/d"), Some(t), Some(t))
+            .unwrap();
+        assert_eq!(
+            fs.metadata(&CleartextPath::parse("/d")).unwrap().modified,
+            Some(t)
+        );
     }
 }
