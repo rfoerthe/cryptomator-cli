@@ -1,4 +1,5 @@
 //! Cryptographic primitives of vault format 8.
+pub mod ctrmac;
 pub mod gcm;
 pub mod header;
 pub mod kdf;
