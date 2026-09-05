@@ -49,6 +49,23 @@ fn validate_threshold(shortening_threshold: u32) -> Result<()> {
     Ok(())
 }
 
+/// The readme is written into the root directory as a regular (unshortened) file, so its
+/// ciphertext name must fit the vault's shortening threshold. Checked before anything is created.
+fn readme_name_fits(cryptor: &Cryptor, threshold: u32) -> Result<()> {
+    let name = ACCESS_LOCATION_README_FILE_NAME;
+    let len = cryptor
+        .file_name_cryptor()
+        .encrypt_filename(name, &[ROOT_DIR_ID.as_bytes()])
+        .len()
+        + CRYPTOMATOR_FILE_SUFFIX.len();
+    if len > threshold as usize {
+        return Err(CoreError::InvalidArgument(format!(
+            "shortening threshold {threshold} is too small for the readme file {name:?} ({len} characters); use at least {len} or disable readme files"
+        )));
+    }
+    Ok(())
+}
+
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -119,8 +136,15 @@ pub fn create_vault(
     rng: &mut dyn Rng,
 ) -> Result<Masterkey> {
     validate_threshold(options.shortening_threshold)?;
-    std::fs::create_dir(vault_path)?;
     let masterkey = Masterkey::generate(rng);
+    let readme_cryptor = if options.write_readme_files {
+        let cryptor = Cryptor::new(options.cipher_combo, &masterkey);
+        readme_name_fits(&cryptor, options.shortening_threshold)?;
+        Some(cryptor)
+    } else {
+        None
+    };
+    std::fs::create_dir(vault_path)?;
     access.persist(
         &masterkey,
         &vault_path.join(MASTERKEY_FILENAME),
@@ -136,11 +160,10 @@ pub fn create_vault(
         DEFAULT_KEY_ID,
         rng,
     )?;
-    if options.write_readme_files {
-        let cryptor = Cryptor::new(options.cipher_combo, &masterkey);
+    if let Some(cryptor) = &readme_cryptor {
         write_root_file(
             vault_path,
-            &cryptor,
+            cryptor,
             ACCESS_LOCATION_README_FILE_NAME,
             access_location_readme_rtf().as_bytes(),
             config.shortening_threshold,
@@ -292,6 +315,43 @@ mod tests {
             assert!(matches!(err, CoreError::InvalidArgument(_)), "{threshold}");
             assert!(!vault.exists(), "{threshold}: nothing may be created");
         }
+    }
+
+    #[test]
+    fn threshold_too_small_for_readme_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        for threshold in [36, 39] {
+            let vault = dir.path().join(format!("vault-{threshold}"));
+            let options = CreateVaultOptions {
+                shortening_threshold: threshold,
+                ..CreateVaultOptions::default()
+            };
+            let err = create_vault(
+                &vault,
+                PASSPHRASE,
+                &options,
+                &MasterkeyFileAccess::new(Vec::new()),
+                &mut OsRng,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CoreError::InvalidArgument(_)), "{threshold}");
+            assert!(!vault.exists(), "{threshold}: nothing may be created");
+        }
+
+        let vault = dir.path().join("vault-40");
+        let options = CreateVaultOptions {
+            shortening_threshold: 40,
+            ..CreateVaultOptions::default()
+        };
+        create_vault(
+            &vault,
+            PASSPHRASE,
+            &options,
+            &MasterkeyFileAccess::new(Vec::new()),
+            &mut OsRng,
+        )
+        .unwrap();
+        open_vault(&vault, &MasterkeyFileAccess::new(Vec::new()), PASSPHRASE).unwrap();
     }
 
     #[test]
