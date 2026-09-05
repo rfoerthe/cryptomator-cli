@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod backup;
 pub mod constants;
 pub mod crypto;
 pub mod error;
