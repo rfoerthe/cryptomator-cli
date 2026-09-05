@@ -456,3 +456,142 @@ fn config_get_and_set() {
         .code(2);
     sb.crypto(&["config", "get", "theme"]).assert().code(2);
 }
+
+#[test]
+fn password_change_and_recovery_key_flows() {
+    let sb = Sandbox::new();
+    let vault = sb.path("pw");
+    sb.crypto(&["vault", "create", vault.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // change password: old from CRYPTO_PASSWORD, new from --new-password-env
+    sb.crypto(&["password", "change", "pw", "--new-password-env", "NEWPW"])
+        .env("NEWPW", "brand-new-passphrase")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Password changed"));
+    assert_eq!(
+        std::fs::read_dir(&vault)
+            .unwrap()
+            .filter(|e| e
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".bkup"))
+            .count(),
+        1
+    );
+    sb.crypto(&["recovery-key", "show", "pw"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("invalid passphrase"));
+    let out = sb
+        .crypto(&["--json", "recovery-key", "show", "pw"])
+        .env("CRYPTO_PASSWORD", "brand-new-passphrase")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let recovery_key = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["recoveryKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(recovery_key.split(' ').count(), 44);
+    sb.crypto(&["password", "change", "pw", "--new-password-env", "NEWPW"])
+        .env("NEWPW", "short")
+        .env("CRYPTO_PASSWORD", "brand-new-passphrase")
+        .assert()
+        .code(4);
+
+    // reset via recovery key from stdin, new password from --new-password-env
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "pw",
+        "--recovery-key-stdin",
+        "--new-password-env",
+        "NP",
+    ])
+    .env("NP", "reset-passphrase-1")
+    .write_stdin(format!("{recovery_key}\n"))
+    .assert()
+    .success();
+    sb.crypto(&["recovery-key", "show", "pw"])
+        .env("CRYPTO_PASSWORD", "reset-passphrase-1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&recovery_key));
+
+    // a recovery key of another vault is rejected before anything is written
+    let other = sb.path("other");
+    let out = sb
+        .crypto(&[
+            "--json",
+            "vault",
+            "create",
+            "--show-recovery-key",
+            other.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let foreign_key = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["recoveryKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = std::fs::read(vault.join("masterkey.cryptomator")).unwrap();
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "pw",
+        "--recovery-key-stdin",
+        "--new-password-env",
+        "NP",
+    ])
+    .env("NP", "reset-passphrase-2")
+    .write_stdin(format!("{foreign_key}\n"))
+    .assert()
+    .code(4);
+    assert_eq!(
+        std::fs::read(vault.join("masterkey.cryptomator")).unwrap(),
+        before
+    );
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "pw",
+        "--recovery-key-stdin",
+        "--new-password-env",
+        "NP",
+    ])
+    .env("NP", "reset-passphrase-2")
+    .write_stdin("pathway lift\n")
+    .assert()
+    .code(4);
+}
+
+#[test]
+fn password_and_recovery_commands_refuse_hub_and_missing_vaults() {
+    let sb = Sandbox::new();
+    let hub = sb.path("hub");
+    std::fs::create_dir_all(hub.join("d")).unwrap();
+    std::fs::write(hub.join("vault.cryptomator"), "eyJraWQiOiJodWIraHR0cHM6Ly9odWIuZXhhbXBsZS5jb20vYXBpL3ZhdWx0cy8xIiwiYWxnIjoiSFMyNTYiLCJ0eXAiOiJKV1QifQ.eyJqdGkiOiJ4IiwiZm9ybWF0Ijo4LCJjaXBoZXJDb21ibyI6IlNJVl9HQ00iLCJzaG9ydGVuaW5nVGhyZXNob2xkIjoyMjB9.AAAA").unwrap();
+    sb.crypto(&["vault", "add", hub.to_str().unwrap()])
+        .assert()
+        .success();
+    sb.crypto(&["recovery-key", "show", "hub"]).assert().code(9);
+    sb.crypto(&["password", "change", "hub", "--new-password-env", "X"])
+        .env("X", "whatever-long")
+        .assert()
+        .code(9);
+    std::fs::remove_dir_all(&hub).unwrap();
+    sb.crypto(&["recovery-key", "show", "hub"])
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains("MISSING"));
+}

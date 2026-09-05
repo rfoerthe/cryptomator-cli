@@ -1,6 +1,6 @@
 //! Command grammar of `crypto`.
 use clap::{Args, Parser, Subcommand};
-use cryptomator_app::PasswordArgs;
+use cryptomator_app::{NewPasswordArgs, PasswordArgs};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -27,6 +27,11 @@ pub enum Command {
     Vault {
         #[command(subcommand)]
         command: VaultCommand,
+    },
+    /// Change or forget vault passwords
+    Password {
+        #[command(subcommand)]
+        command: PasswordCommand,
     },
     /// Show, validate or use recovery keys
     #[command(name = "recovery-key")]
@@ -154,9 +159,55 @@ pub struct AddArgs {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum PasswordCommand {
+    /// Change the password of a vault (writes a .bkup of the old masterkey file)
+    Change(ChangePasswordArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChangePasswordArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+    #[command(flatten)]
+    pub new_password: NewPasswordArgs,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum RecoveryKeyCommand {
+    /// Print the recovery key of a vault (requires the password)
+    Show(ShowArgs),
+    /// Set a new password using the recovery key
+    #[command(name = "reset-password")]
+    ResetPassword(ResetPasswordArgs),
     /// Check whether a recovery key is well-formed (dictionary words, length, checksum)
     Validate(ValidateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+// The group carries `required(true)`, not the flag: putting it on `recovery_key_stdin` would make
+// clap demand that flag even when `--recovery-key-file` is given.
+#[derive(Args, Debug)]
+#[command(group = clap::ArgGroup::new("recovery-key-source").required(true))]
+pub struct ResetPasswordArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Read the recovery key from the next line of standard input
+    #[arg(long, group = "recovery-key-source")]
+    pub recovery_key_stdin: bool,
+    /// Read the recovery key from a file
+    #[arg(long, value_name = "FILE", group = "recovery-key-source")]
+    pub recovery_key_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub new_password: NewPasswordArgs,
 }
 
 #[derive(Args, Debug)]

@@ -5,7 +5,7 @@ mod exit;
 mod output;
 
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, RecoveryKeyCommand, VaultCommand};
+use cli::{Cli, Command, ConfigCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand};
 use commands::Ctx;
 use cryptomator_app::settings::SettingsStore;
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
@@ -55,23 +55,30 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             VaultCommand::Info { vault } => commands::vault::info(&ctx, &vault),
             VaultCommand::Set(args) => commands::vault::set(&ctx, args),
         },
-        Command::RecoveryKey {
-            command: RecoveryKeyCommand::Validate(args),
-        } => {
-            debug_assert!(args.recovery_key_stdin);
-            // The recovery key is key material: keep it in a buffer that is wiped on drop and
-            // never copy it into an owned String (`trim` borrows).
-            let mut input = Zeroizing::new(String::new());
-            std::io::stdin().read_to_string(&mut input)?;
-            let recovery_key: &str = input.trim();
-            if validate_recovery_key(&WordEncoder::new(), recovery_key) {
-                println!("valid");
-                Ok(exit::OK)
-            } else {
-                println!("invalid");
-                Ok(exit::INVALID_PASSPHRASE)
+        Command::Password {
+            command: PasswordCommand::Change(args),
+        } => commands::password::change(&ctx, args),
+        Command::RecoveryKey { command } => match command {
+            RecoveryKeyCommand::Show(args) => commands::recovery::show(&ctx, args),
+            RecoveryKeyCommand::ResetPassword(args) => {
+                commands::recovery::reset_password_cmd(&ctx, args)
             }
-        }
+            RecoveryKeyCommand::Validate(args) => {
+                debug_assert!(args.recovery_key_stdin);
+                // The recovery key is key material: keep it in a buffer that is wiped on drop and
+                // never copy it into an owned String (`trim` borrows).
+                let mut input = Zeroizing::new(String::new());
+                std::io::stdin().read_to_string(&mut input)?;
+                let recovery_key: &str = input.trim();
+                if validate_recovery_key(&WordEncoder::new(), recovery_key) {
+                    println!("valid");
+                    Ok(exit::OK)
+                } else {
+                    println!("invalid");
+                    Ok(exit::INVALID_PASSPHRASE)
+                }
+            }
+        },
         Command::Config { command } => match command {
             ConfigCommand::Get { key } => commands::config::get(&ctx, key.as_deref()),
             ConfigCommand::Set { key, value } => commands::config::set(&ctx, &key, &value),

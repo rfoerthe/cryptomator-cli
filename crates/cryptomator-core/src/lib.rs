@@ -14,6 +14,7 @@ pub mod vault_config;
 pub use backup::{
     attempt_backup, backup_file_name, generate_file_id_suffix, BackupOutcome, BackupStatus,
 };
+pub use constants::VAULT_VERSION;
 pub use crypto::cryptor::{CipherCombo, ContentCryptor, Cryptor, HeaderCryptor};
 pub use crypto::header::FileHeader;
 pub use crypto::masterkey::Masterkey;
