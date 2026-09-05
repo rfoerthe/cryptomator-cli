@@ -14,6 +14,12 @@ pub enum AppError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("cannot read settings file {path}: {source}")]
+    SettingsUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("no vault matches {0:?} (by id, display name or path)")]
     VaultNotFound(String),
     #[error("{:?} matches several vaults: {}", _0, _1.join(", "))]

@@ -84,13 +84,23 @@ impl SettingsStore {
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(AppError::Io(e)),
+                Err(source) => {
+                    return Err(AppError::SettingsUnreadable {
+                        path: path.clone(),
+                        source,
+                    })
+                }
             }
         }
         Ok(SettingsJson::default())
     }
 
-    /// Writes `settings.json.tmp` and renames it over the preferred path (`SettingsProvider.save`).
+    /// Writes a process-unique `settings.json.<pid>.tmp` next to the preferred path and renames it
+    /// over that path (`SettingsProvider.save`). The tmp name must not collide with the desktop
+    /// app's fixed `settings.json.tmp`: a concurrent desktop save would otherwise truncate our tmp
+    /// file and we would publish a partial file, which this crate reports as a corrupt settings
+    /// file instead of silently resetting it. `create_new` additionally refuses to reuse a
+    /// foreign tmp file, and every failure after creation removes the tmp file again.
     pub fn save(&self, settings: &mut SettingsJson) -> Result<()> {
         let path = self.preferred_path();
         if let Some(parent) = path.parent() {
@@ -103,13 +113,26 @@ impl SettingsStore {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "settings.json".to_string());
-        let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
-        {
-            let mut tmp = std::fs::File::create(&tmp_path)?;
-            tmp.write_all(settings.to_json_pretty().as_bytes())?;
-            tmp.sync_all()?;
+        let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+        let written = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .and_then(|mut tmp| {
+                tmp.write_all(settings.to_json_pretty().as_bytes())?;
+                tmp.sync_all()
+            });
+        if let Err(e) = written {
+            // Only remove the tmp file if we are the ones who created it.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            return Err(AppError::Io(e));
         }
-        std::fs::rename(&tmp_path, path)?;
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(AppError::Io(e));
+        }
         Ok(())
     }
 
@@ -230,6 +253,40 @@ mod tests {
             })
             .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn unreadable_first_candidate_is_an_error_not_a_fallthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first/settings.json");
+        let second = dir.path().join("second/settings.json");
+        // A directory where a file is expected: readable entry, unreadable content.
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&second, br#"{"port": 1}"#).unwrap();
+        let store = SettingsStore::with_paths(vec![first.clone(), second]).unwrap();
+        match store.load() {
+            Err(AppError::SettingsUnreadable { path, .. }) => assert_eq!(path, first),
+            other => panic!("expected SettingsUnreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_save_leaves_no_tmp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // The preferred path itself is a non-empty directory, so `create_dir_all` on its parent
+        // and the tmp write both succeed, but the final rename fails (EISDIR/ENOTEMPTY).
+        let path = dir.path().join("settings.json");
+        std::fs::create_dir_all(path.join("occupied")).unwrap();
+        let store = SettingsStore::at(path.clone());
+        let mut settings = SettingsJson::default();
+        assert!(store.save(&mut settings).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
     }
 
     #[test]
