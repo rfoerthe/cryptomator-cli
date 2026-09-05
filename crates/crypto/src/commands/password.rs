@@ -4,7 +4,8 @@ use crate::commands::{locked_vault_path, Ctx};
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::{
-    min_password_length, read_new_passphrase, read_passphrase, PasswordArgs, SystemIo,
+    min_password_length, read_new_passphrase_no_env_fallback, read_passphrase, PasswordArgs,
+    SystemIo,
 };
 use cryptomator_core::{change_password, read_vault_config, MasterkeyFileAccess, OsRng};
 use serde_json::json;
@@ -17,7 +18,9 @@ pub fn change(ctx: &Ctx, args: ChangePasswordArgs) -> Result<u8> {
         .require_masterkey_file()?;
     let mut io = SystemIo;
     let old = read_passphrase(&args.password, "Current password: ", &mut io)?;
-    let new = read_new_passphrase(
+    // Not `read_new_passphrase`: $CRYPTO_PASSWORD is where the *current* password just came from,
+    // so without an explicit --new-password-* flag we prompt (and fail without a terminal).
+    let new = read_new_passphrase_no_env_fallback(
         &PasswordArgs::from(&args.new_password),
         "New password: ",
         min_password_length(),

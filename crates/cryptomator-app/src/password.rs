@@ -1,6 +1,7 @@
 //! Passphrase sources for the CLI. Order: --password-stdin (one line) → --password-file → --password-env VAR
 //! → $CRYPTO_PASSWORD → interactive prompt (only when stdin is a terminal). Passphrases are NFC-normalised
-//! like the desktop app's `SecurePasswordField`.
+//! like the desktop app's `SecurePasswordField`. `read_new_passphrase_no_env_fallback` drops the
+//! $CRYPTO_PASSWORD step for callers where that variable already holds a different password.
 use crate::error::{AppError, Result};
 use clap::Args;
 use std::io::{BufRead, IsTerminal, Read};
@@ -109,27 +110,39 @@ fn strip_line_ending(mut line: String) -> String {
     line
 }
 
-fn read_password_file(path: &Path, label: &str) -> Result<Zeroizing<String>> {
+/// Reads a secret from a file: at most [`MAX_PASSWORD_FILE_BYTES`], valid UTF-8, one trailing line
+/// ending removed. `key` names the flag the file came from, so violations surface as a usage error.
+pub fn read_secret_file(path: &Path, key: &str) -> Result<Zeroizing<String>> {
     let file = std::fs::File::open(path)?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_PASSWORD_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PASSWORD_FILE_BYTES {
         return Err(AppError::InvalidValue {
-            key: format!("{label}-file"),
+            key: key.to_string(),
             message: format!("file is larger than {MAX_PASSWORD_FILE_BYTES} bytes"),
         });
     }
     let text = String::from_utf8(bytes.to_vec()).map_err(|_| AppError::InvalidValue {
-        key: format!("{label}-file"),
+        key: key.to_string(),
         message: "file is not valid UTF-8".to_string(),
     })?;
     Ok(Zeroizing::new(strip_line_ending(text)))
 }
 
+/// Whether `$CRYPTO_PASSWORD` may act as the implicit source when no explicit flag is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultEnv {
+    Allowed,
+    /// `password change`: the variable already supplied the *current* password, so letting it
+    /// supply the new one too would silently keep the old password.
+    Denied,
+}
+
 fn read_raw(
     args: &PasswordArgs,
     prompt: &str,
+    default_env: DefaultEnv,
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
     if args.password_stdin {
@@ -139,7 +152,7 @@ fn read_raw(
             .ok_or(AppError::NoPasswordSource);
     }
     if let Some(file) = &args.password_file {
-        return read_password_file(file, args.label);
+        return read_secret_file(file, &format!("{}-file", args.label));
     }
     if let Some(var) = &args.password_env {
         return io
@@ -150,8 +163,10 @@ fn read_raw(
                 message: format!("environment variable {var} is not set"),
             });
     }
-    if let Some(value) = io.env(PASSWORD_ENV) {
-        return Ok(Zeroizing::new(value));
+    if default_env == DefaultEnv::Allowed {
+        if let Some(value) = io.env(PASSWORD_ENV) {
+            return Ok(Zeroizing::new(value));
+        }
     }
     io.prompt(prompt)?
         .map(Zeroizing::new)
@@ -163,7 +178,7 @@ pub fn read_passphrase(
     prompt: &str,
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
-    let raw = read_raw(args, prompt, io)?;
+    let raw = read_raw(args, prompt, DefaultEnv::Allowed, io)?;
     Ok(normalize_passphrase(&raw))
 }
 
@@ -174,11 +189,34 @@ pub fn read_new_passphrase(
     min_len: usize,
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
-    let interactive = !args.password_stdin
-        && args.password_file.is_none()
-        && args.password_env.is_none()
-        && io.env(PASSWORD_ENV).is_none();
-    let passphrase = read_passphrase(args, prompt, io)?;
+    read_new(args, prompt, min_len, DefaultEnv::Allowed, io)
+}
+
+/// Like [`read_new_passphrase`], but `$CRYPTO_PASSWORD` is *not* a source: without an explicit
+/// `--new-password-*` flag the passphrase is typed at the prompt (and [`AppError::NoPasswordSource`]
+/// without a terminal). Used by `password change`, where the variable holds the current password.
+pub fn read_new_passphrase_no_env_fallback(
+    args: &PasswordArgs,
+    prompt: &str,
+    min_len: usize,
+    io: &mut dyn PasswordIo,
+) -> Result<Zeroizing<String>> {
+    read_new(args, prompt, min_len, DefaultEnv::Denied, io)
+}
+
+fn read_new(
+    args: &PasswordArgs,
+    prompt: &str,
+    min_len: usize,
+    default_env: DefaultEnv,
+    io: &mut dyn PasswordIo,
+) -> Result<Zeroizing<String>> {
+    let no_explicit_source =
+        !args.password_stdin && args.password_file.is_none() && args.password_env.is_none();
+    let interactive =
+        no_explicit_source && (default_env == DefaultEnv::Denied || io.env(PASSWORD_ENV).is_none());
+    let raw = read_raw(args, prompt, default_env, io)?;
+    let passphrase = normalize_passphrase(&raw);
     if passphrase.chars().count() < min_len {
         return Err(AppError::PasswordTooShort(min_len));
     }
@@ -355,6 +393,65 @@ mod tests {
             read_new_passphrase(&args(false, None, None), "p", 8, &mut io),
             Err(AppError::PasswordMismatch)
         ));
+    }
+
+    #[test]
+    fn new_passphrase_without_env_fallback_prompts_instead_of_reusing_crypto_password() {
+        // `password change`: CRYPTO_PASSWORD already supplied the *current* password, so it must
+        // not silently become the new one.
+        let mut io = FakeIo {
+            env: HashMap::from([(PASSWORD_ENV.to_string(), "current-passphrase".to_string())]),
+            prompts: Some(VecDeque::from([
+                "typed-new-passphrase".to_string(),
+                "typed-new-passphrase".to_string(),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(
+            *read_new_passphrase_no_env_fallback(
+                &args(false, None, None),
+                "New password: ",
+                8,
+                &mut io
+            )
+            .unwrap(),
+            "typed-new-passphrase"
+        );
+        assert_eq!(io.prompted, vec!["New password: ", "Confirm password: "]);
+
+        // Without a terminal there is no source at all – nothing is written.
+        let mut no_tty = FakeIo {
+            env: HashMap::from([(PASSWORD_ENV.to_string(), "current-passphrase".to_string())]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            read_new_passphrase_no_env_fallback(&args(false, None, None), "p", 8, &mut no_tty),
+            Err(AppError::NoPasswordSource)
+        ));
+
+        // Explicit flags keep working, and `read_new_passphrase` keeps the env fallback.
+        let mut explicit = FakeIo {
+            env: HashMap::from([
+                (PASSWORD_ENV.to_string(), "current-passphrase".to_string()),
+                ("NEW_PW".to_string(), "explicit-passphrase".to_string()),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            *read_new_passphrase_no_env_fallback(
+                &args(false, None, Some("NEW_PW")),
+                "p",
+                8,
+                &mut explicit
+            )
+            .unwrap(),
+            "explicit-passphrase"
+        );
+        assert_eq!(
+            *read_new_passphrase(&args(false, None, None), "p", 8, &mut explicit).unwrap(),
+            "current-passphrase"
+        );
+        assert!(explicit.prompted.is_empty());
     }
 
     #[test]

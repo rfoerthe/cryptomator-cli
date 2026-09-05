@@ -89,6 +89,19 @@ impl Sandbox {
     }
 }
 
+fn bkup_count(vault: &Path) -> usize {
+    std::fs::read_dir(vault)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".bkup")
+        })
+        .count()
+}
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -471,18 +484,7 @@ fn password_change_and_recovery_key_flows() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Password changed"));
-    assert_eq!(
-        std::fs::read_dir(&vault)
-            .unwrap()
-            .filter(|e| e
-                .as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".bkup"))
-            .count(),
-        1
-    );
+    assert_eq!(bkup_count(&vault), 1);
     sb.crypto(&["recovery-key", "show", "pw"])
         .assert()
         .code(4)
@@ -576,6 +578,124 @@ fn password_change_and_recovery_key_flows() {
 }
 
 #[test]
+fn password_change_never_takes_the_new_password_from_crypto_password() {
+    // CRYPTO_PASSWORD supplies the *current* password; without an explicit --new-password-* flag
+    // the new one has to be typed, so a non-interactive run must fail without touching the vault.
+    let sb = Sandbox::new();
+    let vault = sb.path("v");
+    sb.crypto(&["vault", "create", vault.to_str().unwrap()])
+        .assert()
+        .success();
+    let masterkey = vault.join("masterkey.cryptomator");
+    let before = std::fs::read(&masterkey).unwrap();
+
+    sb.crypto(&["password", "change", "v"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Password changed").not());
+
+    assert_eq!(std::fs::read(&masterkey).unwrap(), before);
+    assert_eq!(bkup_count(&vault), 0, "nothing was written");
+    // The original password still opens the vault.
+    sb.crypto(&["recovery-key", "show", "v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(" "));
+}
+
+#[test]
+fn reset_password_reads_the_recovery_key_from_a_file() {
+    let sb = Sandbox::new();
+    let vault = sb.path("v");
+    let out = sb
+        .crypto(&[
+            "--json",
+            "vault",
+            "create",
+            "--show-recovery-key",
+            vault.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let recovery_key = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["recoveryKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key_file = sb.path("recovery.txt");
+    std::fs::write(&key_file, format!("{recovery_key}\n")).unwrap();
+
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "v",
+        "--recovery-key-file",
+        key_file.to_str().unwrap(),
+        "--new-password-env",
+        "NP",
+    ])
+    .env("NP", "from-file-passphrase")
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Password reset"));
+    sb.crypto(&["recovery-key", "show", "v"])
+        .env("CRYPTO_PASSWORD", "from-file-passphrase")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&recovery_key));
+
+    // Oversized and non-UTF-8 key files are usage errors naming the flag, not bare io errors.
+    std::fs::write(&key_file, vec![b'a'; 5001]).unwrap();
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "v",
+        "--recovery-key-file",
+        key_file.to_str().unwrap(),
+        "--new-password-env",
+        "NP",
+    ])
+    .env("NP", "from-file-passphrase")
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("--recovery-key-file"));
+    std::fs::write(&key_file, [0xff, 0xfe, 0x00]).unwrap();
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "v",
+        "--recovery-key-file",
+        key_file.to_str().unwrap(),
+        "--new-password-env",
+        "NP",
+    ])
+    .env("NP", "from-file-passphrase")
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("--recovery-key-file"));
+}
+
+#[test]
+fn password_change_refuses_a_vault_that_is_not_locked() {
+    let sb = Sandbox::new();
+    let vault = sb.path("v");
+    sb.crypto(&["vault", "create", vault.to_str().unwrap()])
+        .assert()
+        .success();
+    // No vault config and no masterkey file: the vault resolves to ALL_MISSING, not LOCKED.
+    std::fs::remove_file(vault.join("vault.cryptomator")).unwrap();
+    std::fs::remove_file(vault.join("masterkey.cryptomator")).unwrap();
+    sb.crypto(&["password", "change", "v", "--new-password-env", "NP"])
+        .env("NP", "brand-new-passphrase")
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains("LOCKED"));
+}
+
+#[test]
 fn password_and_recovery_commands_refuse_hub_and_missing_vaults() {
     let sb = Sandbox::new();
     let hub = sb.path("hub");
@@ -589,6 +709,19 @@ fn password_and_recovery_commands_refuse_hub_and_missing_vaults() {
         .env("X", "whatever-long")
         .assert()
         .code(9);
+    // The key id check comes first, so no recovery key and no password are read.
+    sb.crypto(&[
+        "recovery-key",
+        "reset-password",
+        "hub",
+        "--recovery-key-stdin",
+        "--new-password-env",
+        "X",
+    ])
+    .env("X", "whatever-long")
+    .write_stdin("")
+    .assert()
+    .code(9);
     std::fs::remove_dir_all(&hub).unwrap();
     sb.crypto(&["recovery-key", "show", "hub"])
         .assert()

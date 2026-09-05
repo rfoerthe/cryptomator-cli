@@ -4,8 +4,8 @@ use crate::commands::{locked_vault_path, Ctx};
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::{
-    min_password_length, read_new_passphrase, read_passphrase, AppError, PasswordArgs, PasswordIo,
-    SystemIo,
+    min_password_length, read_new_passphrase, read_passphrase, read_secret_file, AppError,
+    PasswordArgs, PasswordIo, SystemIo,
 };
 use cryptomator_core::recovery::{
     create_recovery_key, decode_recovery_key, reset_password, WordEncoder,
@@ -16,13 +16,20 @@ use zeroize::Zeroizing;
 
 pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
     let path = locked_vault_path(ctx, &args.vault)?;
+    // Reject Hub and unsupported key ids before asking for any passphrase.
+    read_vault_config(&path)?
+        .key_id()?
+        .require_masterkey_file()?;
     let passphrase = read_passphrase(&args.password, "Password: ", &mut SystemIo)?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;
     let key = create_recovery_key(&WordEncoder::new(), opened.masterkey.raw());
-    // `emit_secret` wipes the rendered JSON; the human line prints straight from the wiped buffer.
-    ctx.out
-        .emit_secret(json!({ "recoveryKey": key.as_str() }), String::new)?;
-    if !ctx.out.json {
+    if ctx.out.json {
+        // `emit_secret` wipes the rendered JSON; the payload is built only on this branch so the
+        // human path never makes an unwiped `serde_json::Value` copy of the key.
+        ctx.out
+            .emit_secret(json!({ "recoveryKey": key.as_str() }), String::new)?;
+    } else {
+        // Printed straight from the wiped buffer.
         println!("{}", key.as_str());
     }
     Ok(exit::OK)
@@ -33,7 +40,7 @@ fn read_recovery_key(
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
     let raw = if let Some(file) = &args.recovery_key_file {
-        Zeroizing::new(std::fs::read_to_string(file)?)
+        read_secret_file(file, "--recovery-key-file")?
     } else {
         io.read_stdin_line()?
             .map(Zeroizing::new)
