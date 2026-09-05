@@ -1,6 +1,8 @@
 //! Vaults created by `crypto` must open with the real cryptofs. Needs Java 21+ and Maven; run with
 //! `cargo test -p crypto --test java_interop -- --ignored` (CI job `interop-java`).
 use assert_cmd::Command;
+use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions};
+use cryptomator_core::{open_vault, MasterkeyFileAccess};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -172,4 +174,123 @@ fn java_opens_fixtures_after_a_password_change_by_crypto() {
         );
         assert_java_rejects(&vault, OLD_PW);
     }
+}
+
+/// A tree written by `CryptoFs` (long names, unicode, sizes at chunk boundaries, symlinks, nesting)
+/// is read by the real cryptofs; the Java manifest equals `crypto fs tree --json --hash`.
+#[test]
+#[ignore = "needs Java + Maven; run with --ignored"]
+fn java_reads_a_tree_written_by_crypto_fs() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    let vault = dir.path().join("rust-tree");
+    let crypto = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("crypto").unwrap();
+        cmd.env_remove("CRYPTO_SETTINGS_PATH")
+            .env_remove("CRYPTO_MIN_PW_LENGTH")
+            .env("CRYPTO_PASSWORD", "interop-passphrase")
+            .arg("--settings")
+            .arg(&settings)
+            .args(args);
+        cmd
+    };
+    crypto(&["vault", "create", "--name", "tree"])
+        .arg(&vault)
+        .assert()
+        .success();
+    {
+        let opened = open_vault(
+            &vault,
+            &MasterkeyFileAccess::new(Vec::new()),
+            "interop-passphrase",
+        )
+        .unwrap();
+        let fs = CryptoFs::open(opened, CryptoFsOptions::default());
+        fs.delete(&CleartextPath::parse("/WELCOME.rtf")).unwrap();
+        fs.create_dir_all(&CleartextPath::parse("/l1/l2/l3/l4/l5"))
+            .unwrap();
+        fs.write_file(
+            &CleartextPath::parse("/l1/l2/l3/l4/l5/deep.txt"),
+            b"deep\n",
+            false,
+        )
+        .unwrap();
+        for size in [0usize, 1, 32_767, 32_768, 32_769, 65_536, 100_000] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 7) as u8).collect();
+            fs.write_file(
+                &CleartextPath::parse(&format!("/size-{size}.bin")),
+                &data,
+                false,
+            )
+            .unwrap();
+        }
+        fs.write_file(
+            &CleartextPath::parse(&format!("/{}.txt", "c".repeat(200))),
+            b"200 chars\n",
+            false,
+        )
+        .unwrap();
+        fs.create_dir(&CleartextPath::parse(&format!("/{}", "d".repeat(200))))
+            .unwrap();
+        fs.write_file(
+            &CleartextPath::parse(&format!("/{}/inner.txt", "d".repeat(200))),
+            b"inside long dir\n",
+            false,
+        )
+        .unwrap();
+        fs.write_file(&CleartextPath::parse("/Grüße 🚀.txt"), b"nfc\n", false)
+            .unwrap();
+        fs.write_file(
+            &CleartextPath::parse("/cafe\u{301}.txt"),
+            b"nfd input, nfc name\n",
+            false,
+        )
+        .unwrap();
+        fs.create_dir(&CleartextPath::parse("/日本語")).unwrap();
+        fs.write_file(
+            &CleartextPath::parse("/日本語/ファイル.txt"),
+            b"japanese\n",
+            false,
+        )
+        .unwrap();
+        fs.write_file(
+            &CleartextPath::parse("/target.txt"),
+            b"link target\n",
+            false,
+        )
+        .unwrap();
+        fs.create_symlink(&CleartextPath::parse("/relative-link"), "target.txt")
+            .unwrap();
+        fs.create_symlink(&CleartextPath::parse("/absolute-link"), "/target.txt")
+            .unwrap();
+        fs.create_symlink(&CleartextPath::parse("/dangling"), "does-not-exist")
+            .unwrap();
+        // a rename and an overwrite exercise the mutation paths before Java looks
+        fs.rename(
+            &CleartextPath::parse("/size-1.bin"),
+            &CleartextPath::parse("/l1/one.bin"),
+            false,
+        )
+        .unwrap();
+        fs.write_file(&CleartextPath::parse("/size-0.bin"), b"", true)
+            .unwrap();
+        fs.close().unwrap();
+    }
+    let java = verify_with_java(&vault, "interop-passphrase");
+    let out = crypto(&["--json", "fs", "tree", "tree", "--hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rust: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(rust, java, "Java manifest differs from crypto fs tree");
+    assert_eq!(java.as_array().unwrap().len(), 24, "{java}");
+    assert!(
+        java.as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "/caf\u{e9}.txt"),
+        "NFC name"
+    );
 }
