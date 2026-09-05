@@ -3,3 +3,4 @@ pub mod kdf;
 pub mod keywrap;
 pub mod masterkey;
 pub mod rng;
+pub mod siv;
