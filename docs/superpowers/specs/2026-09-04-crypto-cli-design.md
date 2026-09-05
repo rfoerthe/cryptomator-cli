@@ -31,6 +31,10 @@ Das Vault-Format steckt **nicht** im Cryptomator-Repo, sondern in `cryptolib 2.2
 ## Zentrale technische Befunde (verifiziert gegen Sources)
 
 1. **FUSE-T ist mit `fuser` nicht direkt ansteuerbar.** FUSE-T hat kein `/dev/fuse`; `libfuse-t.dylib` ist eine libfuse-2.9-API-kompatible Bibliothek mit NFS/SMB-Userspace-Server. `fuser` spricht das Kernel-FUSE-Protokoll über einen fd. Einziger Weg für ein Binary mit Laufzeitwahl: `dlopen` der Vendor-Dylib (`/usr/local/lib/libfuse.2.dylib` macFUSE, `/usr/local/lib/libfuse-t.dylib` FUSE-T; genau diese Pfade prüfen `MacFuseMountProvider`/`FuseTMountProvider`), `fuse_mount_compat25(mountpoint, &fuse_args) -> fd` aufrufen (das Symbol nutzt fusers eigenes `src/mnt/fuse2.rs`) und den fd an `fuser::Session::from_fd` übergeben. Für macFUSE sicher, für FUSE-T **Spike (M0) mit Go/No-Go**; Fallback: `fuse_lowlevel_ops`-FFI-Backend nur für FUSE-T (wie jfuse).
+   **Spike-A-Ergebnis (M0, [`docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md`](../spikes/2026-09-04-spike-a-fuse-t.md)): FUSE-T 1.2.7 ist mit unverändertem fuser 0.18 ein NO-GO.**
+   Transport und Handshake funktionieren (`dlopen` → `fuse_mount_compat25` → `fuser::Session::from_fd`, `proto=7.19` ausgehandelt, echte Kernel-FUSE-Requests fließen); das Hindernis ist ausschließlich das Struct-ABI:
+   fuser schreibt unter `target_os = "macos"` das macFUSE-`fuse_attr`-Layout (104 B, mit `crtime`/`crtimensec`, `flags` vor `blksize`), während FUSE-T das Linux-Layout (88 B) parst — dadurch kommt `mode` als 0 an und FUSE-T bricht den Mount ab.
+   **Entscheidung für M4:** weiter mit `fuser`, aber mit einem Linux-ABI-Feature (Fork/Patch von `fuse_abi.rs`, das die `#[cfg(target_os = "macos")]`-Felder abschaltbar macht; als Feature-Flag upstream-tauglich), verifiziert durch einen Folge-Spike vor der Umsetzung. macFUSE ist **ungetestet** (nicht installiert) und vom Root Cause nicht betroffen.
 2. **`keyring`-Crate ungeeignet** (sucht nach `service`/`username`). Desktop-Schema: macOS Generic Password in der Login-Keychain, Service `"Cryptomator"`, Account = Vault-ID, Passwort UTF-8 → `security-framework` direkt. Linux Secret Service: Login-Collection, Label `"Cryptomator"`, Attribute `{"Vault": id, "Name": displayName}`, Suche nur über `{"Vault": id}` → `secret-service`-Crate direkt. KWallet (Ordner `Cryptomator`, Key = ID) optional/später.
 3. **settings.json-Asymmetrie**: Die Desktop-App ignoriert unbekannte Keys beim Lesen und **verwirft sie beim nächsten Speichern**. Das CLI muss unbekannte Keys erhalten (serde `flatten`), darf aber **keinen CLI-eigenen Zustand in settings.json ablegen** → separate `cli.json` neben settings.json. Lokal geprüft: `~/Library/Application Support/Cryptomator/settings.json` (geschrieben von 1.19.3) entspricht exakt `SettingsJson`.
 4. **AES-SIV-Schlüsselreihenfolge**: cryptolib ruft `siv.encrypt(encKey /*CTR*/, macKey /*S2V*/)`. RFC 5297/RustCrypto `Aes256Siv`: erste Hälfte = S2V-Key, zweite = CTR-Key → **Rust-Key = macKey ‖ encKey**.
@@ -39,6 +43,8 @@ Das Vault-Format steckt **nicht** im Cryptomator-Repo, sondern in `cryptolib 2.2
 7. **mountPointsDir**: Linux `~/.local/share/Cryptomator/mnt`; im macOS-Build-Skript fehlt ein Slash (Upstream-Tippfehler). Wir nutzen `~/Library/Application Support/Cryptomator/mnt` und dokumentieren die Abweichung.
 8. **Legacy-cryptofs auf Maven Central**: 1.9.15 (Format 7), 1.8.9 (Format 6), 1.6.2 (Format 5) für Legacy-Fixtures verfügbar.
 9. **Lokale Umgebung**: macOS 26.6.2, cargo 1.98, pkg-config, Java 26 + jshell + Maven. **Kein FUSE installiert** (weder macFUSE noch FUSE-T). Für Spike A und FUSE-Tests muss der User FUSE-T (`brew install --cask macos-fuse-t/homebrew-cask/fuse-t`) oder macFUSE installieren; bis dahin WebDAV-Feature bauen/testen. Da die Dylib per `dlopen` geladen wird, braucht der Build selbst kein FUSE.
+10. **Spike B (Desktop-Keychain lesen) ist BLOCKED, kein NO-GO** ([`docs/superpowers/spikes/2026-09-04-spike-b-keychain.md`](../spikes/2026-09-04-spike-b-keychain.md)):
+    Die Desktop-App hatte nie eine Passphrase gespeichert, es existierte also kein echter Eintrag; gegen einen Wegwerf-Eintrag zeigt macOS für jeden Zugriff einen modalen ACL-Dialog, den eine nicht-interaktive Session nicht beantworten kann. Der Ansatz (`security-framework`, Generic Password, Service `Cryptomator`, Account = Vault-ID) ist damit weder bestätigt noch widerlegt — **vor M6 mit einem Menschen am Rechner wiederholen**.
 
 ## Zielarchitektur
 
@@ -54,7 +60,7 @@ crates/
   cryptomator-mount/       MountService-API + Backends (Features: fuse, webdav; default beide)
   cryptomator-app/         settings.json, cli.json, State-Dir, Keychain, Vault-Registry, Mounter-Orchestrierung, Daemon-Protokoll/Client/Server
   crypto/                  Binary (clap): dünne Kommandoschicht, Ausgabe (human/--json), Exit-Codes
-xtask/                     lipo (Universal Binary), deb, Fixture-Regenerierung
+xtask/                     lipo (Universal Binary), deb, Fixture-Regenerierung (M8-Deliverable, noch nicht angelegt)
 tools/fixture-gen/         Maven-Harness (Java) zum Erzeugen/Verifizieren von Referenz-Vaults
 tests/fixtures/            eingecheckte Referenz-Vaults + Manifeste + KAT-Vektoren
 packaging/{homebrew/crypto.rb, deb/, man/}
@@ -66,9 +72,9 @@ packaging/{homebrew/crypto.rb, deb/, man/}
 | Rust-Modul | Verantwortung | Vorlage (Pfad im Sources-JAR bzw. App) |
 |---|---|---|
 | `crypto/masterkey.rs` | `Masterkey(Zeroizing<[u8;64]>)`, enc = [0..32], mac = [32..64] | cryptolib `api/Masterkey.java` |
-| `crypto/scrypt.rs`, `crypto/keywrap.rs` | scrypt (N=2^15, r=8, p=1, dkLen 32, Salt‖Pepper, Pepper leer), RFC3394 Wrap/Unwrap | `common/Scrypt.java`, `common/AesKeyWrap.java` |
+| `crypto/kdf.rs`, `crypto/keywrap.rs` | scrypt (N=2^15, r=8, p=1, dkLen 32, Salt‖Pepper, Pepper leer), RFC3394 Wrap/Unwrap | `common/Scrypt.java`, `common/AesKeyWrap.java` |
 | `crypto/siv.rs` | `FileNameCryptor`: `hash_directory_id` = BASE32(SHA1(SIV(dirId))), `encrypt_filename`/`decrypt_filename` (base64url mit Padding, AD = [dirId]) | `v2/FileNameCryptorImpl.java`, siv-mode `SivMode.java` |
-| `crypto/header.rs`, `crypto/content.rs`, `crypto/cryptor.rs` | `FileHeader{nonce, reserved=-1, content_key}`; `ContentCryptor` enum SivGcm (Header 68 B, Chunk 12+32768+16, AAD = BE64(chunkNo)‖headerNonce) / SivCtrMac (Header 88 B, Chunk 16+32768+32, HMAC mit macKey); `cleartext_size/ciphertext_size` exakt wie Java inkl. Fehlerfälle | `v1/*`, `v2/*` (`FileHeaderImpl`, `FileHeaderCryptorImpl`, `FileContentCryptorImpl`, `Constants`) |
+| `crypto/header.rs`, `crypto/gcm.rs`, `crypto/ctrmac.rs`, `crypto/cryptor.rs` | `FileHeader{nonce, reserved=-1, content_key}`; `ContentCryptor` enum SivGcm (Header 68 B, Chunk 12+32768+16, AAD = BE64(chunkNo)‖headerNonce) / SivCtrMac (Header 88 B, Chunk 16+32768+32, HMAC mit macKey); `cleartext_size/ciphertext_size` exakt wie Java inkl. Fehlerfälle | `v1/*`, `v2/*` (`FileHeaderImpl`, `FileHeaderCryptorImpl`, `FileContentCryptorImpl`, `Constants`) |
 | `crypto/stream.rs` | `EncryptingWriter`/`DecryptingReader` mit Leer-Chunk-Semantik (Befund 5) | `common/EncryptingWritableByteChannel.java`, `DecryptingReadableByteChannel.java` |
 | `masterkey_file.rs` | JSON (Feldreihenfolge version, scryptSalt, scryptCostParam, scryptBlockSize, primaryMasterKey, hmacMasterKey, versionMac; Std-Base64), `load/persist(.tmp+rename)/change_passphrase/read_alleged_vault_version` | `common/MasterkeyFile.java`, `common/MasterkeyFileAccess.java` |
 | `vault_config.rs` | JWT selbst implementiert: `UnverifiedVaultConfig` (kid, alleged format/threshold), `verify(raw_key, 8)` (HS256/384/512 akzeptieren), `to_token` (HS256), `KeyId` → `HubVaultUnsupported` | cryptofs `VaultConfig.java` |
@@ -107,7 +113,7 @@ packaging/{homebrew/crypto.rb, deb/, man/}
 - `fuse/linux.rs`: Klasse `…LinuxFuseMountProvider`; supported wenn `fusermount3 -V` (2 s Timeout); Caps `{MOUNT_FLAGS, MOUNT_TO_EXISTING_DIR}`; Default-Flags `-oauto_unmount -ouid=<uid> -ogid=<gid> -oattr_timeout=5`; Mount via `fuser::Session::new` (ohne `libfuse`-Feature, fuser ruft `fusermount3`); Unmount `fusermount3 -u -- <name>` (cwd Parent), forced `fusermount3 -uz` (nur wir, Cap `UNMOUNT_FORCED`).
 - `fuse/macos_dl.rs`: `libloading` von `fuse_mount_compat25`, `fuse_unmount_compat22`, `struct fuse_args`; argv `["cryptomator-cli", "-o", …]`; liefert `OwnedFd` → `fuser::Session::from_fd`.
 - `fuse/macfuse.rs`: Klasse `…MacFuseMountProvider`; supported wenn `/usr/local/lib/libfuse.2.dylib` oder `libosxfuse.2.dylib`; Caps `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, MOUNT_TO_SYSTEM_CHOSEN_PATH, VOLUME_ID, VOLUME_NAME}`; Defaults `-ouid=<uid> -ogid=<gid> -oatomic_o_trunc -oauto_xattr -oauto_cache -onoappledouble -odefault_permissions`; `-ovolname=<name>`, `-r` bei readonly; `-obackend=fskit` ablehnen; ohne Mountpoint `/Volumes/<volumeId>`; Unmount `umount -- <p>` / `umount -f -- <p>`.
-- `fuse/fuset.rs`: Klasse `…FuseTMountProvider`; supported wenn `/usr/local/lib/libfuse-t.dylib`; Caps `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, VOLUME_NAME}`; Defaults `-ononamedattr -obackend=smb -orwsize=262144 -ouid=<uid> -ogid=<gid>`; `-ononamedattr` immer anhängen; gleicher dlopen-Pfad (Spike-abhängig).
+- `fuse/fuset.rs`: Klasse `…FuseTMountProvider`; supported wenn `/usr/local/lib/libfuse-t.dylib`; Caps `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, VOLUME_NAME}`; Defaults `-ononamedattr -obackend=smb -orwsize=262144 -ouid=<uid> -ogid=<gid>`; `-ononamedattr` immer anhängen; gleicher dlopen-Pfad. Laut Spike A reicht dieser Pfad mit unverändertem fuser 0.18 **nicht** (macFUSE- statt Linux-`fuse_attr`-Layout) — M4 setzt fuser mit einem Linux-ABI-Feature (Fork/Patch von `fuse_abi.rs`, upstream-tauglich) ein, verifiziert durch einen Folge-Spike. Ebenfalls aus Spike A: `-obackend=smb` ist auf FUSE-T 1.2.7 unbrauchbar (nur der NFS-Helper `go-nfsv4` wird ausgeliefert, `mount -t smbfs` scheitert mit Exit 64) — Default-Backend NFS verwenden.
 - `webdav/{fs,server,fallback}.rs`: `impl dav_server::fs::DavFileSystem` über `CryptoFs` (Symlinks verborgen wie Java); hyper 1 + tokio auf `127.0.0.1:<port>` (Port 0 → ephemer), Kontextpfad `"/" + normalize(volumeId)`; `FallbackMounter` (Klasse `org.cryptomator.frontend.webdav.mount.FallbackMounter`, Caps `{LOOPBACK_PORT, VOLUME_ID}`), Werte `MacAppleScriptMounter`/`LinuxGioMounter` aus settings.json akzeptieren und auf Fallback mit Hinweis abbilden (OS-Mount via `open`/`gio mount` als spätere Komfortfunktion).
 
 ### `crypto` (Binary) – Kommandogrammatur (freigegeben, Details ergänzt)
@@ -159,7 +165,7 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 | JSON/UUID | `serde` 1, `serde_json` 1 (`preserve_order`), `uuid` 1 (v4) | Pretty-Print weicht kosmetisch von Jackson ab (ok) |
 | Secrets/RNG/CRC | `zeroize` 1.9, `secrecy` 0.10, `getrandom` 0.3, `crc32fast` 1.5 | |
 | Passwort-Prompt | `rpassword` 7.5 + `std::io::IsTerminal` | |
-| FUSE | `fuser` 0.18 (ohne `libfuse`-Feature) + `libloading` 0.8 | `Filesystem` mit `&self`, `Session::from_fd`, `MountOption::CUSTOM`; kein pkg-config nötig |
+| FUSE | `fuser` 0.18 (ohne `libfuse`-Feature) + `libloading` 0.9 | `Filesystem` mit `&self`, `Session::from_fd`, `MountOption::CUSTOM`; kein pkg-config nötig |
 | WebDAV | `dav-server` 0.11 (`hyper`) + `hyper` 1 + `hyper-util` + `http-body-util` | |
 | Async/Unix | `tokio` 1 (rt-multi-thread, net, signal, io-util, time, macros), `nix` 0.31 (process, signal, unistd, fcntl) | |
 | Keychain | `security-framework` 3.7 (macOS), `secret-service` 5.2 (`rt-tokio-crypto-rust`, Linux) | |
@@ -179,14 +185,14 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 
 - macOS: `aarch64-apple-darwin` + `x86_64-apple-darwin` → `xtask lipo` Universal Binary; kein Link gegen libfuse (dlopen), läuft ohne FUSE (WebDAV). `MACOSX_DEPLOYMENT_TARGET=12.0`. Optional Developer-ID-Signatur/Notarisierung (stabile Code-Identität reduziert Keychain-Prompts).
 - Linux: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`; kein libfuse zur Build-/Linkzeit (`fusermount3` zur Laufzeit aus `fuse3`); musl-Static als Extra-Artefakt möglich.
-- CI (`ci.yml`): macos-15 (arm64), macos-13 (x86_64), ubuntu-22.04, ubuntu-22.04-arm; Jobs fmt+clippy(-D warnings), Unit/Prop-Tests, interop-java (Temurin + Maven-Cache), Mount-E2E, Keychain-E2E. `release.yml` bei Tag: Build, lipo, `cargo-deb` (`Depends: fuse3`, `Recommends: gnome-keyring`), tar.gz + sha256, GitHub-Release, Homebrew-Formel (`packaging/homebrew/crypto.rb`, Caveats: macfuse oder fuse-t).
+- CI (`ci.yml`): **aktuell umgesetzt** ubuntu-22.04 und macos-15 (arm64) mit `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`. macos-13 (x86_64) und ubuntu-22.04-arm sowie die Jobs interop-java (Temurin + Maven-Cache), Mount-E2E und Keychain-E2E sind für **M8** geplant. `release.yml` bei Tag: Build, lipo, `cargo-deb` (`Depends: fuse3`, `Recommends: gnome-keyring`), tar.gz + sha256, GitHub-Release, Homebrew-Formel (`packaging/homebrew/crypto.rb`, Caveats: macfuse oder fuse-t).
 - README-Voraussetzungen: macOS macFUSE (Kext) oder FUSE-T (`brew install --cask macos-fuse-t/homebrew-cask/fuse-t`), sonst WebDAV; Linux `fuse3`, ggf. `user_allow_other`, Secret-Service-Daemon für Keychain.
 
 ## Phasen und Meilensteine
 
 | M | Umfang | Testbar am Ende |
 |---|---|---|
-| **M0 Gerüst + Spikes** | Workspace, Lizenz, CI-Skelett, `xtask`, Spec ins Repo; **Spike A**: dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `fuser::Session::from_fd` mit Hello-World-FS (braucht FUSE-T-Installation durch den User); **Spike B**: Desktop-Keychain-Eintrag auf macOS lesen; `cargo tree -d` für RustCrypto-Generationen | Go/No-Go FUSE-T-via-fuser (sonst lowlevel-FFI-Backend einplanen); Keychain-Ansatz bestätigt |
+| **M0 Gerüst + Spikes** | Workspace, Lizenz, CI-Skelett, Spec ins Repo (`xtask` nach M8 verschoben); **Spike A**: dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `fuser::Session::from_fd` mit Hello-World-FS (braucht FUSE-T-Installation durch den User); **Spike B**: Desktop-Keychain-Eintrag auf macOS lesen; `cargo tree -d` für RustCrypto-Generationen | Go/No-Go FUSE-T-via-fuser (sonst lowlevel-FFI-Backend einplanen); Keychain-Ansatz bestätigt |
 | **M1 Core-Krypto** | masterkey, scrypt, keywrap, SIV-Namen, Header/Content beide Schemata, Streams, Masterkey-Datei, Vault-Config-JWT, Recovery-Wörter/Key; Fixture-Generator + `vectors.json` | KATs; `recovery-key validate`; Masterkey-Load aller Fixtures |
 | **M2 Vault-Metadaten** | Settings-Modell/Store, Vault-Refs, Zustandserkennung + bkup-Restore, `vault create/add/remove/list/info/set`, `password change`, `recovery-key show/reset-password`, `config`, Readme-Erzeugung | Java `verify` akzeptiert Rust-erzeugte leere Vaults; Settings-Roundtrip; Desktop-App öffnet CLI-Vault |
 | **M3 Dateisystem + mountlose Ops** | path mapper, dir stream + Konflikte, open files/chunk cache, symlinks, attrs, `fs *`, `name decrypt/locate` | bidirektionaler Interop auf allen Fixtures; proptests |
@@ -194,7 +200,7 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 | **M5 WebDAV** | dav-server-FS, Server, FallbackMounter, Portregeln | Finder/`gio`/`curl`-E2E |
 | **M6 Keychain** | macOS/Linux-Provider, `password store/forget`, Keychain-Unlock, `--store-password` | Keychain-E2E; Einträge mit Desktop-App austauschbar |
 | **M7 Health, Restore, Migration** | 3 Checks + Fixes + Report, `recovery-key restore`, Migratoren v6/v7/v8 | beschädigte Fixtures (Harness erzeugt: Orphan-Dir, fehlende dirid, Trailing Bytes …); Legacy-Fixtures migrieren und in Java verifizieren |
-| **M8 Release** | Packaging, Docs, Manpages, Completions, Homebrew/deb | Release-Artefakte auf sauberen VMs installierbar |
+| **M8 Release** | Packaging, Docs, Manpages, Completions, Homebrew/deb, `xtask` (lipo/deb/Fixture-Regenerierung), vollständige CI-Matrix (macos-13, ubuntu-22.04-arm, interop-java, Mount-/Keychain-E2E) | Release-Artefakte auf sauberen VMs installierbar |
 
 Jede Phase: TDD, Commit pro Task, Kompatibilitätslauf gegen Fixtures am Ende.
 
