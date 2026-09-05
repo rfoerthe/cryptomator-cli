@@ -28,7 +28,7 @@ pub use events::{discard_events, EventCollector, EventSink, FilesystemEvent};
 // pub use open_file::{OpenCryptoFile, OpenOptions};
 // pub use open_files::{FileHandle, OpenCryptoFiles};
 pub use path::{child_display, CleartextPath};
-// pub use path_mapper::CryptoPathMapper;
+pub use path_mapper::CryptoPathMapper;
 pub use stats::{CryptoFsStats, StatsSnapshot};
 
 use std::fmt::Display;
@@ -41,8 +41,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// The io helpers are consumed by the modules added in later tasks.
-#[allow(dead_code)]
+// The io helpers not yet used are consumed by the modules added in later tasks.
 mod io_errors {
     use super::*;
 
@@ -58,18 +57,21 @@ mod io_errors {
             format!("{path}: already exists"),
         )
     }
+    #[allow(dead_code)]
     pub(crate) fn not_a_directory(path: impl Display) -> io::Error {
         io::Error::new(
             io::ErrorKind::NotADirectory,
             format!("{path}: not a directory"),
         )
     }
+    #[allow(dead_code)]
     pub(crate) fn is_a_directory(path: impl Display) -> io::Error {
         io::Error::new(
             io::ErrorKind::IsADirectory,
             format!("{path}: is a directory"),
         )
     }
+    #[allow(dead_code)]
     pub(crate) fn directory_not_empty(path: impl Display) -> io::Error {
         io::Error::new(
             io::ErrorKind::DirectoryNotEmpty,
@@ -82,18 +84,21 @@ mod io_errors {
     pub(crate) fn invalid_data(message: impl Into<String>) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message.into())
     }
+    #[allow(dead_code)]
     pub(crate) fn read_only_fs() -> io::Error {
         io::Error::new(
             io::ErrorKind::ReadOnlyFilesystem,
             "vault is opened read-only",
         )
     }
+    #[allow(dead_code)]
     pub(crate) fn name_too_long(path: impl Display, max: usize) -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{path}: file name longer than {max} characters"),
         )
     }
+    #[allow(dead_code)]
     pub(crate) fn not_a_link(path: impl Display, detail: &str) -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -101,6 +106,7 @@ mod io_errors {
         )
     }
     /// `ErrorKind::FilesystemLoop` is still unstable, so this uses `Other`.
+    #[allow(dead_code)]
     pub(crate) fn fs_loop(path: impl Display) -> io::Error {
         io::Error::other(format!("{path}: too many levels of symbolic links"))
     }

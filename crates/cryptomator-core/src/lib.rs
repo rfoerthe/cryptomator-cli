@@ -26,7 +26,10 @@ pub use crypto::rng::{OsRng, Rng};
 pub use crypto::siv::FileNameCryptor;
 pub use crypto::stream::{decrypt_all, encrypt_all, DecryptingReader, EncryptingWriter};
 pub use error::{CoreError, NotAVaultReason, Result};
-pub use fs::CleartextPath;
+pub use fs::{
+    CiphertextDirectory, CiphertextFilePath, CiphertextFileType, CleartextPath, CryptoPathMapper,
+    DirIdLoader, EventSink, FilesystemEvent,
+};
 pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
 pub use vault::init::{
     create_vault, initialize, write_root_file, CreateVaultOptions, DEFAULT_SHORTENING_THRESHOLD,
