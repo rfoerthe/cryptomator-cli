@@ -50,8 +50,16 @@
 - Passphrase sources `--password-stdin` / `--password-file` / `--password-env` / `$CRYPTO_PASSWORD` /
   TTY prompt, NFC normalisation, minimum length and confirmation for new passwords. `password change`
   does not take the new password from `$CRYPTO_PASSWORD`, which holds the current one.
+- `crypto vault set --mount-flags` requires the `=` form (`--mount-flags="-ovolname=Secret"`), so a
+  forgotten value cannot swallow the next flag.
 - Interop: the Java harness verifies vaults created by `crypto` for both cipher combos
-  (`cargo test -p crypto --test java_interop -- --ignored`, CI job `interop-java`).
+  (`cargo test -p crypto --test java_interop -- --ignored`, CI job `interop-java`) and re-verifies the
+  checked-in fixtures after `crypto password change` — with the new passphrase accepted and the old
+  one rejected.
+- Deferred to M4: `settings.json` writes are atomic (tmp + rename) but not locked — the `flock` on
+  `settings.json.lock` and the warning about a running desktop app ship with the daemon, which owns
+  settings-writer coordination. Until then, close the desktop app before `vault add/remove/set` and
+  `config set`.
 - Deliberate deviation from the desktop app: a `settings.json` that cannot be parsed is reported as
   an error instead of being silently replaced with defaults, so a broken or foreign file never costs
   the user their vault list.

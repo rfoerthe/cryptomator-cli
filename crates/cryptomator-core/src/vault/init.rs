@@ -88,7 +88,7 @@ pub fn initialize(
     if !vault_path.is_dir() {
         return Err(CoreError::Io(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
-            vault_path.display().to_string(),
+            format!("{} is not a directory", vault_path.display()),
         )));
     }
     validate_threshold(shortening_threshold)?;

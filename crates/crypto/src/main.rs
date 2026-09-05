@@ -70,13 +70,15 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 let mut input = Zeroizing::new(String::new());
                 std::io::stdin().read_to_string(&mut input)?;
                 let recovery_key: &str = input.trim();
-                if validate_recovery_key(&WordEncoder::new(), recovery_key) {
-                    println!("valid");
-                    Ok(exit::OK)
+                let valid = validate_recovery_key(&WordEncoder::new(), recovery_key);
+                ctx.out.emit(serde_json::json!({ "valid": valid }), || {
+                    if valid { "valid" } else { "invalid" }.to_string()
+                })?;
+                Ok(if valid {
+                    exit::OK
                 } else {
-                    println!("invalid");
-                    Ok(exit::INVALID_PASSPHRASE)
-                }
+                    exit::INVALID_PASSPHRASE
+                })
             }
         },
         Command::Config { command } => match command {

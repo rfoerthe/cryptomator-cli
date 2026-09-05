@@ -55,7 +55,7 @@ pub fn check_dir_structure(path_to_vault: &Path) -> Result<DirStructure> {
     if !metadata.is_dir() {
         return Err(CoreError::Io(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
-            path_to_vault.display().to_string(),
+            format!("{} is not a directory", path_to_vault.display()),
         )));
     }
     if path_to_vault.join(DATA_DIR_NAME).is_dir() {
@@ -70,16 +70,26 @@ pub fn check_dir_structure(path_to_vault: &Path) -> Result<DirStructure> {
 }
 
 /// `VaultListManager.assertIsVaultDirectory`: Ok for `Vault` and `MaybeLegacy`, otherwise the most specific reason.
+/// A missing path and a path that is not a directory are reported as `NotAVaultDirectory` too, so
+/// every "this is not a vault" outcome maps to the same exit code instead of a bare I/O error.
 pub fn assert_is_vault_directory(path_to_vault: &Path) -> Result<()> {
-    if check_dir_structure(path_to_vault)? != DirStructure::Unrelated {
-        return Ok(());
-    }
     let fail = |reason| {
         Err(CoreError::NotAVaultDirectory {
             path: path_to_vault.to_path_buf(),
             reason,
         })
     };
+    match check_dir_structure(path_to_vault) {
+        Ok(DirStructure::Unrelated) => {}
+        Ok(_) => return Ok(()),
+        Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return fail(NotAVaultReason::PathNotFound)
+        }
+        Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotADirectory => {
+            return fail(NotAVaultReason::NotADirectory)
+        }
+        Err(e) => return Err(e),
+    }
     let data_dir = path_to_vault.join(DATA_DIR_NAME);
     if !data_dir.exists() {
         return fail(NotAVaultReason::MissingDataDir);

@@ -93,7 +93,8 @@ packaging/{homebrew/crypto.rb, deb/, man/}
 ### `cryptomator-app`
 
 - `settings/model.rs`: `SettingsJson`/`VaultSettingsJson` mit nur den genutzten Feldern + `#[serde(flatten)] extra: Map` auf beiden Ebenen; Java-Defaults (port 42427, useKeychain true, revealAfterMount true, autoLockIdleSeconds 1800, actionAfterUnlock ASK, maxCleartextFilenameLength -1, keychainProvider/mountService per OS); `Option`-Felder mit `skip_serializing_if` (entspricht `NON_NULL`); Legacy-Keys (`preferredVolumeImpl`, `useCustomMountPath`/`customMountPath`, `winDriveLetter`) lesen, migrieren und beim Schreiben entfernen. Neue Einträge mit vollem Java-Default-Satz schreiben. Golden-Tests aus `src/test/java/org/cryptomator/common/settings/SettingsJsonTest.java` übernehmen.
-- `settings/store.rs`: Pfade macOS `~/Library/Application Support/Cryptomator/settings.json`; Linux `~/.config/Cryptomator/settings.json`, dann `~/.Cryptomator/settings.json`; Override `--settings`/`CRYPTO_SETTINGS_PATH`. Laden tolerant; Speichern pretty JSON → `settings.json.tmp` → rename, `flock` auf `settings.json.lock`; `writtenByVersion` erhalten (nur bei Neuanlage `crypto-<semver>`). Warnung, wenn der Desktop-IPC-Socket erreichbar ist (App läuft). Eine unparsebare settings.json führt zu einem Fehler (Abweichung von Java, das sie stillschweigend ersetzt).
+- `settings/store.rs`: Pfade macOS `~/Library/Application Support/Cryptomator/settings.json`; Linux `~/.config/Cryptomator/settings.json`, dann `~/.Cryptomator/settings.json`; Override `--settings`/`CRYPTO_SETTINGS_PATH`. Laden tolerant; Speichern pretty JSON → `settings.json.<pid>.tmp` → rename; `writtenByVersion` erhalten (nur bei Neuanlage `crypto-<semver>`). Eine unparsebare settings.json führt zu einem Fehler (Abweichung von Java, das sie stillschweigend ersetzt).
+  **M2 liefert ausschließlich das atomare tmp+rename.** `flock` auf `settings.json.lock` und die Warnung bei erreichbarem Desktop-IPC-Socket sind **auf M4 verschoben**, wo der Daemon die Koordination der Settings-Schreiber ohnehin besitzt (siehe Risiko 3). Bis dahin gilt: Desktop-App vor `vault add/remove/set` und `config set` schließen.
 - `settings/vault_ref.rs`, `settings/ids.rs`: Auflösung per ID / Anzeigename (eindeutig, erst case-sensitive) / Pfad (kanonisiert); Ad-hoc-Vault per Pfad mit `--no-register`; ID = base64url(9 Zufallsbytes); `normalize_display_name` (mountName-Regeln).
 - `cli_config.rs`: `cli.json` neben settings.json (`mountPointsDir`, `defaultMounter`, `logLevel`, `forceUnmountOnSignalAfterSecs`, `webdavBind`).
 - `state_dir.rs`: Linux `$XDG_RUNTIME_DIR/crypto` (Fallback `/tmp/crypto-<uid>`, 0700), macOS `~/Library/Application Support/Cryptomator/cli-run`; je Vault `<id>.sock/.pid/.json/.log`.
@@ -124,7 +125,7 @@ Vault-Referenz <VAULT>: ID | Anzeigename | Pfad. Passwortoptionen (max. eine): -
 
 crypto vault create <path> [--name N] [--shortening-threshold 36..220 (220)] [--show-recovery-key] [--no-register] [--store-password]
 crypto vault add <path> [--name N] | remove <VAULT> [--forget-password] | list | info <VAULT>
-crypto vault set <VAULT> [--name] [--mount-point P|--no-mount-point] [--read-only true|false] [--mount-flags S|--default-mount-flags] [--mounter X] [--port N] [--auto-lock-idle SECS|--no-auto-lock] [--max-filename-length N|auto]
+crypto vault set <VAULT> [--name] [--mount-point P|--no-mount-point] [--read-only true|false] [--mount-flags=S|--default-mount-flags] [--mounter X] [--port N] [--auto-lock-idle SECS|--no-auto-lock] [--max-filename-length N|auto]
 crypto unlock <VAULT> [--mounter X] [--mount-point P] [--mount-option -o…]* [--read-only] [--volume-name N] [--port N] [--foreground] [--store-password|--no-store-password] [--reveal]
 crypto lock <VAULT>... | --all [--force]
 crypto status [<VAULT>] ; crypto stats <VAULT> [--follow] [--interval S] ; crypto events <VAULT> [--follow] [--since N]
@@ -194,13 +195,15 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 |---|---|---|
 | **M0 Gerüst + Spikes** ✅ | Workspace, Lizenz, CI-Skelett, Spec ins Repo (`xtask` nach M8 verschoben); **Spike A**: dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `fuser::Session::from_fd` mit Hello-World-FS (braucht FUSE-T-Installation durch den User); **Spike B**: Desktop-Keychain-Eintrag auf macOS lesen; `cargo tree -d` für RustCrypto-Generationen | Go/No-Go FUSE-T-via-fuser (sonst lowlevel-FFI-Backend einplanen); Keychain-Ansatz bestätigt |
 | **M1 Core-Krypto** ✅ | masterkey, scrypt, keywrap, SIV-Namen, Header/Content beide Schemata, Streams, Masterkey-Datei, Vault-Config-JWT, Recovery-Wörter/Key; Fixture-Generator + `vectors.json` | KATs; `recovery-key validate`; Masterkey-Load aller Fixtures |
-| **M2 Vault-Metadaten** ✅ | Settings-Modell/Store, Vault-Refs, Zustandserkennung + bkup-Restore, `vault create/add/remove/list/info/set`, `password change`, `recovery-key show/reset-password`, `config`, Readme-Erzeugung | Java `verify` akzeptiert Rust-erzeugte leere Vaults; Settings-Roundtrip; Desktop-App öffnet CLI-Vault |
+| **M2 Vault-Metadaten** ✅ [^m2-lock] | Settings-Modell/Store, Vault-Refs, Zustandserkennung + bkup-Restore, `vault create/add/remove/list/info/set`, `password change`, `recovery-key show/reset-password`, `config`, Readme-Erzeugung | Java `verify` akzeptiert Rust-erzeugte leere Vaults; Settings-Roundtrip; Desktop-App öffnet CLI-Vault |
 | **M3 Dateisystem + mountlose Ops** | path mapper, dir stream + Konflikte, open files/chunk cache, symlinks, attrs, `fs *`, `name decrypt/locate` | bidirektionaler Interop auf allen Fixtures; proptests |
 | **M4 FUSE + Daemon** | fuser-Adapter, Linux-/macFUSE-/FUSE-T-Provider, `Mounter`, Daemon/Protokoll, `unlock/lock/status/stats/events`, Auto-Lock, `mounters` | Mount-E2E Linux-CI + FUSE-T macOS; Koexistenz mit Desktop-App |
 | **M5 WebDAV** | dav-server-FS, Server, FallbackMounter, Portregeln | Finder/`gio`/`curl`-E2E |
 | **M6 Keychain** | macOS/Linux-Provider, `password store/forget`, Keychain-Unlock, `--store-password` | Keychain-E2E; Einträge mit Desktop-App austauschbar |
 | **M7 Health, Restore, Migration** | 3 Checks + Fixes + Report, `recovery-key restore`, Migratoren v6/v7/v8 | beschädigte Fixtures (Harness erzeugt: Orphan-Dir, fehlende dirid, Trailing Bytes …); Legacy-Fixtures migrieren und in Java verifizieren |
 | **M8 Release** | Packaging, Docs, Manpages, Completions, Homebrew/deb, `xtask` (lipo/deb/Fixture-Regenerierung), vollständige CI-Matrix (macos-13, ubuntu-22.04-arm, interop-java, Mount-/Keychain-E2E) | Release-Artefakte auf sauberen VMs installierbar |
+
+[^m2-lock]: M2 ist abgeschlossen **ohne** `flock` auf `settings.json.lock` und ohne die Warnung bei laufender Desktop-App; beides ist nach M4 verschoben (Daemon besitzt die Schreiber-Koordination, siehe `settings/store.rs` oben und Risiko 3). Bis dahin: Desktop-App vor `vault add/remove/set` und `config set` schließen.
 
 ✅ = abgeschlossen. Jede Phase: TDD, Commit pro Task, Kompatibilitätslauf gegen Fixtures am Ende.
 
@@ -221,7 +224,7 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 
 1. **FUSE-T über fuser** (Top-Risiko): Spike A; Fallback lowlevel-FFI-Backend (+ Aufwand). Selbst bei funktionierendem fd können FUSE-T-Protokolldetails (`fuse_init`-Flags, `renamex_np`, `setvolname`) fuser-Anpassungen erfordern.
 2. **macOS-Keychain-ACLs**: von Cryptomator.app erzeugte Einträge lösen beim CLI Zugriffs-Prompts aus und umgekehrt; Touch-ID-Einträge ggf. headless nicht lesbar. Signatur mit stabiler Identität und Doku.
-3. **Gleichzeitige settings.json-Schreiber**: Desktop-App schreibt die ganze Datei aus dem Speicher (1 s Debounce) → CLI-Änderungen bei laufender App können verloren gehen. flock + kurzes RMW-Fenster + Warnung, wenn IPC-Socket erreichbar; Empfehlung, App für `vault add/remove` zu schließen.
+3. **Gleichzeitige settings.json-Schreiber**: Desktop-App schreibt die ganze Datei aus dem Speicher (1 s Debounce) → CLI-Änderungen bei laufender App können verloren gehen. M2 liefert nur das kurze RMW-Fenster mit atomarem tmp+rename; flock und die Warnung bei erreichbarem IPC-Socket kommen mit M4 (Daemon). Empfehlung bis dahin: App für `vault add/remove/set` und `config set` schließen.
 4. **`.c9u`-In-Use-Marker** (nur mit Hub-Owner aktiv): beim Listing ignorieren, nie erzeugen.
 5. **Namensnormalisierung macOS** (NFD FUSE-seitig, NFC im Vault), Finder-`._*`-Dateien (werden normale verschlüsselte Dateien, wie bei Java-WebDAV).
 6. **Java-`cleartextSize`-Fehlerfälle** (Größe 0 bei fehlerhaftem letztem Chunk) exakt nachbilden, damit `ls -l` mit der Desktop-App übereinstimmt.

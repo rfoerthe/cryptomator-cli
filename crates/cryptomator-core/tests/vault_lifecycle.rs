@@ -1,8 +1,8 @@
 //! create → open → change password → open again, exercising the public API only.
 use cryptomator_core::recovery::{create_recovery_key, reset_password, WordEncoder};
 use cryptomator_core::{
-    change_password, create_vault, open_vault, read_vault_config, CoreError, CreateVaultOptions,
-    MasterkeyFileAccess, OsRng, VAULT_VERSION,
+    change_password, create_vault, open_vault, read_vault_config, BackupStatus, CoreError,
+    CreateVaultOptions, MasterkeyFileAccess, OsRng, VAULT_VERSION,
 };
 use std::fs;
 
@@ -24,7 +24,9 @@ fn full_password_lifecycle() {
     .unwrap();
     let old_file = fs::read(vault.join("masterkey.cryptomator")).unwrap();
 
-    let backup = change_password(&vault, &access, OLD, NEW, &mut OsRng).unwrap();
+    let outcome = change_password(&vault, &access, OLD, NEW, &mut OsRng).unwrap();
+    assert_eq!(outcome.status, BackupStatus::Created);
+    let backup = outcome.path;
     assert!(backup
         .file_name()
         .unwrap()

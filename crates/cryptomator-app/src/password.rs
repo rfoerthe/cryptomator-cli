@@ -139,6 +139,21 @@ enum DefaultEnv {
     Denied,
 }
 
+impl DefaultEnv {
+    /// The `env_fallback` flag of [`AppError::NoPasswordSource`]: does `$CRYPTO_PASSWORD` count here?
+    fn is_allowed(self) -> bool {
+        self == DefaultEnv::Allowed
+    }
+}
+
+/// The "no source left" error for this passphrase position, naming the flags that would work.
+fn no_source(args: &PasswordArgs, default_env: DefaultEnv) -> AppError {
+    AppError::NoPasswordSource {
+        label: args.label,
+        env_fallback: default_env.is_allowed(),
+    }
+}
+
 fn read_raw(
     args: &PasswordArgs,
     prompt: &str,
@@ -149,7 +164,7 @@ fn read_raw(
         return io
             .read_stdin_line()?
             .map(|line| Zeroizing::new(strip_line_ending(line)))
-            .ok_or(AppError::NoPasswordSource);
+            .ok_or_else(|| no_source(args, default_env));
     }
     if let Some(file) = &args.password_file {
         return read_secret_file(file, &format!("{}-file", args.label));
@@ -170,7 +185,7 @@ fn read_raw(
     }
     io.prompt(prompt)?
         .map(Zeroizing::new)
-        .ok_or(AppError::NoPasswordSource)
+        .ok_or_else(|| no_source(args, default_env))
 }
 
 pub fn read_passphrase(
@@ -224,7 +239,7 @@ fn read_new(
         let confirmation = io
             .prompt("Confirm password: ")?
             .map(|c| normalize_passphrase(&Zeroizing::new(c)))
-            .ok_or(AppError::NoPasswordSource)?;
+            .ok_or_else(|| no_source(args, default_env))?;
         if *confirmation != *passphrase {
             return Err(AppError::PasswordMismatch);
         }
@@ -291,7 +306,7 @@ mod tests {
         );
         assert!(matches!(
             read_passphrase(&args(true, None, None), "p", &mut io),
-            Err(AppError::NoPasswordSource)
+            Err(AppError::NoPasswordSource { .. })
         ));
         assert!(io.prompted.is_empty());
     }
@@ -356,7 +371,7 @@ mod tests {
         let mut no_tty = FakeIo::default();
         assert!(matches!(
             read_passphrase(&args(false, None, None), "p", &mut no_tty),
-            Err(AppError::NoPasswordSource)
+            Err(AppError::NoPasswordSource { .. })
         ));
     }
 
@@ -426,7 +441,7 @@ mod tests {
         };
         assert!(matches!(
             read_new_passphrase_no_env_fallback(&args(false, None, None), "p", 8, &mut no_tty),
-            Err(AppError::NoPasswordSource)
+            Err(AppError::NoPasswordSource { .. })
         ));
 
         // Explicit flags keep working, and `read_new_passphrase` keeps the env fallback.
@@ -452,6 +467,40 @@ mod tests {
             "current-passphrase"
         );
         assert!(explicit.prompted.is_empty());
+    }
+
+    #[test]
+    fn no_password_source_message_depends_on_the_position() {
+        // Current password: $CRYPTO_PASSWORD is one of the sources.
+        let mut no_tty = FakeIo::default();
+        let err = read_passphrase(&args(false, None, None), "p", &mut no_tty).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("--password-stdin, --password-file or --password-env"));
+        assert!(message.contains(&format!("set {PASSWORD_ENV}")));
+
+        // New password of `password change`: the variable holds the *current* password.
+        let new_args = PasswordArgs::from(&NewPasswordArgs::default());
+        let mut with_env = FakeIo {
+            env: HashMap::from([(PASSWORD_ENV.to_string(), "current-passphrase".to_string())]),
+            ..Default::default()
+        };
+        let err =
+            read_new_passphrase_no_env_fallback(&new_args, "p", 8, &mut with_env).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("--new-password-stdin, --new-password-file or --new-password-env"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "{PASSWORD_ENV} supplies only the current password"
+            )),
+            "{message}"
+        );
+        assert!(
+            !message.contains(&format!("set {PASSWORD_ENV}")),
+            "{message}"
+        );
     }
 
     #[test]

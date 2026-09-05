@@ -44,7 +44,11 @@ fn read_recovery_key(
     } else {
         io.read_stdin_line()?
             .map(Zeroizing::new)
-            .ok_or(AppError::NoPasswordSource)?
+            // Not a password source: name the flag that was given but delivered nothing.
+            .ok_or_else(|| AppError::InvalidValue {
+                key: "--recovery-key-stdin".to_string(),
+                message: "no recovery key on standard input".to_string(),
+            })?
     };
     Ok(Zeroizing::new(
         raw.split_whitespace().collect::<Vec<_>>().join(" "),

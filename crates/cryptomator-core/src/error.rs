@@ -39,6 +39,10 @@ pub enum CoreError {
 /// Why a directory is not usable as a vault (`common/vaults/NotAVaultDirectoryException.Reason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotAVaultReason {
+    /// The path does not exist at all.
+    PathNotFound,
+    /// The path exists but is not a directory (e.g. a regular file).
+    NotADirectory,
     MissingDataDir,
     DataNotADirectory,
     MissingVaultConfig,
@@ -49,6 +53,8 @@ pub enum NotAVaultReason {
 impl NotAVaultReason {
     pub fn as_str(&self) -> &'static str {
         match self {
+            NotAVaultReason::PathNotFound => "PATH_NOT_FOUND",
+            NotAVaultReason::NotADirectory => "NOT_A_DIRECTORY",
             NotAVaultReason::MissingDataDir => "MISSING_DATA_DIR",
             NotAVaultReason::DataNotADirectory => "DATA_NOT_A_DIRECTORY",
             NotAVaultReason::MissingVaultConfig => "MISSING_VAULT_CONFIG",

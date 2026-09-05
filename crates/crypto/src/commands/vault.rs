@@ -196,7 +196,8 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
 
 pub fn add(ctx: &Ctx, args: AddArgs) -> Result<u8> {
     let path = normalize_vault_path(&args.path);
-    assert_is_vault_directory(&path)?;
+    assert_is_vault_directory(&path)
+        .with_context(|| format!("cannot register vault at {}", path.display()))?;
     let vault = register(ctx, &path, args.name)?;
     ctx.out.emit(vault_json(&vault), || {
         format!(
@@ -270,10 +271,12 @@ pub fn set(ctx: &Ctx, args: SetArgs) -> Result<u8> {
         Some("default") | Some("") => Some(None),
         Some(other) => Some(Some(resolve_mounter(other)?)),
     };
+    // Accepted case-insensitively like `--mounter`; settings.json always gets the canonical
+    // upper-case spelling, because the desktop app's Jackson mapping is case-sensitive.
     let action =
         match args.action_after_unlock.as_deref() {
             None => None,
-            Some(value) => Some(WhenUnlocked::parse(value).ok_or_else(|| {
+            Some(value) => Some(WhenUnlocked::parse(&value.to_uppercase()).ok_or_else(|| {
                 invalid("--action-after-unlock", "expected IGNORE, REVEAL or ASK")
             })?),
         };

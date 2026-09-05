@@ -84,12 +84,14 @@ pub struct SetArgs {
     /// Mount read-only (true|false)
     #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
     pub read_only: Option<bool>,
-    /// Custom mount flags, e.g. "-ovolname=Secret"
+    /// Custom mount flags, e.g. --mount-flags="-ovolname=Secret"
     // Mount flags start with a dash; without `allow_hyphen_values` clap would read them as options.
+    // `require_equals` keeps that from swallowing the *next* flag when the value is left out.
     #[arg(
         long,
         value_name = "FLAGS",
         allow_hyphen_values = true,
+        require_equals = true,
         conflicts_with = "default_mount_flags"
     )]
     pub mount_flags: Option<String>,

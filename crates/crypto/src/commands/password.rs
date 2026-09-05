@@ -7,7 +7,9 @@ use cryptomator_app::{
     min_password_length, read_new_passphrase_no_env_fallback, read_passphrase, PasswordArgs,
     SystemIo,
 };
-use cryptomator_core::{change_password, read_vault_config, MasterkeyFileAccess, OsRng};
+use cryptomator_core::{
+    change_password, read_vault_config, BackupStatus, MasterkeyFileAccess, OsRng,
+};
 use serde_json::json;
 
 pub fn change(ctx: &Ctx, args: ChangePasswordArgs) -> Result<u8> {
@@ -33,12 +35,28 @@ pub fn change(ctx: &Ctx, args: ChangePasswordArgs) -> Result<u8> {
         &new,
         &mut OsRng,
     )?;
-    ctx.out
-        .emit(json!({ "path": path, "backup": backup }), || {
-            format!(
+    // Only these two statuses mean a file with the *old* masterkey is on disk: `Created` was
+    // written completely, `VerifiedExisting` was compared byte for byte.
+    let kept = matches!(
+        backup.status,
+        BackupStatus::Created | BackupStatus::VerifiedExisting
+    );
+    if !kept {
+        eprintln!(
+            "warning: no backup of the previous masterkey file could be verified at {}",
+            backup.path.display()
+        );
+    }
+    let backup_path = kept.then_some(&backup.path);
+    ctx.out.emit(
+        json!({ "path": path, "backup": backup_path }),
+        || match backup_path {
+            Some(path) => format!(
                 "Password changed. Previous masterkey file kept as {}",
-                backup.display()
-            )
-        })?;
+                path.display()
+            ),
+            None => "Password changed.".to_string(),
+        },
+    )?;
     Ok(exit::OK)
 }

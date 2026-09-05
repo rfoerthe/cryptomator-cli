@@ -71,11 +71,24 @@ fn render(value: &Value) -> String {
     }
 }
 
+/// An empty value would be written verbatim into settings.json, where the desktop app cannot
+/// resolve it: `mountService` is cleared with the explicit keyword `default` instead.
+fn reject_empty(key: &str, value: &str, hint: &str) -> Result<(), AppError> {
+    if value.is_empty() {
+        return Err(AppError::InvalidValue {
+            key: key.to_string(),
+            message: format!("value must not be empty; {hint}"),
+        });
+    }
+    Ok(())
+}
+
 pub fn set(ctx: &Ctx, key: &str, value: &str) -> Result<u8> {
     let updated = ctx.store.update(|settings| {
         match key {
             "mountService" => {
-                settings.mount_service = if value.is_empty() || value == "default" {
+                reject_empty(key, value, "use \"default\" for the automatic choice")?;
+                settings.mount_service = if value == "default" {
                     None
                 } else {
                     Some(resolve_mounter(value)?)
@@ -88,7 +101,10 @@ pub fn set(ctx: &Ctx, key: &str, value: &str) -> Result<u8> {
                 })?
             }
             "useKeychain" => settings.use_keychain = parse_bool(key, value)?,
-            "keychainProvider" => settings.keychain_provider = value.to_string(),
+            "keychainProvider" => {
+                reject_empty(key, value, "pass the keychain provider's Java class name")?;
+                settings.keychain_provider = value.to_string()
+            }
             "debugMode" => settings.debug_mode = parse_bool(key, value)?,
             _ => return Err(unknown_key(key)),
         }
