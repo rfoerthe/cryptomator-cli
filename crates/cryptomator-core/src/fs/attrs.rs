@@ -36,8 +36,6 @@ impl FileAttributes {
 }
 
 /// `CryptoBasicFileAttributes.calculatePlaintextFileSize`: undefined sizes count as 0.
-// Consumed by `CryptoFs` (added in a later task); until then only the tests below call it.
-#[allow(dead_code)]
 pub(crate) fn cleartext_size_of(cryptor: &Cryptor, ciphertext_size: u64) -> u64 {
     ciphertext_size
         .checked_sub(cryptor.file_header_cryptor().header_size() as u64)
@@ -45,7 +43,6 @@ pub(crate) fn cleartext_size_of(cryptor: &Cryptor, ciphertext_size: u64) -> u64 
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
 pub(crate) fn attributes_of(
     ciphertext_path: &Path,
     file_type: CiphertextFileType,
