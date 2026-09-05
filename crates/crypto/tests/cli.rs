@@ -1,4 +1,7 @@
+mod common;
+
 use assert_cmd::Command;
+use common::Sandbox;
 use predicates::prelude::*;
 
 #[test]
@@ -84,40 +87,6 @@ fn recovery_key_validate_requires_a_source() {
 }
 
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
-
-const PW: &str = "test-password-123";
-
-struct Sandbox {
-    dir: TempDir,
-}
-
-impl Sandbox {
-    fn new() -> Self {
-        Self {
-            dir: tempfile::tempdir().unwrap(),
-        }
-    }
-    fn settings(&self) -> PathBuf {
-        self.dir.path().join("settings.json")
-    }
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
-    }
-    /// `crypto --settings <sandbox> <args>` with CRYPTO_PASSWORD set and no inherited password variables.
-    fn crypto(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("crypto").unwrap();
-        cmd.env_remove("CRYPTO_SETTINGS_PATH")
-            .env_remove("CRYPTO_MIN_PW_LENGTH")
-            .env("CRYPTO_PASSWORD", PW);
-        cmd.arg("--settings").arg(self.settings());
-        cmd.args(args);
-        cmd
-    }
-    fn settings_json(&self) -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(self.settings()).unwrap()).unwrap()
-    }
-}
 
 fn bkup_count(vault: &Path) -> usize {
     std::fs::read_dir(vault)
@@ -198,7 +167,7 @@ fn vault_create_json_output_and_recovery_key() {
 #[test]
 fn vault_create_rejects_existing_dir_short_password_and_missing_source() {
     let sb = Sandbox::new();
-    sb.crypto(&["vault", "create", sb.dir.path().to_str().unwrap()])
+    sb.crypto(&["vault", "create", sb.root().to_str().unwrap()])
         .assert()
         .code(1);
     sb.crypto(&["vault", "create", sb.path("x").to_str().unwrap()])
@@ -238,7 +207,7 @@ fn vault_add_list_info_remove() {
         .assert()
         .code(5)
         .stderr(predicate::str::contains("already registered"));
-    sb.crypto(&["vault", "add", sb.dir.path().to_str().unwrap()])
+    sb.crypto(&["vault", "add", sb.root().to_str().unwrap()])
         .assert()
         .code(12);
 
@@ -315,12 +284,12 @@ fn vault_info_detects_hub_vaults() {
 #[test]
 fn vault_create_names_the_path_in_errors() {
     let sb = Sandbox::new();
-    sb.crypto(&["vault", "create", sb.dir.path().to_str().unwrap()])
+    sb.crypto(&["vault", "create", sb.root().to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(
             predicate::str::contains("cannot create vault at")
-                .and(predicate::str::contains(sb.dir.path().to_str().unwrap())),
+                .and(predicate::str::contains(sb.root().to_str().unwrap())),
         );
 }
 

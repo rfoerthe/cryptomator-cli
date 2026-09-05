@@ -44,6 +44,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Read and write vault contents without mounting
+    Fs {
+        #[command(subcommand)]
+        command: FsCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -217,4 +222,133 @@ pub struct ValidateArgs {
     /// Read the recovery key from standard input
     #[arg(long, required = true)]
     pub recovery_key_stdin: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FsCommand {
+    /// List a directory
+    Ls(FsLsArgs),
+    /// List a directory tree recursively (one path per line; --json like the fixture manifests)
+    Tree(FsTreeArgs),
+    /// Print a file to standard output
+    Cat(FsPathArgs),
+    /// Copy a file out of the vault
+    Get(FsGetArgs),
+    /// Copy a file into the vault
+    Put(FsPutArgs),
+    /// Delete a file, symlink or (empty) directory
+    Rm(FsRmArgs),
+    /// Create a directory
+    Mkdir(FsMkdirArgs),
+    /// Move or rename a file, symlink or directory
+    Mv(FsMvArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct FsLsArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext directory
+    #[arg(default_value = "/")]
+    pub path: String,
+    /// Long listing: type, size, modification time, name
+    #[arg(short = 'l', long)]
+    pub long: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsTreeArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext directory to start from
+    #[arg(default_value = "/")]
+    pub path: String,
+    /// Include the SHA-256 of every file (reads all content)
+    #[arg(long)]
+    pub hash: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsPathArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext path
+    pub path: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsGetArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext file
+    pub path: String,
+    /// Local destination file, or "-" for standard output
+    pub local: PathBuf,
+    /// Overwrite an existing local file
+    #[arg(long)]
+    pub force: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsPutArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Local source file, or "-" for standard input (not combinable with --password-stdin)
+    pub local: PathBuf,
+    /// Cleartext destination file (the full name, not a directory)
+    pub path: String,
+    /// Overwrite an existing vault file
+    #[arg(long)]
+    pub force: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsRmArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext path
+    pub path: String,
+    /// Delete directories with their contents
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsMkdirArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext directory
+    pub path: String,
+    /// Create missing parent directories; no error if the directory exists
+    #[arg(short = 'p', long)]
+    pub parents: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsMvArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext source path
+    pub source: String,
+    /// Destination path (never "into" an existing directory)
+    pub destination: String,
+    /// Replace an existing destination (directories only if empty)
+    #[arg(long)]
+    pub force: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
 }

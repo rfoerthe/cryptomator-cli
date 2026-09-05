@@ -338,8 +338,10 @@ dependencies = [
  "cryptomator-app",
  "cryptomator-core",
  "cryptomator-mount",
+ "data-encoding",
  "predicates",
  "serde_json",
+ "sha2",
  "tempfile",
  "zeroize",
 ]
