@@ -21,7 +21,7 @@ pub mod symlinks;
 // pub use capabilities::determine_supported_cleartext_file_name_length;
 pub use ciphertext_path::{CiphertextDirectory, CiphertextFilePath, CiphertextFileType};
 // pub use crypto_fs::{CryptoFs, CryptoFsOptions, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH};
-// pub use dir_id::DirIdLoader;
+pub use dir_id::DirIdLoader;
 // pub use dir_stream::DirEntry;
 pub use events::{discard_events, EventCollector, EventSink, FilesystemEvent};
 // pub use name_decryptor::decrypt_filename;
