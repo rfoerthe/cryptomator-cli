@@ -237,6 +237,13 @@ impl UnverifiedVaultConfig {
             .map(|v| v as u32)
     }
 
+    pub fn alleged_cipher_combo(&self) -> Option<String> {
+        self.claims
+            .get(CLAIM_CIPHER_COMBO)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     /// Checks the signature with the raw masterkey, then the `format` claim, then parses the remaining claims.
     pub fn verify(&self, raw_key: &[u8; 64], expected_vault_version: u32) -> Result<VaultConfig> {
         let algorithm = self.algorithm()?;

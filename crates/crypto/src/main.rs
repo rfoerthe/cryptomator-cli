@@ -1,20 +1,18 @@
 //! `crypto` – Cryptomator command line interface.
 mod cli;
+mod commands;
+mod exit;
+mod output;
 
 use clap::Parser;
-use cli::{Cli, Command, RecoveryKeyCommand};
+use cli::{Cli, Command, RecoveryKeyCommand, VaultCommand};
+use commands::Ctx;
+use cryptomator_app::settings::SettingsStore;
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
+use output::Output;
 use std::io::Read;
 use std::process::ExitCode;
 use zeroize::Zeroizing;
-
-/// Exit codes as defined in the design spec.
-pub mod exit {
-    pub const OK: u8 = 0;
-    pub const GENERAL: u8 = 1;
-    pub const USAGE: u8 = 2;
-    pub const INVALID_PASSPHRASE: u8 = 4;
-}
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -34,13 +32,28 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("error: {err:#}");
-            ExitCode::from(exit::GENERAL)
+            ExitCode::from(exit::code_for(&err))
         }
     }
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
+    let store = match cli.settings {
+        Some(path) => SettingsStore::at(path),
+        None => SettingsStore::from_env_or_default()?,
+    };
+    let ctx = Ctx {
+        store,
+        out: Output { json: cli.json },
+    };
     match cli.command {
+        Command::Vault { command } => match command {
+            VaultCommand::Create(args) => commands::vault::create(&ctx, args),
+            VaultCommand::Add(args) => commands::vault::add(&ctx, args),
+            VaultCommand::Remove { vault } => commands::vault::remove(&ctx, &vault),
+            VaultCommand::List => commands::vault::list(&ctx),
+            VaultCommand::Info { vault } => commands::vault::info(&ctx, &vault),
+        },
         Command::RecoveryKey {
             command: RecoveryKeyCommand::Validate(args),
         } => {
@@ -50,8 +63,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             let mut input = Zeroizing::new(String::new());
             std::io::stdin().read_to_string(&mut input)?;
             let recovery_key: &str = input.trim();
-            let encoder = WordEncoder::new();
-            if validate_recovery_key(&encoder, recovery_key) {
+            if validate_recovery_key(&WordEncoder::new(), recovery_key) {
                 println!("valid");
                 Ok(exit::OK)
             } else {
