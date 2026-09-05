@@ -11,6 +11,7 @@ use crate::constants::{
 };
 use crate::Cryptor;
 use regex::Regex;
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -76,14 +77,16 @@ impl DirectoryLister<'_> {
             })
             .collect();
         nodes.sort();
+        // both subtractions saturate: a manipulated vault config may carry a threshold below 25,
+        // which `CryptoPathMapper` accepts unchecked.
+        let threshold = self.mapper.shortening_threshold();
+        let max_cleartext_file_name_length =
+            (threshold.saturating_sub(4) / 4 * 3).saturating_sub(16);
         let ctx = NodeContext {
             lister: self,
             dir_id: &dir.dir_id,
             cleartext_dir,
-            max_cleartext_file_name_length: (self.mapper.shortening_threshold().saturating_sub(4))
-                / 4
-                * 3
-                - 16,
+            max_cleartext_file_name_length,
         };
         let mut out = Vec::new();
         for (name, path) in nodes {
@@ -129,7 +132,7 @@ impl NodeContext<'_> {
     fn process_c9r(&self, name: &str, path: PathBuf) -> io::Result<Option<DirEntry>> {
         let basename = name.strip_suffix(CRYPTOMATOR_FILE_SUFFIX).unwrap_or(name);
         let Some((cleartext_name, extracted)) =
-            self.extract_ciphertext(basename, 0, basename.len())
+            self.extract_ciphertext(basename, 0, basename.len(), &mut HashSet::new())
         else {
             return Ok(None);
         };
@@ -145,12 +148,22 @@ impl NodeContext<'_> {
 
     /// `C9rDecryptor.extractCiphertext`: the first base64 run that decrypts; on failure narrow the
     /// search region at the `_`/`-` delimiters, first from the start, then from the end.
+    ///
+    /// The result only depends on `(start, end)`, so `visited` records the regions already explored.
+    /// Without it the two recursive calls shrink the region by as little as one byte each and the
+    /// call tree grows exponentially — a name of 220 `-` characters would never finish. A region is
+    /// only re-entered after it yielded `None` (a hit short-circuits all the way out), so skipping
+    /// it returns exactly what the unmemoized search would.
     fn extract_ciphertext(
         &self,
         basename: &str,
         start: usize,
         end: usize,
+        visited: &mut HashSet<(usize, usize)>,
     ) -> Option<(String, String)> {
+        if !visited.insert((start, end)) {
+            return None;
+        }
         let m = BASE64_PATTERN.find(&basename[start..end])?;
         let (m_start, m_end) = (start + m.start(), start + m.end());
         let valid = &basename[m_start..m_end];
@@ -164,12 +177,12 @@ impl NodeContext<'_> {
                 let first_delim = valid.find(['_', '-'])?; // fail fast: no other subsequence possible
                 let last_delim = valid.rfind(['_', '-']).unwrap_or(first_delim);
                 let new_start = m_start + first_delim.max(1);
-                if let Some(found) = self.extract_ciphertext(basename, new_start, end) {
+                if let Some(found) = self.extract_ciphertext(basename, new_start, end, visited) {
                     return Some(found);
                 }
                 let delim_distance_from_end = valid.len() - last_delim;
                 let new_end = m_end - delim_distance_from_end.max(1);
-                self.extract_ciphertext(basename, start, new_end)
+                self.extract_ciphertext(basename, start, new_end, visited)
             }
         }
     }
@@ -634,5 +647,43 @@ mod tests {
                 .any(|n| n.starts_with("a_conflict-2024") || n == "a (1).txt"),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn narrowing_terminates_on_a_pathological_name() {
+        let fx = fx(220);
+        fx.write_file("sibling.txt", b"s");
+        // every `-` is a narrowing delimiter: without memoisation the search tree is exponential
+        let root = fx.mapper.root().path.clone();
+        std::fs::write(root.join(format!("{}.c9r", "-".repeat(220))), b"?").unwrap();
+        let started = std::time::Instant::now();
+        let names = fx.names(false);
+        let elapsed = started.elapsed();
+        assert_eq!(names, vec!["sibling.txt".to_string()]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "listing took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_shortening_threshold_does_not_underflow() {
+        let (dir, cryptor, _config) = new_vault(36);
+        let events = EventCollector::new();
+        // a threshold below 25 underflows `(t - 4) / 4 * 3 - 16` unless the subtraction saturates
+        let mapper = CryptoPathMapper::new(
+            dir.path(),
+            cryptor.clone(),
+            Arc::new(DirIdLoader::new(events.sink())),
+            20,
+            events.sink(),
+        );
+        let lister = DirectoryLister {
+            mapper: &mapper,
+            cryptor: &cryptor,
+            events: &events.sink(),
+            read_only: false,
+        };
+        assert!(lister.list(&CleartextPath::root()).unwrap().is_empty());
     }
 }
