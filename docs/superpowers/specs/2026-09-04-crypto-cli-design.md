@@ -93,7 +93,7 @@ packaging/{homebrew/crypto.rb, deb/, man/}
 ### `cryptomator-app`
 
 - `settings/model.rs`: `SettingsJson`/`VaultSettingsJson` mit nur den genutzten Feldern + `#[serde(flatten)] extra: Map` auf beiden Ebenen; Java-Defaults (port 42427, useKeychain true, revealAfterMount true, autoLockIdleSeconds 1800, actionAfterUnlock ASK, maxCleartextFilenameLength -1, keychainProvider/mountService per OS); `Option`-Felder mit `skip_serializing_if` (entspricht `NON_NULL`); Legacy-Keys (`preferredVolumeImpl`, `useCustomMountPath`/`customMountPath`, `winDriveLetter`) lesen, migrieren und beim Schreiben entfernen. Neue Einträge mit vollem Java-Default-Satz schreiben. Golden-Tests aus `src/test/java/org/cryptomator/common/settings/SettingsJsonTest.java` übernehmen.
-- `settings/store.rs`: Pfade macOS `~/Library/Application Support/Cryptomator/settings.json`; Linux `~/.config/Cryptomator/settings.json`, dann `~/.Cryptomator/settings.json`; Override `--settings`/`CRYPTO_SETTINGS_PATH`. Laden tolerant; Speichern pretty JSON → `settings.json.tmp` → rename, `flock` auf `settings.json.lock`; `writtenByVersion` erhalten (nur bei Neuanlage `crypto-<semver>`). Warnung, wenn der Desktop-IPC-Socket erreichbar ist (App läuft).
+- `settings/store.rs`: Pfade macOS `~/Library/Application Support/Cryptomator/settings.json`; Linux `~/.config/Cryptomator/settings.json`, dann `~/.Cryptomator/settings.json`; Override `--settings`/`CRYPTO_SETTINGS_PATH`. Laden tolerant; Speichern pretty JSON → `settings.json.tmp` → rename, `flock` auf `settings.json.lock`; `writtenByVersion` erhalten (nur bei Neuanlage `crypto-<semver>`). Warnung, wenn der Desktop-IPC-Socket erreichbar ist (App läuft). Eine unparsebare settings.json führt zu einem Fehler (Abweichung von Java, das sie stillschweigend ersetzt).
 - `settings/vault_ref.rs`, `settings/ids.rs`: Auflösung per ID / Anzeigename (eindeutig, erst case-sensitive) / Pfad (kanonisiert); Ad-hoc-Vault per Pfad mit `--no-register`; ID = base64url(9 Zufallsbytes); `normalize_display_name` (mountName-Regeln).
 - `cli_config.rs`: `cli.json` neben settings.json (`mountPointsDir`, `defaultMounter`, `logLevel`, `forceUnmountOnSignalAfterSecs`, `webdavBind`).
 - `state_dir.rs`: Linux `$XDG_RUNTIME_DIR/crypto` (Fallback `/tmp/crypto-<uid>`, 0700), macOS `~/Library/Application Support/Cryptomator/cli-run`; je Vault `<id>.sock/.pid/.json/.log`.
@@ -192,9 +192,9 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 
 | M | Umfang | Testbar am Ende |
 |---|---|---|
-| **M0 Gerüst + Spikes** | Workspace, Lizenz, CI-Skelett, Spec ins Repo (`xtask` nach M8 verschoben); **Spike A**: dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `fuser::Session::from_fd` mit Hello-World-FS (braucht FUSE-T-Installation durch den User); **Spike B**: Desktop-Keychain-Eintrag auf macOS lesen; `cargo tree -d` für RustCrypto-Generationen | Go/No-Go FUSE-T-via-fuser (sonst lowlevel-FFI-Backend einplanen); Keychain-Ansatz bestätigt |
-| **M1 Core-Krypto** | masterkey, scrypt, keywrap, SIV-Namen, Header/Content beide Schemata, Streams, Masterkey-Datei, Vault-Config-JWT, Recovery-Wörter/Key; Fixture-Generator + `vectors.json` | KATs; `recovery-key validate`; Masterkey-Load aller Fixtures |
-| **M2 Vault-Metadaten** | Settings-Modell/Store, Vault-Refs, Zustandserkennung + bkup-Restore, `vault create/add/remove/list/info/set`, `password change`, `recovery-key show/reset-password`, `config`, Readme-Erzeugung | Java `verify` akzeptiert Rust-erzeugte leere Vaults; Settings-Roundtrip; Desktop-App öffnet CLI-Vault |
+| **M0 Gerüst + Spikes** ✅ | Workspace, Lizenz, CI-Skelett, Spec ins Repo (`xtask` nach M8 verschoben); **Spike A**: dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `fuser::Session::from_fd` mit Hello-World-FS (braucht FUSE-T-Installation durch den User); **Spike B**: Desktop-Keychain-Eintrag auf macOS lesen; `cargo tree -d` für RustCrypto-Generationen | Go/No-Go FUSE-T-via-fuser (sonst lowlevel-FFI-Backend einplanen); Keychain-Ansatz bestätigt |
+| **M1 Core-Krypto** ✅ | masterkey, scrypt, keywrap, SIV-Namen, Header/Content beide Schemata, Streams, Masterkey-Datei, Vault-Config-JWT, Recovery-Wörter/Key; Fixture-Generator + `vectors.json` | KATs; `recovery-key validate`; Masterkey-Load aller Fixtures |
+| **M2 Vault-Metadaten** ✅ | Settings-Modell/Store, Vault-Refs, Zustandserkennung + bkup-Restore, `vault create/add/remove/list/info/set`, `password change`, `recovery-key show/reset-password`, `config`, Readme-Erzeugung | Java `verify` akzeptiert Rust-erzeugte leere Vaults; Settings-Roundtrip; Desktop-App öffnet CLI-Vault |
 | **M3 Dateisystem + mountlose Ops** | path mapper, dir stream + Konflikte, open files/chunk cache, symlinks, attrs, `fs *`, `name decrypt/locate` | bidirektionaler Interop auf allen Fixtures; proptests |
 | **M4 FUSE + Daemon** | fuser-Adapter, Linux-/macFUSE-/FUSE-T-Provider, `Mounter`, Daemon/Protokoll, `unlock/lock/status/stats/events`, Auto-Lock, `mounters` | Mount-E2E Linux-CI + FUSE-T macOS; Koexistenz mit Desktop-App |
 | **M5 WebDAV** | dav-server-FS, Server, FallbackMounter, Portregeln | Finder/`gio`/`curl`-E2E |
@@ -202,7 +202,7 @@ Exit-Codes: 0 ok · 1 allgemein · 2 Usage · 3 Vault nicht gefunden/mehrdeutig 
 | **M7 Health, Restore, Migration** | 3 Checks + Fixes + Report, `recovery-key restore`, Migratoren v6/v7/v8 | beschädigte Fixtures (Harness erzeugt: Orphan-Dir, fehlende dirid, Trailing Bytes …); Legacy-Fixtures migrieren und in Java verifizieren |
 | **M8 Release** | Packaging, Docs, Manpages, Completions, Homebrew/deb, `xtask` (lipo/deb/Fixture-Regenerierung), vollständige CI-Matrix (macos-13, ubuntu-22.04-arm, interop-java, Mount-/Keychain-E2E) | Release-Artefakte auf sauberen VMs installierbar |
 
-Jede Phase: TDD, Commit pro Task, Kompatibilitätslauf gegen Fixtures am Ende.
+✅ = abgeschlossen. Jede Phase: TDD, Commit pro Task, Kompatibilitätslauf gegen Fixtures am Ende.
 
 ## Erster Umsetzungsschritt nach Freigabe
 

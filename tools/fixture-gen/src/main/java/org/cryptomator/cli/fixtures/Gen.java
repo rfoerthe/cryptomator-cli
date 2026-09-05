@@ -22,7 +22,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Generates reference vaults with cryptofs 2.10.0. Usage: Gen gen <outputDir>
+ * Generates reference vaults with cryptofs 2.10.0 and verifies foreign vaults with it.
+ * Usage: Gen gen <outputDir> | Gen verify <vaultDir> <passphrase>
  * Each vault uses passphrase "test-password-123"; its masterkey is SHA-512(name) so regeneration only changes nonces.
  */
 public final class Gen {
@@ -38,15 +39,50 @@ public final class Gen {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 2 || !args[0].equals("gen")) {
-            System.err.println("usage: Gen gen <outputDir>");
+        List<String> argv = java.util.Arrays.stream(args).filter(a -> !a.isEmpty()).toList();
+        if (argv.size() == 2 && argv.get(0).equals("gen")) {
+            Path out = Path.of(argv.get(1));
+            Files.createDirectories(out);
+            for (Spec spec : specs()) {
+                generate(out.resolve(spec.name()), spec);
+                System.out.println("generated " + spec.name());
+            }
+        } else if (argv.size() == 3 && argv.get(0).equals("verify")) {
+            System.exit(verify(Path.of(argv.get(1)), argv.get(2)));
+        } else {
+            System.err.println("usage: Gen gen <outputDir> | Gen verify <vaultDir> <passphrase>");
             System.exit(2);
         }
-        Path out = Path.of(args[1]);
-        Files.createDirectories(out);
-        for (Spec spec : specs()) {
-            generate(out.resolve(spec.name()), spec);
-            System.out.println("generated " + spec.name());
+    }
+
+    /**
+     * Opens a vault written by another implementation with the real cryptofs and prints its cleartext tree as JSON.
+     * The cipher combo and the shortening threshold are not configured here on purpose: cryptofs reads both from the
+     * vault's own {@code vault.cryptomator}, so the same call verifies SIV_GCM and SIV_CTRMAC vaults alike.
+     */
+    static int verify(Path vault, String passphrase) {
+        try {
+            var access = new MasterkeyFileAccess(new byte[0], new SecureRandom());
+            try (Masterkey masterkey = access.load(vault.resolve("masterkey.cryptomator"), passphrase)) {
+                CryptoFileSystemProperties props = CryptoFileSystemProperties.cryptoFileSystemProperties()
+                        .withKeyLoader(uri -> masterkey.copy())
+                        .build();
+                List<Map<String, Object>> entries = new ArrayList<>();
+                try (CryptoFileSystem fs = CryptoFileSystemProvider.newFileSystem(vault, props)) {
+                    walk(fs.getPath("/"), entries);
+                    for (Map<String, Object> entry : entries) {
+                        if ("file".equals(entry.get("type"))) {
+                            Files.readAllBytes(fs.getPath((String) entry.get("path"))); // authenticate every chunk
+                        }
+                    }
+                }
+                var gson = new GsonBuilder().disableHtmlEscaping().create();
+                System.out.println(gson.toJson(entries));
+                return 0;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            return 3;
         }
     }
 

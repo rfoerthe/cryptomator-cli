@@ -29,3 +29,27 @@
 - CLI: `crypto recovery-key validate --recovery-key-stdin`.
 - Java fixture generator (`tools/fixture-gen`) plus eight checked-in reference vaults; integration
   tests unlock every fixture and verify the complete decrypted tree against `expected.json`.
+
+### M2 – Vault metadata
+
+- `settings.json` model and store shared with the desktop app: all fields the app uses plus unknown
+  keys preserved, Java defaults, legacy key migration, atomic save (`.tmp` + rename) with a lock file,
+  paths for macOS/Linux and the `--settings` / `$CRYPTO_SETTINGS_PATH` overrides.
+- Vault references: resolution by id, display name or path; generated ids (base64url of 9 random
+  bytes) and `normalize_display_name` following the app's mount-name rules.
+- Vault state detection (`LOCKED`, `MISSING`, `VAULT_CONFIG_MISSING`, `ALL_MISSING`, `NEEDS_MIGRATION`) including the automatic
+  `masterkey.cryptomator.bkup` restore of `BackupRestorer`.
+- `crypto vault create` (config, root dir, `dirid.c9r`, `WELCOME.rtf` inside and `IMPORTANT.rtf`
+  outside the vault), `vault add`, `vault remove`, `vault list`, `vault info`, `vault set`.
+- `crypto config get|set` for the global settings (`mountService`, `port`, `useKeychain`,
+  `keychainProvider`, `debugMode`).
+- `crypto password change` (with `.bkup` of the old masterkey file) and `crypto recovery-key show` /
+  `recovery-key reset-password`.
+- Passphrase sources `--password-stdin` / `--password-file` / `--password-env` / `$CRYPTO_PASSWORD` /
+  TTY prompt, NFC normalisation, minimum length and confirmation for new passwords. `password change`
+  does not take the new password from `$CRYPTO_PASSWORD`, which holds the current one.
+- Interop: the Java harness verifies vaults created by `crypto` for both cipher combos
+  (`cargo test -p crypto --test java_interop -- --ignored`, CI job `interop-java`).
+- Deliberate deviation from the desktop app: a `settings.json` that cannot be parsed is reported as
+  an error instead of being silently replaced with defaults, so a broken or foreign file never costs
+  the user their vault list.
