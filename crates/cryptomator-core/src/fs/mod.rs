@@ -22,7 +22,7 @@ pub mod symlinks;
 pub use ciphertext_path::{CiphertextDirectory, CiphertextFilePath, CiphertextFileType};
 // pub use crypto_fs::{CryptoFs, CryptoFsOptions, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH};
 pub use dir_id::DirIdLoader;
-// pub use dir_stream::DirEntry;
+pub use dir_stream::DirEntry;
 pub use events::{discard_events, EventCollector, EventSink, FilesystemEvent};
 // pub use name_decryptor::decrypt_filename;
 // pub use open_file::{OpenCryptoFile, OpenOptions};

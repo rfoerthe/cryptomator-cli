@@ -28,7 +28,7 @@ pub use crypto::stream::{decrypt_all, encrypt_all, DecryptingReader, EncryptingW
 pub use error::{CoreError, NotAVaultReason, Result};
 pub use fs::{
     CiphertextDirectory, CiphertextFilePath, CiphertextFileType, CleartextPath, CryptoPathMapper,
-    DirIdLoader, EventSink, FilesystemEvent,
+    DirEntry, DirIdLoader, EventSink, FilesystemEvent,
 };
 pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
 pub use vault::init::{
