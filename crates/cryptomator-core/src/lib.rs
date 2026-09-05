@@ -7,6 +7,7 @@ pub mod constants;
 pub mod crypto;
 pub mod error;
 pub mod masterkey_file;
+pub mod recovery;
 pub mod vault_config;
 
 pub use crypto::cryptor::{CipherCombo, ContentCryptor, Cryptor, HeaderCryptor};
