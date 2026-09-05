@@ -1,0 +1,7 @@
+{
+  "name": "threshold_36",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 36,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "e0d59a71465de0e14943cabba523d9fce57f09cd0842c90c41df4c65e7d8fbab41c869d53b6339fadca65ab5c483413847e97955a1c0b7cf83ea86aba405c7b3"
+}

@@ -1,0 +1,44 @@
+[
+  {
+    "path": "/size-0.bin",
+    "type": "file",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "/size-1.bin",
+    "type": "file",
+    "size": 1,
+    "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  {
+    "path": "/size-100000.bin",
+    "type": "file",
+    "size": 100000,
+    "sha256": "931030b89f42c06dcdda12a43dfcd601d745d11bbb5fcd1a00fea442e8405157"
+  },
+  {
+    "path": "/size-32767.bin",
+    "type": "file",
+    "size": 32767,
+    "sha256": "27e5511ca2be6412d9d916e59c05ace4bedbfb25cf3d9c442347bb07af1054ed"
+  },
+  {
+    "path": "/size-32768.bin",
+    "type": "file",
+    "size": 32768,
+    "sha256": "1ad834c3986c55f4bf52a09f4aa6adc9ed0de1f1ac20457a0606321042057254"
+  },
+  {
+    "path": "/size-32769.bin",
+    "type": "file",
+    "size": 32769,
+    "sha256": "183535296ba7e0cca7a221a3980cbd98b90b920db350274881288849d785d67f"
+  },
+  {
+    "path": "/size-65536.bin",
+    "type": "file",
+    "size": 65536,
+    "sha256": "d790e413479d16f4eab89ec0d18e3565e0982bd4788c26736a76d20ea781c901"
+  }
+]

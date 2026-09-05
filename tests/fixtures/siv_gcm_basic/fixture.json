@@ -1,0 +1,7 @@
+{
+  "name": "siv_gcm_basic",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "8124ad63dbfc7402c79bb88414f1fd0be9b6b90a25ba8f15e70ae21beb917eec02c2d0a49bb7985037b354b41bfa685b9679e4ce9865726d0a19ac2e4db6512d"
+}

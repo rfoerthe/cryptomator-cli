@@ -1,0 +1,34 @@
+[
+  {
+    "path": "/l1",
+    "type": "dir"
+  },
+  {
+    "path": "/l1/l2",
+    "type": "dir"
+  },
+  {
+    "path": "/l1/l2/l3",
+    "type": "dir"
+  },
+  {
+    "path": "/l1/l2/l3/l4",
+    "type": "dir"
+  },
+  {
+    "path": "/l1/l2/l3/l4/l5",
+    "type": "dir"
+  },
+  {
+    "path": "/l1/l2/l3/l4/l5/deep.txt",
+    "type": "file",
+    "size": 5,
+    "sha256": "64896f89fd11190013b70103e603a1c5826e56b7fb7d2197ab279b0690043599"
+  },
+  {
+    "path": "/l1/one.txt",
+    "type": "file",
+    "size": 2,
+    "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+  }
+]

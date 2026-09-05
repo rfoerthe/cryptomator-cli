@@ -1,0 +1,32 @@
+[
+  {
+    "path": "/absolute-link",
+    "type": "symlink",
+    "target": "/target.txt"
+  },
+  {
+    "path": "/dangling",
+    "type": "symlink",
+    "target": "does-not-exist"
+  },
+  {
+    "path": "/dir-link",
+    "type": "symlink",
+    "target": "sub"
+  },
+  {
+    "path": "/relative-link",
+    "type": "symlink",
+    "target": "target.txt"
+  },
+  {
+    "path": "/sub",
+    "type": "dir"
+  },
+  {
+    "path": "/target.txt",
+    "type": "file",
+    "size": 12,
+    "sha256": "1a0fc3e1ec529072c28dba75551cc6955a8aaba25d987c24825fe7729243c833"
+  }
+]

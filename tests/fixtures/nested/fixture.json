@@ -1,0 +1,7 @@
+{
+  "name": "nested",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "d0feb29b3347dd5d8ee46515f6a8ec86a8f434bc69f38d9b52e9c1efb8c7cf264a45d03dbbb78d48dbe114578f54ad30d33abe456661e45a862c8e9f1d502c07"
+}

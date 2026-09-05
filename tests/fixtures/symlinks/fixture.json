@@ -1,0 +1,7 @@
+{
+  "name": "symlinks",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "ed8b4258159170c03c82bfa7abb9de7aaf9887ce26ec44d8d1c6f74a1d850a7b08eb61266485b5f9b71b654a994ed74e33f0d23bf4aee857acb8b8ef4399da50"
+}

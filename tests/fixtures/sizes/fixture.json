@@ -1,0 +1,7 @@
+{
+  "name": "sizes",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "04ff759fb79502898d7971c9ecccec3b4da1c9d1de1cc61519a2e0f981dee437a2cce120f1a1c686ed27e15ea137c06b242816f1f8004b37082a975451bebc75"
+}

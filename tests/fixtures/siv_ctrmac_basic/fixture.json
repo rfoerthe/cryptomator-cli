@@ -1,0 +1,7 @@
+{
+  "name": "siv_ctrmac_basic",
+  "cipherCombo": "SIV_CTRMAC",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "c661f0df03248dc903d4f251b298678d793cc88288b4e9ee562d9c676465b6b310b7bfc7e4c8f9009c2008840d0a711eb3f0651c908cfd1c54fe79582b05984e"
+}

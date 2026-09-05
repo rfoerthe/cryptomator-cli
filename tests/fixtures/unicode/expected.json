@@ -1,0 +1,24 @@
+[
+  {
+    "path": "/Grüße 🚀.txt",
+    "type": "file",
+    "size": 4,
+    "sha256": "dcde261ae09ae7d38054ee36faa1e49d3d845651f7e3a26b8f26919476345df0"
+  },
+  {
+    "path": "/café.txt",
+    "type": "file",
+    "size": 24,
+    "sha256": "079c81b6786a695ee73ead4de29e81594e8fb075c76d3fa33fe940fadae6fe01"
+  },
+  {
+    "path": "/日本語",
+    "type": "dir"
+  },
+  {
+    "path": "/日本語/ファイル.txt",
+    "type": "file",
+    "size": 9,
+    "sha256": "e4a888a2a729d5264b6e2d7abbdc3d6023c7bcdd2ae1a8127ad5d4dfb950805d"
+  }
+]

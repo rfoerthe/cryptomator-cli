@@ -1,0 +1,18 @@
+[
+  {
+    "path": "/dir",
+    "type": "dir"
+  },
+  {
+    "path": "/dir/file.txt",
+    "type": "file",
+    "size": 7,
+    "sha256": "370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3"
+  },
+  {
+    "path": "/short.txt",
+    "type": "file",
+    "size": 44,
+    "sha256": "6f47c2d606760dd11bcad9971e4c245d0dacf90f6dec0c94fd4c4c383cc05576"
+  }
+]

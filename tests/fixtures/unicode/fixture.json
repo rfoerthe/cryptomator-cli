@@ -1,0 +1,7 @@
+{
+  "name": "unicode",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "babd8bcefe359b2d692fb31f7e28fa07d7801aa17b3865d2a15cf6761f9dadfcdba4c7752edae29fd5661334c5e73de723266267bdb1b5ad28e5f48a81960857"
+}

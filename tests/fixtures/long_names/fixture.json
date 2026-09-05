@@ -1,0 +1,7 @@
+{
+  "name": "long_names",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "94bbaac9dca57b62feb981ceeae19617f6031c20963aa1adddfda8587b399844ee03b04bee0e70ddabf4e159bb08f0bd47750cefd004a4c51cb09ff6acdbcbe7"
+}

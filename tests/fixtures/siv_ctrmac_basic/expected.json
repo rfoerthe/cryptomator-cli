@@ -1,0 +1,18 @@
+[
+  {
+    "path": "/docs",
+    "type": "dir"
+  },
+  {
+    "path": "/docs/notes.md",
+    "type": "file",
+    "size": 19,
+    "sha256": "6180cb5f037ab8776072fb4ed1a6ee8644aaf9fd2ae5b8a759562c167d3735cf"
+  },
+  {
+    "path": "/hello.txt",
+    "type": "file",
+    "size": 20,
+    "sha256": "612dac5cac33f9740788a3dd09d3530782bf4b05f220700aca202b286ed24178"
+  }
+]
