@@ -453,4 +453,70 @@ mod tests {
         assert_eq!(unverified.algorithm().unwrap(), JwtAlgorithm::Hs512);
         assert_eq!(unverified.verify(&raw_key(), 8).unwrap(), cfg);
     }
+
+    /// Splices a forged header (raw JSON) and a signature segment onto the valid `TOKEN`'s claims.
+    fn token_with_header(header_json: &str, signature_b64: &str) -> String {
+        let claims_b64 = TOKEN.split('.').nth(1).expect("claims segment");
+        let header_b64 = BASE64URL_NOPAD.encode(header_json.as_bytes());
+        format!("{header_b64}.{claims_b64}.{signature_b64}")
+    }
+
+    /// The real HS256 signature segment of `TOKEN`.
+    fn valid_signature_segment() -> &'static str {
+        TOKEN.split('.').nth(2).expect("signature segment")
+    }
+
+    #[test]
+    fn alg_none_is_rejected_before_signature_check() {
+        let token = token_with_header(
+            r#"{"kid":"masterkeyfile:masterkey.cryptomator","alg":"none","typ":"JWT"}"#,
+            "",
+        );
+        let unverified = UnverifiedVaultConfig::decode(&token).unwrap();
+        // The algorithm allowlist rejects `none` on its own ...
+        assert!(matches!(
+            unverified.algorithm(),
+            Err(CoreError::VaultConfigLoad(_))
+        ));
+        // ... and `verify` consults it before comparing any MAC, so the empty signature never
+        // reaches the HMAC path: the error is VaultConfigLoad, not VaultKeyInvalid.
+        assert!(matches!(
+            unverified.verify(&raw_key(), 8),
+            Err(CoreError::VaultConfigLoad(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_algorithm_is_rejected() {
+        let token = token_with_header(
+            r#"{"kid":"masterkeyfile:masterkey.cryptomator","alg":"RS256","typ":"JWT"}"#,
+            valid_signature_segment(),
+        );
+        let unverified = UnverifiedVaultConfig::decode(&token).unwrap();
+        assert!(matches!(
+            unverified.algorithm(),
+            Err(CoreError::VaultConfigLoad(_))
+        ));
+        assert!(matches!(
+            unverified.verify(&raw_key(), 8),
+            Err(CoreError::VaultConfigLoad(_))
+        ));
+    }
+
+    #[test]
+    fn missing_alg_is_rejected() {
+        let token = token_with_header(
+            r#"{"kid":"masterkeyfile:masterkey.cryptomator","typ":"JWT"}"#,
+            valid_signature_segment(),
+        );
+        let unverified = UnverifiedVaultConfig::decode(&token).unwrap();
+        assert!(matches!(
+            unverified.algorithm(),
+            Err(CoreError::VaultConfigLoad(_))
+        ));
+        assert!(matches!(
+            unverified.verify(&raw_key(), 8),
+            Err(CoreError::VaultConfigLoad(_))
+        ));
+    }
 }
