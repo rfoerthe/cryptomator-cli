@@ -15,20 +15,26 @@ impl Rng for OsRng {
     }
 }
 
-/// Deterministic RNG reproducing the Java `DetRandom` used to create the known-answer vectors:
-/// byte number `n` (counting from 0 over the lifetime of the instance) is `0xA0 + (n & 0x3F)`.
-/// Never use outside tests and fixture generation.
+/// Deterministic and therefore **insecure** RNG: for known-answer tests and fixture generation only,
+/// never for real keys, nonces or salts.
+///
+/// Reproduces the Java `DetRandom` used to create the known-answer vectors: byte number `n`
+/// (counting from 0 over the lifetime of the instance) is `0xA0 + (n & 0x3F)`.
+/// Outside this crate it exists only behind the non-default `det-rng` feature.
+#[cfg(any(test, feature = "det-rng"))]
 #[derive(Debug, Default, Clone)]
 pub struct DetRng {
     counter: u64,
 }
 
+#[cfg(any(test, feature = "det-rng"))]
 impl DetRng {
     pub fn starting_at(counter: u64) -> Self {
         Self { counter }
     }
 }
 
+#[cfg(any(test, feature = "det-rng"))]
 impl Rng for DetRng {
     fn fill(&mut self, buf: &mut [u8]) {
         for b in buf.iter_mut() {

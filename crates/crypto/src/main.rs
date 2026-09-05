@@ -6,6 +6,7 @@ use cli::{Cli, Command, RecoveryKeyCommand};
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
 use std::io::Read;
 use std::process::ExitCode;
+use zeroize::Zeroizing;
 
 /// Exit codes as defined in the design spec.
 pub mod exit {
@@ -44,10 +45,13 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             command: RecoveryKeyCommand::Validate(args),
         } => {
             debug_assert!(args.recovery_key_stdin);
-            let mut input = String::new();
+            // The recovery key is key material: keep it in a buffer that is wiped on drop and
+            // never copy it into an owned String (`trim` borrows).
+            let mut input = Zeroizing::new(String::new());
             std::io::stdin().read_to_string(&mut input)?;
+            let recovery_key: &str = input.trim();
             let encoder = WordEncoder::new();
-            if validate_recovery_key(&encoder, input.trim()) {
+            if validate_recovery_key(&encoder, recovery_key) {
                 println!("valid");
                 Ok(exit::OK)
             } else {

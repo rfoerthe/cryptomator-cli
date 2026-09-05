@@ -7,6 +7,7 @@ use crate::crypto::rng::Rng;
 use crate::crypto::siv::FileNameCryptor;
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// `cipherCombo` claim of `vault.cryptomator`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -143,16 +144,18 @@ impl ContentCryptor {
         }
     }
 
+    /// The cleartext is wrapped in [`Zeroizing`] so the plaintext chunk is wiped when it is dropped.
     pub fn decrypt_chunk(
         &self,
         ciphertext_chunk: &[u8],
         chunk_number: u64,
         header: &FileHeader,
-    ) -> Result<Vec<u8>> {
-        match self {
-            ContentCryptor::Gcm(c) => c.decrypt_chunk(ciphertext_chunk, chunk_number, header),
-            ContentCryptor::CtrMac(c) => c.decrypt_chunk(ciphertext_chunk, chunk_number, header),
-        }
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let cleartext = match self {
+            ContentCryptor::Gcm(c) => c.decrypt_chunk(ciphertext_chunk, chunk_number, header)?,
+            ContentCryptor::CtrMac(c) => c.decrypt_chunk(ciphertext_chunk, chunk_number, header)?,
+        };
+        Ok(Zeroizing::new(cleartext))
     }
 
     /// Cleartext size of a file body (ciphertext size WITHOUT the header). Mirrors `FileContentCryptor.cleartextSize`,
@@ -303,7 +306,8 @@ mod tests {
                 cryptor
                     .file_content_cryptor()
                     .decrypt_chunk(&chunk, 3, &header)
-                    .unwrap(),
+                    .unwrap()
+                    .as_slice(),
                 b"payload"
             );
         }

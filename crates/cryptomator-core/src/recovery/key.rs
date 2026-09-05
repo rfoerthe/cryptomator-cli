@@ -1,5 +1,4 @@
 //! Recovery key = 64-byte masterkey + 2 low-order bytes (little-endian) of CRC32 → 66 bytes → 44 words.
-use crate::backup::backup_file_name;
 use crate::constants::MASTERKEY_FILENAME;
 use crate::crypto::masterkey::Masterkey;
 use crate::crypto::rng::Rng;
@@ -18,13 +17,16 @@ fn crc_suffix(raw_key: &[u8; 64]) -> [u8; 2] {
     [crc[0], crc[1]]
 }
 
-pub fn create_recovery_key(encoder: &WordEncoder, raw_key: &[u8; 64]) -> String {
+/// The returned string is key material; it is wrapped in [`Zeroizing`] so it is wiped on drop.
+pub fn create_recovery_key(encoder: &WordEncoder, raw_key: &[u8; 64]) -> Zeroizing<String> {
     let mut padded = Zeroizing::new([0u8; PADDED_LEN]);
     padded[..64].copy_from_slice(raw_key);
     padded[64..].copy_from_slice(&crc_suffix(raw_key));
-    encoder
-        .encode_padded(&*padded)
-        .expect("66 is a multiple of 3")
+    Zeroizing::new(
+        encoder
+            .encode_padded(&*padded)
+            .expect("66 is a multiple of 3"),
+    )
 }
 
 pub fn decode_recovery_key(
@@ -52,8 +54,13 @@ pub fn validate_recovery_key(encoder: &WordEncoder, recovery_key: &str) -> bool 
 }
 
 /// `RecoveryKeyFactory.newMasterkeyFileWithPassphrase`: back up an existing masterkey file, then write a new one.
+///
+/// The backup is a *copy* ([`crate::backup::attempt_backup`], like `BackupHelper` in cryptofs), so the
+/// original stays in place until `access.persist` replaces it atomically via `<name>.tmp` + rename.
+/// Nothing is written when the recovery key does not decode.
 pub fn reset_password(
     encoder: &WordEncoder,
+    access: &MasterkeyFileAccess,
     vault_path: &Path,
     recovery_key: &str,
     new_passphrase: &str,
@@ -63,11 +70,9 @@ pub fn reset_password(
     let masterkey = Masterkey::from_raw(*raw);
     let masterkey_path = vault_path.join(MASTERKEY_FILENAME);
     if masterkey_path.exists() {
-        let old_bytes = std::fs::read(&masterkey_path)?;
-        let backup_path = vault_path.join(backup_file_name(MASTERKEY_FILENAME, &old_bytes));
-        std::fs::rename(&masterkey_path, &backup_path)?;
+        crate::backup::attempt_backup(&masterkey_path)?;
     }
-    MasterkeyFileAccess::new(Vec::new()).persist(
+    access.persist(
         &masterkey,
         &masterkey_path,
         new_passphrase,
@@ -101,7 +106,7 @@ mod tests {
         let enc = WordEncoder::new();
         let key = create_recovery_key(&enc, &sequential());
         assert_eq!(key.split(' ').count(), 44);
-        assert_eq!(key, RECOVERY_KEY_SEQUENTIAL);
+        assert_eq!(*key, RECOVERY_KEY_SEQUENTIAL);
     }
 
     #[test]
@@ -132,14 +137,17 @@ mod tests {
         let masterkey_path = dir.path().join("masterkey.cryptomator");
         std::fs::write(&masterkey_path, b"old masterkey file\n").unwrap();
         let enc = WordEncoder::new();
+        let access = MasterkeyFileAccess::new(Vec::new());
         reset_password(
             &enc,
+            &access,
             dir.path(),
             RECOVERY_KEY_SEQUENTIAL,
             "new-pass",
             &mut DetRng::default(),
         )
         .unwrap();
+        // attempt_backup copies, so the old content survives in the .bkup file …
         let expected_backup = dir.path().join(format!(
             "masterkey.cryptomator{}.bkup",
             crate::backup::generate_file_id_suffix(b"old masterkey file\n")
@@ -148,9 +156,13 @@ mod tests {
             std::fs::read(&expected_backup).unwrap(),
             b"old masterkey file\n"
         );
-        let key = MasterkeyFileAccess::new(Vec::new())
-            .load(&masterkey_path, "new-pass")
-            .unwrap();
+        // … while the original was replaced by the freshly wrapped masterkey.
+        assert_ne!(
+            std::fs::read(&masterkey_path).unwrap(),
+            b"old masterkey file\n"
+        );
+        assert!(!dir.path().join("masterkey.cryptomator.tmp").exists());
+        let key = access.load(&masterkey_path, "new-pass").unwrap();
         assert_eq!(key.raw(), &sequential());
     }
 
@@ -161,6 +173,7 @@ mod tests {
         assert!(matches!(
             reset_password(
                 &enc,
+                &MasterkeyFileAccess::new(Vec::new()),
                 dir.path(),
                 INVALID_CRC_KEY,
                 "x",
@@ -169,5 +182,6 @@ mod tests {
             Err(CoreError::InvalidRecoveryKey(_))
         ));
         assert!(!dir.path().join("masterkey.cryptomator").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

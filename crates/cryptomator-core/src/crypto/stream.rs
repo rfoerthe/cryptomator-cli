@@ -4,13 +4,22 @@ use crate::crypto::cryptor::Cryptor;
 use crate::crypto::header::FileHeader;
 use crate::crypto::rng::Rng;
 use std::io::{self, Read, Write};
+use zeroize::Zeroizing;
 
+/// Streaming encryptor: cleartext in, `header || chunk*` out.
+///
+/// **Dropping the writer without calling [`finish`](Self::finish) discards the buffered cleartext and
+/// never writes the mandatory final chunk.** The ciphertext produced so far is then truncated and no
+/// longer decryptable as a whole file (`DecryptingReader` fails on the missing tail), so every
+/// successful write path must end in `finish()`. `Drop` deliberately does not flush: it could not
+/// report an I/O error.
 pub struct EncryptingWriter<'a, W: Write> {
     dest: W,
     cryptor: &'a Cryptor,
     rng: &'a mut dyn Rng,
     header: FileHeader,
-    buffer: Vec<u8>,
+    /// Buffered cleartext of the chunk currently being filled; wiped on drop.
+    buffer: Zeroizing<Vec<u8>>,
     header_written: bool,
     chunk_number: u64,
 }
@@ -32,7 +41,7 @@ impl<'a, W: Write> EncryptingWriter<'a, W> {
             cryptor,
             rng,
             header,
-            buffer: Vec::with_capacity(capacity),
+            buffer: Zeroizing::new(Vec::with_capacity(capacity)),
             header_written: false,
             chunk_number: 0,
         }
@@ -90,6 +99,11 @@ impl<W: Write> Write for EncryptingWriter<'_, W> {
         Ok(written)
     }
 
+    /// Flushes the destination only.
+    ///
+    /// Chunks are all-or-nothing (each carries its own nonce and tag), so a partially filled chunk
+    /// cannot be emitted here; buffered cleartext stays buffered until it is full or
+    /// [`finish`](Self::finish) is called.
     fn flush(&mut self) -> io::Result<()> {
         self.dest.flush()
     }
@@ -99,7 +113,8 @@ pub struct DecryptingReader<'a, R: Read> {
     src: R,
     cryptor: &'a Cryptor,
     header: Option<FileHeader>,
-    cleartext: Vec<u8>,
+    /// Cleartext of the chunk currently being served; wiped on drop.
+    cleartext: Zeroizing<Vec<u8>>,
     position: usize,
     reached_eof: bool,
     chunk_number: u64,
@@ -119,7 +134,7 @@ impl<'a, R: Read> DecryptingReader<'a, R> {
             src,
             cryptor,
             header: None,
-            cleartext: Vec::new(),
+            cleartext: Zeroizing::new(Vec::new()),
             position: 0,
             reached_eof: false,
             chunk_number: 0,

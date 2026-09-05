@@ -324,6 +324,7 @@ dependencies = [
  "cryptomator-core",
  "cryptomator-mount",
  "predicates",
+ "zeroize",
 ]
 
 [[package]]

@@ -70,9 +70,16 @@ impl MasterkeyFile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MasterkeyFileAccess {
     pepper: Vec<u8>,
+}
+
+/// The pepper is secret; never print it.
+impl std::fmt::Debug for MasterkeyFileAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MasterkeyFileAccess { pepper: <redacted> }")
+    }
 }
 
 impl MasterkeyFileAccess {
@@ -97,6 +104,9 @@ impl MasterkeyFileAccess {
         self.unlock(&file, passphrase)
     }
 
+    /// Note that `versionMac` is not checked here: cryptolib 2.x writes it for compatibility with
+    /// pre-format-8 readers only and moved integrity protection of the vault version to the signed
+    /// vault config, so an unlock succeeds regardless of the stored MAC.
     pub fn unlock(&self, file: &MasterkeyFile, passphrase: &str) -> Result<Masterkey> {
         let kek = scrypt_kek(
             passphrase,
@@ -112,6 +122,9 @@ impl MasterkeyFileAccess {
         Ok(Masterkey::from_parts(&enc_key, &mac_key))
     }
 
+    /// Writes `versionMac` (HMAC-SHA256 of the big-endian vault version under the MAC key) purely for
+    /// legacy compatibility; it is not verified on [`unlock`](Self::unlock) (cryptolib 2.x behaviour —
+    /// integrity of the version moved to the signed vault config).
     pub fn lock(
         &self,
         masterkey: &Masterkey,
@@ -296,6 +309,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), JAVA_FILE_DEFAULT);
+    }
+
+    #[test]
+    fn debug_does_not_print_the_pepper() {
+        let rendered = format!("{:?}", MasterkeyFileAccess::new(b"s3cr3t-pepper".to_vec()));
+        assert_eq!(rendered, "MasterkeyFileAccess { pepper: <redacted> }");
+        assert!(!rendered.contains("s3cr3t"));
     }
 
     #[test]

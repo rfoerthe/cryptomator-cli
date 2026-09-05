@@ -59,18 +59,27 @@ impl WordEncoder {
     pub fn decode(&self, encoded: &str) -> Result<Vec<u8>> {
         let split: Vec<&str> = encoded.split(DELIMITER).filter(|w| !w.is_empty()).collect();
         if split.len() % 2 != 0 {
-            return Err(CoreError::InvalidRecoveryKey(format!(
-                "{encoded} needs to be a multiple of two words"
-            )));
+            // The messages below never quote the input: a recovery key is key material.
+            return Err(CoreError::InvalidRecoveryKey(
+                "recovery key must consist of an even number of words".into(),
+            ));
         }
+        let unknown_word = |index: usize| {
+            CoreError::InvalidRecoveryKey(format!(
+                "recovery key contains a word that is not in the dictionary (word #{})",
+                index + 1
+            ))
+        };
         let mut out = Vec::with_capacity(split.len() / 2 * 3);
-        for pair in split.chunks_exact(2) {
-            let first = *self.indices.get(pair[0]).ok_or_else(|| {
-                CoreError::InvalidRecoveryKey(format!("{} not in dictionary", pair[0]))
-            })? as u32;
-            let second = *self.indices.get(pair[1]).ok_or_else(|| {
-                CoreError::InvalidRecoveryKey(format!("{} not in dictionary", pair[1]))
-            })? as u32;
+        for (pair_index, pair) in split.chunks_exact(2).enumerate() {
+            let first = *self
+                .indices
+                .get(pair[0])
+                .ok_or_else(|| unknown_word(pair_index * 2))? as u32;
+            let second = *self
+                .indices
+                .get(pair[1])
+                .ok_or_else(|| unknown_word(pair_index * 2 + 1))? as u32;
             out.push((first >> 4) as u8);
             out.push((((first << 4) & 0xF0) | ((second >> 8) & 0x0F)) as u8);
             out.push((second & 0xFF) as u8);
@@ -134,6 +143,28 @@ mod tests {
             Err(CoreError::InvalidRecoveryKey(_))
         ));
         assert_eq!(enc.decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decode_errors_never_quote_the_input() {
+        let enc = WordEncoder::new();
+        for input in ["pathway", "ad Backpfeifengesicht", "Schweinehund ad"] {
+            let message = enc.decode(input).unwrap_err().to_string();
+            for word in input.split(' ') {
+                assert!(
+                    !message.contains(word),
+                    "message {message:?} leaks input word {word:?}"
+                );
+            }
+        }
+        assert_eq!(
+            enc.decode("Schweinehund ad").unwrap_err().to_string(),
+            "invalid recovery key: recovery key contains a word that is not in the dictionary (word #1)"
+        );
+        assert_eq!(
+            enc.decode("ad Backpfeifengesicht").unwrap_err().to_string(),
+            "invalid recovery key: recovery key contains a word that is not in the dictionary (word #2)"
+        );
     }
 
     #[test]

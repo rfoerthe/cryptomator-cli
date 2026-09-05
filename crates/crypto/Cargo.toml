@@ -17,6 +17,7 @@ cryptomator-app = { path = "../cryptomator-app" }
 cryptomator-mount = { path = "../cryptomator-mount" }
 clap.workspace = true
 anyhow.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
