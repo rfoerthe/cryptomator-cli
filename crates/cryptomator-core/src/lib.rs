@@ -32,6 +32,7 @@ pub use vault::init::{
 pub use vault::open::{
     open_vault, open_vault_with_key, read_vault_config, root_content_dir, OpenedVault,
 };
+pub use vault::password::change_password;
 pub use vault::readme::{
     access_location_readme_rtf, storage_location_readme_rtf, ACCESS_LOCATION_README_FILE_NAME,
     STORAGE_LOCATION_README_FILE_NAME,
