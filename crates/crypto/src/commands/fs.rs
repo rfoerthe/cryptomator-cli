@@ -28,7 +28,7 @@ fn warn_sink() -> EventSink {
 /// One wording per error kind. The cleartext layer, `std::fs` and the kernel describe the same
 /// condition differently ("already exists" vs. "File exists"), and the layer repeats the path that
 /// the caller's context line already names, so these kinds are restated in a single, stable form.
-fn io_detail(err: io::Error) -> io::Error {
+pub(crate) fn io_detail(err: io::Error) -> io::Error {
     let phrase = match err.kind() {
         io::ErrorKind::AlreadyExists => "already exists",
         io::ErrorKind::NotFound => "no such file or directory",

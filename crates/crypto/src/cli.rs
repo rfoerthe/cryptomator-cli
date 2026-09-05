@@ -49,6 +49,11 @@ pub enum Command {
         #[command(subcommand)]
         command: FsCommand,
     },
+    /// Translate between cleartext and ciphertext names
+    Name {
+        #[command(subcommand)]
+        command: NameCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -349,6 +354,39 @@ pub struct FsMvArgs {
     /// Replace an existing destination (directories only if empty)
     #[arg(long)]
     pub force: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NameCommand {
+    /// Decrypt the names of ciphertext nodes (paths below <vault>/d/XX/YYYY/)
+    Decrypt(NameDecryptArgs),
+    /// Show the ciphertext node of a cleartext path
+    Locate(NameLocateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct NameDecryptArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Ciphertext nodes (.c9r files, .c9r node directories or .c9s directories)
+    #[arg(required = true)]
+    pub paths: Vec<PathBuf>,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct NameLocateArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// Cleartext path
+    pub path: String,
+    /// Print the content directory of a directory, contents.c9r of a shortened file or symlink.c9r
+    /// of a symlink instead of the node itself
+    #[arg(long)]
+    pub contents: bool,
     #[command(flatten)]
     pub password: PasswordArgs,
 }

@@ -142,7 +142,7 @@ mod tests {
             .ciphertext_file_path(&CleartextPath::parse("/docs"))
             .unwrap();
         assert_eq!(
-            decrypt_filename(dir.path(), fs.cryptor(), docs_node.raw_path()).unwrap(),
+            decrypt_filename(dir.path(), fs.cryptor_ref(), docs_node.raw_path()).unwrap(),
             "docs"
         );
         let notes = fs
@@ -150,7 +150,7 @@ mod tests {
             .ciphertext_file_path(&CleartextPath::parse("/docs/notes.md"))
             .unwrap();
         assert_eq!(
-            decrypt_filename(dir.path(), fs.cryptor(), notes.raw_path()).unwrap(),
+            decrypt_filename(dir.path(), fs.cryptor_ref(), notes.raw_path()).unwrap(),
             "notes.md"
         );
         let long_node = fs
@@ -159,29 +159,33 @@ mod tests {
             .unwrap();
         assert!(long_node.is_shortened());
         assert_eq!(
-            decrypt_filename(dir.path(), fs.cryptor(), long_node.raw_path()).unwrap(),
+            decrypt_filename(dir.path(), fs.cryptor_ref(), long_node.raw_path()).unwrap(),
             long
         );
         // relative node paths are resolved against the current directory, so pass absolute ones
         assert!(matches!(
-            decrypt_filename(dir.path(), fs.cryptor(), Path::new("/elsewhere/x.c9r")),
+            decrypt_filename(dir.path(), fs.cryptor_ref(), Path::new("/elsewhere/x.c9r")),
             Err(CoreError::InvalidArgument(_))
         ));
         assert!(
             matches!(
-                decrypt_filename(dir.path(), fs.cryptor(), &docs_content),
+                decrypt_filename(dir.path(), fs.cryptor_ref(), &docs_content),
                 Err(CoreError::InvalidArgument(_))
             ),
             "depth 3"
         );
         assert!(matches!(
-            decrypt_filename(dir.path(), fs.cryptor(), &docs_content.join("short.c9r")),
+            decrypt_filename(
+                dir.path(),
+                fs.cryptor_ref(),
+                &docs_content.join("short.c9r")
+            ),
             Err(CoreError::InvalidArgument(_))
         ));
         assert!(matches!(
             decrypt_filename(
                 dir.path(),
-                fs.cryptor(),
+                fs.cryptor_ref(),
                 &docs_content.join(format!("{}.txt", "a".repeat(30)))
             ),
             Err(CoreError::InvalidArgument(_))
@@ -191,13 +195,13 @@ mod tests {
         let _ = other_dir;
         let foreign = notes.raw_path().to_path_buf();
         assert!(matches!(
-            decrypt_filename(dir.path(), other_fs.cryptor(), &foreign),
+            decrypt_filename(dir.path(), other_fs.cryptor_ref(), &foreign),
             Err(CoreError::AuthenticationFailed(_))
         ));
         // missing dirid.c9r
         std::fs::remove_file(docs_content.join(DIR_ID_BACKUP_FILE_NAME)).unwrap();
         assert!(matches!(
-            decrypt_filename(dir.path(), fs.cryptor(), notes.raw_path()),
+            decrypt_filename(dir.path(), fs.cryptor_ref(), notes.raw_path()),
             Err(CoreError::InvalidArgument(_))
         ));
     }
