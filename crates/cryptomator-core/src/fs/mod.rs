@@ -25,7 +25,7 @@ pub use dir_id::DirIdLoader;
 pub use dir_stream::DirEntry;
 pub use events::{discard_events, EventCollector, EventSink, FilesystemEvent};
 // pub use name_decryptor::decrypt_filename;
-// pub use open_file::{OpenCryptoFile, OpenOptions};
+pub use open_file::{OpenCryptoFile, OpenOptions};
 // pub use open_files::{FileHandle, OpenCryptoFiles};
 pub use path::{child_display, CleartextPath};
 pub use path_mapper::CryptoPathMapper;
