@@ -9,6 +9,17 @@ rust-version.workspace = true
 
 [dependencies]
 cryptomator-core = { path = "../cryptomator-core" }
+clap.workspace = true
+data-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+rpassword.workspace = true
+unicode-normalization.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
+
+[dev-dependencies]
+tempfile.workspace = true

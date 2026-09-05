@@ -48,9 +48,28 @@ impl KeyId {
     /// Name of the masterkey file this vault is unlocked with, or the error that explains why this
     /// vault cannot be opened by `crypto` at all. Use this instead of matching on the variants, so
     /// every caller rejects Hub and unknown key ids the same way.
+    ///
+    /// The name must be a plain file name: the `kid` header is read *before* the config signature
+    /// is checked, so an attacker-supplied `masterkeyfile:../../secret` would otherwise make
+    /// callers join a path outside the vault. Empty, `.`, `..` and anything containing `/`, `\` or
+    /// `:` is rejected as an unsupported key id. `:` matters because a Windows drive-relative
+    /// prefix such as `C:evil` escapes `Path::join` too. (Java does not perform this check.)
     pub fn require_masterkey_file(&self) -> Result<&str> {
         match self {
-            KeyId::MasterkeyFile { file_name } => Ok(file_name),
+            KeyId::MasterkeyFile { file_name } => {
+                if file_name.is_empty()
+                    || file_name == "."
+                    || file_name == ".."
+                    || file_name.contains('/')
+                    || file_name.contains('\\')
+                    || file_name.contains(':')
+                {
+                    return Err(CoreError::UnsupportedKeyId(format!(
+                        "masterkeyfile:{file_name}"
+                    )));
+                }
+                Ok(file_name)
+            }
             KeyId::Hub { uri } => Err(CoreError::HubVaultUnsupported(uri.clone())),
             KeyId::Other(raw) => Err(CoreError::UnsupportedKeyId(raw.clone())),
         }
@@ -216,6 +235,13 @@ impl UnverifiedVaultConfig {
             .get(CLAIM_SHORTENING_THRESHOLD)
             .and_then(Value::as_u64)
             .map(|v| v as u32)
+    }
+
+    pub fn alleged_cipher_combo(&self) -> Option<String> {
+        self.claims
+            .get(CLAIM_CIPHER_COMBO)
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Checks the signature with the raw masterkey, then the `format` claim, then parses the remaining claims.
@@ -443,6 +469,43 @@ mod tests {
                 .unwrap(),
             "masterkey.cryptomator"
         );
+    }
+
+    #[test]
+    fn require_masterkey_file_rejects_path_components() {
+        // The `kid` header is unverified at the point callers join this onto the vault path.
+        for raw in [
+            "masterkeyfile:../../x",
+            "masterkeyfile:a/b",
+            "masterkeyfile:..",
+            "masterkeyfile:",
+            "masterkeyfile:.",
+            "masterkeyfile:..\\x",
+            // Windows drive-relative prefix: `Path::join` does not stay inside the vault.
+            "masterkeyfile:C:evil",
+        ] {
+            let err = KeyId::parse(raw).require_masterkey_file().unwrap_err();
+            assert!(
+                matches!(err, CoreError::UnsupportedKeyId(ref reported) if reported == raw),
+                "{raw} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_masterkey_file_accepts_plain_file_names() {
+        for (raw, expected) in [
+            (
+                "masterkeyfile:masterkey.cryptomator",
+                "masterkey.cryptomator",
+            ),
+            ("masterkeyfile:custom-name.json", "custom-name.json"),
+        ] {
+            assert_eq!(
+                KeyId::parse(raw).require_masterkey_file().unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

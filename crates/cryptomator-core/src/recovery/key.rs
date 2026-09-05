@@ -1,10 +1,10 @@
 //! Recovery key = 64-byte masterkey + 2 low-order bytes (little-endian) of CRC32 → 66 bytes → 44 words.
-use crate::constants::MASTERKEY_FILENAME;
 use crate::crypto::masterkey::Masterkey;
 use crate::crypto::rng::Rng;
 use crate::error::{CoreError, Result};
 use crate::masterkey_file::{MasterkeyFileAccess, DEFAULT_MASTERKEY_FILE_VERSION};
 use crate::recovery::words::WordEncoder;
+use crate::vault::open::read_vault_config;
 use std::path::Path;
 use zeroize::Zeroizing;
 
@@ -68,7 +68,12 @@ pub fn reset_password(
 ) -> Result<()> {
     let raw = decode_recovery_key(encoder, recovery_key)?;
     let masterkey = Masterkey::from_raw(*raw);
-    let masterkey_path = vault_path.join(MASTERKEY_FILENAME);
+    // The vault config names the masterkey file; it is not always `masterkey.cryptomator`.
+    let file_name = read_vault_config(vault_path)?
+        .key_id()?
+        .require_masterkey_file()?
+        .to_string();
+    let masterkey_path = vault_path.join(&file_name);
     if masterkey_path.exists() {
         crate::backup::attempt_backup(&masterkey_path)?;
     }
@@ -92,6 +97,10 @@ mod tests {
     // From RecoveryKeyFactoryTest in the desktop app.
     const VALID_KEY: &str = "pathway lift abuse plenty export texture gentleman landscape beyond ceiling around leaf cafe charity border breakdown victory surely computer cat linger restrict infer crowd live computer true written amazed investor boot depth left theory snow whereby terminal weekly reject happiness circuit partial cup ad";
     const INVALID_CRC_KEY: &str = "pathway lift abuse plenty export texture gentleman landscape beyond ceiling around leaf cafe charity border breakdown victory surely computer cat linger restrict infer crowd live computer true written amazed investor boot depth left theory snow whereby terminal weekly reject happiness circuit partial cup wrong";
+
+    // kid = masterkeyfile:masterkey.cryptomator; only the header is read here, so the signature
+    // does not have to match the recovery key.
+    const CONFIG_TOKEN: &str = "eyJraWQiOiJtYXN0ZXJrZXlmaWxlOm1hc3RlcmtleS5jcnlwdG9tYXRvciIsImFsZyI6IkhTMjU2IiwidHlwIjoiSldUIn0.eyJqdGkiOiI1YmMwMzg0Yi0xNGFjLTRmZGMtYWVkMC02MmU3YmMwOGZkNWEiLCJmb3JtYXQiOjgsImNpcGhlckNvbWJvIjoiU0lWX0dDTSIsInNob3J0ZW5pbmdUaHJlc2hvbGQiOjIyMH0.0DdfRRefLZici0eI0jDe6lS4sU7H8ZGp9eTqESy29Cg";
 
     fn sequential() -> [u8; 64] {
         let mut raw = [0u8; 64];
@@ -134,6 +143,7 @@ mod tests {
     #[test]
     fn reset_password_backs_up_old_file_and_writes_new_one() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.cryptomator"), CONFIG_TOKEN).unwrap();
         let masterkey_path = dir.path().join("masterkey.cryptomator");
         std::fs::write(&masterkey_path, b"old masterkey file\n").unwrap();
         let enc = WordEncoder::new();
@@ -182,6 +192,7 @@ mod tests {
             Err(CoreError::InvalidRecoveryKey(_))
         ));
         assert!(!dir.path().join("masterkey.cryptomator").exists());
+        // Not even the vault config is read: the key is rejected first.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

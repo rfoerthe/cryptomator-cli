@@ -1,0 +1,62 @@
+//! Errors of the application layer.
+use crate::password::PASSWORD_ENV;
+use std::path::PathBuf;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error(transparent)]
+    Core(#[from] cryptomator_core::CoreError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    // No `{source}`: the field is a `#[source]`, and the CLI renders the whole chain with `{err:#}`.
+    #[error("settings file {path} is not valid JSON")]
+    SettingsCorrupt {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("cannot read settings file {path}")]
+    SettingsUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("no vault matches {0:?} (by id, display name or path)")]
+    VaultNotFound(String),
+    #[error("{:?} matches several vaults: {}", _0, _1.join(", "))]
+    AmbiguousVault(String, Vec<String>),
+    #[error("vault at {0} is already registered")]
+    VaultAlreadyAdded(PathBuf),
+    #[error("no password source: {}", no_password_hint(.label, .env_fallback))]
+    NoPasswordSource {
+        /// Flag prefix of the passphrase that is missing (`--password` or `--new-password`).
+        label: &'static str,
+        /// Whether `$CRYPTO_PASSWORD` is an accepted source in this position. `password change`
+        /// reads the *current* password from it, so it never supplies the new one.
+        env_fallback: bool,
+    },
+    #[error("password must be at least {0} characters long")]
+    PasswordTooShort(usize),
+    #[error("passwords do not match")]
+    PasswordMismatch,
+    #[error("vault is {actual}, expected {expected}")]
+    WrongState { expected: String, actual: String },
+    #[error("invalid value for {key}: {message}")]
+    InvalidValue { key: String, message: String },
+    #[error("no home directory (set HOME or CRYPTO_SETTINGS_PATH)")]
+    NoHomeDirectory,
+}
+
+/// Message branch of [`AppError::NoPasswordSource`]: which flags apply and whether
+/// `$CRYPTO_PASSWORD` is one of the sources.
+fn no_password_hint(label: &str, env_fallback: &bool) -> String {
+    let flags = format!("use {label}-stdin, {label}-file or {label}-env");
+    if *env_fallback {
+        format!("{flags}, set {PASSWORD_ENV}, or run interactively")
+    } else {
+        format!("{flags}, or run interactively; {PASSWORD_ENV} supplies only the current password")
+    }
+}
+
+pub type Result<T> = std::result::Result<T, AppError>;

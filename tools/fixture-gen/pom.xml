@@ -9,8 +9,11 @@
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <exec.mainClass>org.cryptomator.cli.fixtures.Gen</exec.mainClass>
-    <!-- Output directory for the generated fixtures; override with -Dfixtures.out=... -->
-    <fixtures.out>${project.basedir}/../../tests/fixtures</fixtures.out>
+    <!-- Command line passed to Gen: `gen <outputDir>` by default, `verify <vaultDir> <passphrase>`
+         with -Dfixture.cmd=verify -Dfixture.arg1=... -Dfixture.arg2=... (empty arguments are dropped). -->
+    <fixture.cmd>gen</fixture.cmd>
+    <fixture.arg1>${project.basedir}/../../tests/fixtures</fixture.arg1>
+    <fixture.arg2></fixture.arg2>
   </properties>
   <dependencies>
     <dependency>
@@ -44,8 +47,9 @@
             <argument>-classpath</argument>
             <classpath/>
             <argument>${exec.mainClass}</argument>
-            <argument>gen</argument>
-            <argument>${fixtures.out}</argument>
+            <argument>${fixture.cmd}</argument>
+            <argument>${fixture.arg1}</argument>
+            <argument>${fixture.arg2}</argument>
           </arguments>
         </configuration>
       </plugin>
