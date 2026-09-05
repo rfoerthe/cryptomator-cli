@@ -7,6 +7,8 @@ pub mod crypto;
 pub mod error;
 pub mod masterkey_file;
 
+pub use crypto::cryptor::{CipherCombo, ContentCryptor, Cryptor, HeaderCryptor};
+pub use crypto::header::FileHeader;
 pub use crypto::masterkey::Masterkey;
 pub use crypto::rng::{DetRng, OsRng, Rng};
 pub use error::{CoreError, Result};
