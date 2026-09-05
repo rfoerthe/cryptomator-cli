@@ -268,3 +268,49 @@ fn vault_info_detects_hub_vaults() {
         "hub+https"
     );
 }
+
+#[test]
+fn vault_create_names_the_path_in_errors() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.dir.path().to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("cannot create vault at")
+                .and(predicate::str::contains(sb.dir.path().to_str().unwrap())),
+        );
+}
+
+#[test]
+fn vault_create_without_flag_prints_no_recovery_key() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto(&["--json", "vault", "create", sb.path("j").to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(json["recoveryKey"].is_null());
+
+    sb.crypto(&["vault", "create", sb.path("h").to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recovery key").not());
+}
+
+#[test]
+fn vault_create_no_register_writes_no_settings() {
+    let sb = Sandbox::new();
+    let vault = sb.path("solo");
+    sb.crypto(&["vault", "create", "--no-register", vault.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Registered as").not());
+    assert!(vault.join("vault.cryptomator").is_file());
+    assert!(
+        !sb.settings().exists(),
+        "--no-register never touches settings.json"
+    );
+}

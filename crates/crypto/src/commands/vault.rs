@@ -2,7 +2,7 @@
 use crate::cli::{AddArgs, CreateArgs};
 use crate::commands::Ctx;
 use crate::exit;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cryptomator_app::settings::{
     generate_id, normalize_vault_path, resolve_vault_index, VaultSettingsJson,
 };
@@ -140,7 +140,8 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
         &options,
         &MasterkeyFileAccess::new(Vec::new()),
         &mut OsRng,
-    )?;
+    )
+    .with_context(|| format!("cannot create vault at {}", path.display()))?;
     // The directory exists now, so this resolves symlinks like every registered path does.
     let path = normalize_vault_path(&path);
     let recovery_key = args
@@ -161,9 +162,11 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
         "displayName": display_name,
         "cipherCombo": cipher_combo.as_str(),
         "shorteningThreshold": args.shortening_threshold,
-        "recoveryKey": recovery_key.as_deref().map(|k| k.to_string()),
+        // A `serde_json::Value` cannot be wiped, so this copy of the recovery key outlives the
+        // `Zeroizing` buffer; `emit_secret` drops it as soon as the output is rendered.
+        "recoveryKey": recovery_key.as_deref(),
     });
-    ctx.out.emit(value, || {
+    let human = || {
         let mut lines = vec![format!("Created vault at {}", path.display())];
         if let Some(v) = &registered {
             lines.push(format!(
@@ -172,11 +175,20 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
                 v.display_name.clone().unwrap_or_default()
             ));
         }
-        if let Some(key) = &recovery_key {
-            lines.push(format!("Recovery key: {}", key.as_str()));
-        }
         lines.join("\n")
-    })?;
+    };
+    if recovery_key.is_some() {
+        ctx.out.emit_secret(value, human)?;
+    } else {
+        ctx.out.emit(value, human)?;
+    }
+    if !ctx.out.json {
+        if let Some(key) = &recovery_key {
+            // `as_str()` borrows out of the `Zeroizing` buffer: the key is never copied into an
+            // owned `String` on the human path.
+            println!("Recovery key: {}", key.as_str());
+        }
+    }
     Ok(exit::OK)
 }
 
