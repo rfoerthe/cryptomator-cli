@@ -17,7 +17,7 @@ pub mod stats;
 pub mod symlinks;
 
 // Re-exports of items that later tasks create; activated by the task that adds them.
-// pub use attrs::FileAttributes;
+pub use attrs::FileAttributes;
 // pub use capabilities::determine_supported_cleartext_file_name_length;
 pub use ciphertext_path::{CiphertextDirectory, CiphertextFilePath, CiphertextFileType};
 // pub use crypto_fs::{CryptoFs, CryptoFsOptions, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH};
@@ -30,6 +30,7 @@ pub use open_files::{FileHandle, OpenCryptoFiles, RngFactory, TwoPhaseMove};
 pub use path::{child_display, CleartextPath};
 pub use path_mapper::CryptoPathMapper;
 pub use stats::{CryptoFsStats, StatsSnapshot};
+pub use symlinks::Symlinks;
 
 use std::fmt::Display;
 use std::io;
@@ -84,7 +85,6 @@ mod io_errors {
     pub(crate) fn invalid_data(message: impl Into<String>) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message.into())
     }
-    #[allow(dead_code)]
     pub(crate) fn read_only_fs() -> io::Error {
         io::Error::new(
             io::ErrorKind::ReadOnlyFilesystem,
@@ -98,7 +98,6 @@ mod io_errors {
             format!("{path}: file name longer than {max} characters"),
         )
     }
-    #[allow(dead_code)]
     pub(crate) fn not_a_link(path: impl Display, detail: &str) -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -106,7 +105,6 @@ mod io_errors {
         )
     }
     /// `ErrorKind::FilesystemLoop` is still unstable, so this uses `Other`.
-    #[allow(dead_code)]
     pub(crate) fn fs_loop(path: impl Display) -> io::Error {
         io::Error::other(format!("{path}: too many levels of symbolic links"))
     }
