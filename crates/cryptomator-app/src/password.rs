@@ -13,7 +13,7 @@ pub const MIN_PW_LENGTH_ENV: &str = "CRYPTO_MIN_PW_LENGTH";
 pub const DEFAULT_MIN_PW_LENGTH: usize = 8;
 pub const MAX_PASSWORD_FILE_BYTES: u64 = 5000;
 
-#[derive(Args, Debug, Clone, Default)]
+#[derive(Args, Debug, Clone)]
 pub struct PasswordArgs {
     /// Read the password from the next line of standard input
     #[arg(long, group = "password-source")]
@@ -24,6 +24,20 @@ pub struct PasswordArgs {
     /// Read the password from the named environment variable (default: CRYPTO_PASSWORD)
     #[arg(long, value_name = "VAR", group = "password-source")]
     pub password_env: Option<String>,
+    /// Flag prefix used in error messages, so a `NewPasswordArgs` conversion names `--new-password-*`.
+    #[arg(skip = "--password")]
+    pub label: &'static str,
+}
+
+impl Default for PasswordArgs {
+    fn default() -> Self {
+        Self {
+            password_stdin: false,
+            password_file: None,
+            password_env: None,
+            label: "--password",
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -45,6 +59,7 @@ impl From<&NewPasswordArgs> for PasswordArgs {
             password_stdin: args.new_password_stdin,
             password_file: args.new_password_file.clone(),
             password_env: args.new_password_env.clone(),
+            label: "--new-password",
         }
     }
 }
@@ -94,19 +109,19 @@ fn strip_line_ending(mut line: String) -> String {
     line
 }
 
-fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+fn read_password_file(path: &Path, label: &str) -> Result<Zeroizing<String>> {
     let file = std::fs::File::open(path)?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_PASSWORD_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PASSWORD_FILE_BYTES {
         return Err(AppError::InvalidValue {
-            key: "--password-file".to_string(),
+            key: format!("{label}-file"),
             message: format!("file is larger than {MAX_PASSWORD_FILE_BYTES} bytes"),
         });
     }
     let text = String::from_utf8(bytes.to_vec()).map_err(|_| AppError::InvalidValue {
-        key: "--password-file".to_string(),
+        key: format!("{label}-file"),
         message: "file is not valid UTF-8".to_string(),
     })?;
     Ok(Zeroizing::new(strip_line_ending(text)))
@@ -124,14 +139,14 @@ fn read_raw(
             .ok_or(AppError::NoPasswordSource);
     }
     if let Some(file) = &args.password_file {
-        return read_password_file(file);
+        return read_password_file(file, args.label);
     }
     if let Some(var) = &args.password_env {
         return io
             .env(var)
             .map(Zeroizing::new)
             .ok_or_else(|| AppError::InvalidValue {
-                key: "--password-env".to_string(),
+                key: format!("{}-env", args.label),
                 message: format!("environment variable {var} is not set"),
             });
     }
@@ -170,7 +185,7 @@ pub fn read_new_passphrase(
     if interactive {
         let confirmation = io
             .prompt("Confirm password: ")?
-            .map(|c| normalize_passphrase(&c))
+            .map(|c| normalize_passphrase(&Zeroizing::new(c)))
             .ok_or(AppError::NoPasswordSource)?;
         if *confirmation != *passphrase {
             return Err(AppError::PasswordMismatch);
@@ -218,6 +233,7 @@ mod tests {
             password_stdin: stdin,
             password_file: file.map(Path::to_path_buf),
             password_env: env.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -351,5 +367,37 @@ mod tests {
         let converted = PasswordArgs::from(&new);
         assert!(converted.password_stdin);
         assert_eq!(converted.password_env.as_deref(), Some("X"));
+        assert_eq!(converted.label, "--new-password");
+    }
+
+    #[test]
+    fn password_groups_are_mutually_exclusive() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            pw: PasswordArgs,
+            #[command(flatten)]
+            new: NewPasswordArgs,
+        }
+        use clap::{CommandFactory, Parser};
+        Cli::command().debug_assert();
+        assert!(Cli::try_parse_from(["x", "--password-stdin", "--password-env", "V"]).is_err());
+        assert!(
+            Cli::try_parse_from(["x", "--new-password-stdin", "--new-password-file", "f"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["x", "--password-stdin", "--new-password-env", "V"]).is_ok());
+    }
+
+    #[test]
+    fn new_password_errors_name_the_new_password_flags() {
+        let args = PasswordArgs::from(&NewPasswordArgs {
+            new_password_env: Some("MISSING".into()),
+            ..Default::default()
+        });
+        let mut io = FakeIo::default();
+        match read_passphrase(&args, "p", &mut io) {
+            Err(AppError::InvalidValue { key, .. }) => assert_eq!(key, "--new-password-env"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 }

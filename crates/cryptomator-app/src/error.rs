@@ -26,7 +26,7 @@ pub enum AppError {
     AmbiguousVault(String, Vec<String>),
     #[error("vault at {0} is already registered")]
     VaultAlreadyAdded(PathBuf),
-    #[error("no password source: use --password-stdin, --password-file, --password-env or CRYPTO_PASSWORD, or run interactively")]
+    #[error("no password source: use --password-stdin, --password-file or --password-env (or the --new-password-* variants), set CRYPTO_PASSWORD, or run interactively")]
     NoPasswordSource,
     #[error("password must be at least {0} characters long")]
     PasswordTooShort(usize),
