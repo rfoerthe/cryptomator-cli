@@ -85,5 +85,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             ConfigCommand::Get { key } => commands::config::get(&ctx, key.as_deref()),
             ConfigCommand::Set { key, value } => commands::config::set(&ctx, &key, &value),
         },
+        Command::Fs { command } => commands::fs::run(&ctx, command),
+        Command::Name { command } => commands::name::run(&ctx, command),
     }
 }

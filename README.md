@@ -12,7 +12,13 @@ Status: early development. See `docs/superpowers/specs/2026-09-04-crypto-cli-des
 ## Commands
 
 Every command accepts `--settings <PATH>` and `--json`. Vaults are addressed by id, display name or
-path (`<VAULT>` below).
+path (`<VAULT>` below). Vault ids are base64url and may start with `-`; they are accepted as they
+are, and `--` before the first positional (`crypto fs ls -- -abcDEF123456 /`) is the general escape
+hatch for any argument that begins with a dash.
+
+`--json` prints one JSON document per command — except where the command's payload is the file
+itself: `fs cat` and `fs get -` always write the raw bytes to standard output, with or without
+`--json`.
 
 | Command | What it does | Example |
 |---|---|---|
@@ -28,6 +34,16 @@ path (`<VAULT>` below).
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
+| `fs ls` | Lists a directory inside a locked vault | `crypto fs ls Secret /2026 -l` |
+| `fs tree` | Walks a directory tree; `--json --hash` prints the fixture-manifest shape | `crypto fs tree Secret --json --hash` |
+| `fs cat` | Writes a vault file to standard output | `crypto fs cat Secret /notes.md` |
+| `fs get` | Copies a file out of the vault (`-` for standard output) | `crypto fs get Secret /2026/report.pdf ./report.pdf` |
+| `fs put` | Copies a local file into the vault (`-` for standard input) | `crypto fs put Secret ./report.pdf /2026/report.pdf` |
+| `fs rm` | Deletes a file, symlink or directory (`-r` for non-empty ones) | `crypto fs rm Secret /2026/old -r` |
+| `fs mkdir` | Creates a directory (`-p` for parents) | `crypto fs mkdir Secret /2026/invoices -p` |
+| `fs mv` | Moves or renames inside the vault | `crypto fs mv Secret /draft.md /2026/notes.md` |
+| `name decrypt` | Decrypts the names of ciphertext nodes below `<vault>/d/` | `crypto name decrypt Secret d/AB/CDEF…/xyz.c9r` |
+| `name locate` | Shows the ciphertext node of a cleartext path | `crypto name locate Secret /2026/report.pdf --contents` |
 
 `crypto vault create` uses `SIV_GCM` and a shortening threshold of 220 like the desktop app;
 `--shortening-threshold` (36–220) and `--no-register` change that. `--show-recovery-key` prints the
@@ -46,6 +62,39 @@ The key is read from standard input (it never appears in the process list or the
 
 It prints `valid` and exits `0`, or prints `invalid` and exits `4`. Error messages never quote the
 input.
+
+## Mount-less access
+
+`crypto fs …` and `crypto name …` read and write vault contents **without a mount**, straight through
+the cleartext layer. The vault has to be registered and in state `LOCKED` as recorded in the vault
+directory (exit `5` otherwise). M3 cannot detect a *running* mount, so do not point the `fs` write
+commands at a vault that is currently mounted — the mounter and `crypto` would write the same
+ciphertext behind each other's back. M4 adds that check. Hub vaults are rejected before any password
+is read. Passwords come from the sources listed above.
+
+- **Read-only vaults.** `usesReadOnlyMode` (from `crypto vault set … --read-only true`) is respected:
+  `put`, `rm`, `mkdir` and `mv` fail with exit `5`, listing and reading still work.
+- **`fs put -`** reads the file from standard input and therefore excludes `--password-stdin`
+  (exit `2`); use `--password-env`/`--password-file` or `$CRYPTO_PASSWORD` in that case.
+- **`fs put` never damages the destination.** The content is encrypted into a sibling temp file
+  (`<name>.<pid>.tmp` in the destination directory) and only a completely written temp file is
+  renamed into place; a source that fails half way through leaves the old file untouched and the
+  temp file is removed. Without `--force` an existing destination is rejected before anything is
+  written.
+- **Names are NFC-normalised** like in the desktop app, so a decomposed `café.txt` and a composed
+  `café.txt` address the same file.
+- **Sync conflicts** are resolved during a listing exactly as the desktop app does it: a ciphertext
+  node that a sync tool renamed is renamed back on disk and shows up as `name (1).ext`. In a
+  read-only vault nothing on disk is touched — the conflicting copy is reported as a warning on
+  standard error and left out of the listing (a deviation from cryptofs, which renames anyway).
+- **`fs mv` never moves *into* a directory.** The destination is always the full new path, so
+  `crypto fs mv Secret /a.txt /dir` renames `a.txt` to `dir` (and fails if `dir` exists) rather than
+  creating `/dir/a.txt`. `--force` replaces an existing destination, directories only when they are
+  empty.
+- **`fs rm`** deletes files, symlinks and empty directories; a non-empty directory needs `-r`.
+- **`fs get`/`fs put`** never overwrite without `--force`; `fs get -` streams to standard output.
+- **Symlinks** are listed and read, never followed for `ls`/`tree`. Relative targets resolve against
+  the link's parent directory (POSIX semantics; cryptofs resolves them against the vault root).
 
 ## Password sources
 
