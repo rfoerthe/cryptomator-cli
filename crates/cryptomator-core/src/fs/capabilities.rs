@@ -6,11 +6,18 @@ use crate::constants::{
 use std::io;
 use std::path::Path;
 
+/// Cleartext characters that survive base64 + IV overhead for `max_ciphertext` ciphertext
+/// characters (math explained in cryptofs issue #60: subtract 4 for the `.c9r` extension,
+/// base64-decode, subtract 16 for the IV). Both subtractions saturate, because a manipulated vault
+/// config may carry a shortening threshold below 25, which `CryptoPathMapper` accepts unchecked.
+pub fn max_cleartext_file_name_length(max_ciphertext: usize) -> usize {
+    (max_ciphertext.saturating_sub(4) / 4 * 3).saturating_sub(16)
+}
+
 /// Cleartext characters that survive base64 + IV overhead for the supported ciphertext length.
 pub fn determine_supported_cleartext_file_name_length(vault_path: &Path) -> io::Result<u32> {
     let max_ciphertext = determine_supported_ciphertext_file_name_length(vault_path)?;
-    // math explained in cryptofs issue #60: subtract 4 for the extension, base64-decode, subtract 16 for the IV
-    Ok((max_ciphertext - 4) / 4 * 3 - 16)
+    Ok(max_cleartext_file_name_length(max_ciphertext as usize) as u32)
 }
 
 pub fn determine_supported_ciphertext_file_name_length(vault_path: &Path) -> io::Result<u32> {

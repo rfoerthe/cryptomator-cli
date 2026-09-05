@@ -12,7 +12,13 @@ Status: early development. See `docs/superpowers/specs/2026-09-04-crypto-cli-des
 ## Commands
 
 Every command accepts `--settings <PATH>` and `--json`. Vaults are addressed by id, display name or
-path (`<VAULT>` below).
+path (`<VAULT>` below). Vault ids are base64url and may start with `-`; they are accepted as they
+are, and `--` before the first positional (`crypto fs ls -- -abcDEF123456 /`) is the general escape
+hatch for any argument that begins with a dash.
+
+`--json` prints one JSON document per command — except where the command's payload is the file
+itself: `fs cat` and `fs get -` always write the raw bytes to standard output, with or without
+`--json`.
 
 | Command | What it does | Example |
 |---|---|---|
@@ -60,14 +66,21 @@ input.
 ## Mount-less access
 
 `crypto fs …` and `crypto name …` read and write vault contents **without a mount**, straight through
-the cleartext layer. The vault has to be registered and `LOCKED`; a vault that is currently mounted
-is refused (exit `5`) instead of being opened a second time behind the mounter's back. Hub vaults are
-rejected before any password is read. Passwords come from the sources listed above.
+the cleartext layer. The vault has to be registered and in state `LOCKED` as recorded in the vault
+directory (exit `5` otherwise). M3 cannot detect a *running* mount, so do not point the `fs` write
+commands at a vault that is currently mounted — the mounter and `crypto` would write the same
+ciphertext behind each other's back. M4 adds that check. Hub vaults are rejected before any password
+is read. Passwords come from the sources listed above.
 
 - **Read-only vaults.** `usesReadOnlyMode` (from `crypto vault set … --read-only true`) is respected:
   `put`, `rm`, `mkdir` and `mv` fail with exit `5`, listing and reading still work.
 - **`fs put -`** reads the file from standard input and therefore excludes `--password-stdin`
   (exit `2`); use `--password-env`/`--password-file` or `$CRYPTO_PASSWORD` in that case.
+- **`fs put` never damages the destination.** The content is encrypted into a sibling temp file
+  (`<name>.<pid>.tmp` in the destination directory) and only a completely written temp file is
+  renamed into place; a source that fails half way through leaves the old file untouched and the
+  temp file is removed. Without `--force` an existing destination is rejected before anything is
+  written.
 - **Names are NFC-normalised** like in the desktop app, so a decomposed `café.txt` and a composed
   `café.txt` address the same file.
 - **Sync conflicts** are resolved during a listing exactly as the desktop app does it: a ciphertext

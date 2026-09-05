@@ -1,7 +1,7 @@
 //! Vaults created by `crypto` must open with the real cryptofs. Needs Java 21+ and Maven; run with
 //! `cargo test -p crypto --test java_interop -- --ignored` (CI job `interop-java`).
 use assert_cmd::Command;
-use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions};
+use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions, OpenOptions};
 use cryptomator_core::{open_vault, MasterkeyFileAccess};
 use std::path::{Path, PathBuf};
 
@@ -274,6 +274,64 @@ fn java_reads_a_tree_written_by_crypto_fs() {
         .unwrap();
         fs.write_file(&CleartextPath::parse("/size-0.bin"), b"", true)
             .unwrap();
+        // renaming *to* a shortened name: the node becomes a `.c9s` directory with `name.c9s`
+        fs.write_file(&CleartextPath::parse("/rename-me.bin"), b"renamed\n", false)
+            .unwrap();
+        fs.rename(
+            &CleartextPath::parse("/rename-me.bin"),
+            &CleartextPath::parse(&format!("/{}.bin", "r".repeat(200))),
+            false,
+        )
+        .unwrap();
+        // renaming *from* a shortened name must leave no `name.c9s` behind (directory and symlink)
+        fs.create_dir(&CleartextPath::parse(&format!("/{}", "e".repeat(200))))
+            .unwrap();
+        fs.write_file(
+            &CleartextPath::parse(&format!("/{}/kept.txt", "e".repeat(200))),
+            b"survives the rename\n",
+            false,
+        )
+        .unwrap();
+        fs.rename(
+            &CleartextPath::parse(&format!("/{}", "e".repeat(200))),
+            &CleartextPath::parse("/was-long-dir"),
+            false,
+        )
+        .unwrap();
+        fs.create_symlink(
+            &CleartextPath::parse(&format!("/{}", "k".repeat(200))),
+            "target.txt",
+        )
+        .unwrap();
+        fs.rename(
+            &CleartextPath::parse(&format!("/{}", "k".repeat(200))),
+            &CleartextPath::parse("/was-long-link"),
+            false,
+        )
+        .unwrap();
+        // a symlink that keeps its 200-char name
+        fs.create_symlink(
+            &CleartextPath::parse(&format!("/{}", "m".repeat(200))),
+            "target.txt",
+        )
+        .unwrap();
+        // truncating a multi-chunk file to a size that is neither zero nor a chunk boundary
+        {
+            let handle = fs
+                .open_file(
+                    &CleartextPath::parse("/size-100000.bin"),
+                    OpenOptions::read_write(),
+                )
+                .unwrap();
+            handle.truncate(40_000).unwrap();
+            handle.close().unwrap();
+        }
+        fs.copy(
+            &CleartextPath::parse("/target.txt"),
+            &CleartextPath::parse("/copy-of-target.txt"),
+            false,
+        )
+        .unwrap();
         fs.close().unwrap();
     }
     let java = verify_with_java(&vault, "interop-passphrase");
@@ -285,7 +343,25 @@ fn java_reads_a_tree_written_by_crypto_fs() {
         .clone();
     let rust: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(rust, java, "Java manifest differs from crypto fs tree");
-    assert_eq!(java.as_array().unwrap().len(), 24, "{java}");
+    assert_eq!(java.as_array().unwrap().len(), 30, "{java}");
+    let entry = |path: &str| {
+        java.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == path)
+            .unwrap_or_else(|| panic!("{path} missing from {java}"))
+            .clone()
+    };
+    assert_eq!(entry("/size-100000.bin")["size"], 40_000, "truncated size");
+    assert_eq!(entry("/was-long-dir")["type"], "dir");
+    assert_eq!(entry("/was-long-dir/kept.txt")["size"], 20);
+    assert_eq!(entry("/was-long-link")["type"], "symlink");
+    assert_eq!(
+        entry("/copy-of-target.txt")["sha256"],
+        entry("/target.txt")["sha256"]
+    );
+    entry(&format!("/{}.bin", "r".repeat(200)));
+    entry(&format!("/{}", "m".repeat(200)));
     assert!(
         java.as_array()
             .unwrap()

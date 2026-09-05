@@ -13,7 +13,7 @@ pub enum CiphertextFileType {
 
 impl CiphertextFileType {
     /// Matches the `type` field of the fixture manifests.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             CiphertextFileType::File => "file",
             CiphertextFileType::Directory => "dir",

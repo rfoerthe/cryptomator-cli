@@ -64,6 +64,12 @@ pub struct CryptoFs {
     rng: Mutex<Box<dyn Rng + Send>>,
 }
 
+// M4 puts this facade behind `fuser::Filesystem`, which requires both.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CryptoFs>();
+};
+
 impl std::fmt::Debug for CryptoFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CryptoFs")
@@ -241,23 +247,45 @@ impl CryptoFs {
         if options.write {
             self.assert_writable()?;
         }
-        let file_type = match self.mapper.ciphertext_file_type(path) {
-            Ok(t) => t,
+        match self.file_type_for_open(path, options)? {
+            CiphertextFileType::Symlink => {
+                let resolved = self.symlinks.resolve_recursively(path)?;
+                self.open_link_target(&resolved, options)
+            }
+            CiphertextFileType::File => self.open_regular_file(path, options),
+            CiphertextFileType::Directory => Err(super::is_a_directory(path)),
+        }
+    }
+
+    /// The node a fully resolved symlink points at. `resolve_recursively` already followed every
+    /// link (and detected loops), so this never resolves again and cannot recurse; a link that ends
+    /// on a directory is rejected like the directory itself.
+    fn open_link_target(
+        &self,
+        path: &CleartextPath,
+        options: OpenOptions,
+    ) -> io::Result<FileHandle> {
+        match self.file_type_for_open(path, options)? {
+            CiphertextFileType::Directory => Err(super::is_a_directory(path)),
+            _ => self.open_regular_file(path, options),
+        }
+    }
+
+    /// The ciphertext type of `path`; a missing node counts as a file when it is about to be created.
+    fn file_type_for_open(
+        &self,
+        path: &CleartextPath,
+        options: OpenOptions,
+    ) -> io::Result<CiphertextFileType> {
+        match self.mapper.ciphertext_file_type(path) {
+            Ok(t) => Ok(t),
             Err(e)
                 if e.kind() == io::ErrorKind::NotFound
                     && (options.create || options.create_new) =>
             {
-                CiphertextFileType::File
+                Ok(CiphertextFileType::File)
             }
-            Err(e) => return Err(e),
-        };
-        match file_type {
-            CiphertextFileType::Symlink => {
-                let resolved = self.symlinks.resolve_recursively(path)?;
-                self.open_regular_file(&resolved, options)
-            }
-            CiphertextFileType::File => self.open_regular_file(path, options),
-            CiphertextFileType::Directory => Err(super::is_a_directory(path)),
+            Err(e) => Err(e),
         }
     }
 
@@ -816,6 +844,7 @@ impl CryptoFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::INFLATED_FILE_NAME;
     use crate::crypto::rng::DetRng;
     use crate::fs::testutil;
     use crate::{open_vault_with_key, CipherCombo};
@@ -1318,5 +1347,91 @@ mod tests {
         h.close().unwrap();
         fs.rename(&d, &f, true).unwrap();
         assert!(fs.metadata(&f).unwrap().is_dir());
+    }
+
+    /// A directory or symlink that moves from a shortened to a short name must leave the `.c9s`
+    /// layout behind completely: the new node is a plain `.c9r` directory with `dir.c9r` or
+    /// `symlink.c9r` and no `name.c9s`.
+    #[test]
+    fn moving_a_directory_to_a_short_name_drops_name_c9s() {
+        let (_dir, fs) = test_fs(220, false);
+        let long = CleartextPath::root().join(&"D".repeat(200)).unwrap();
+        let short = CleartextPath::parse("/d");
+        fs.create_dir(&long).unwrap();
+        fs.write_file(&long.join("f").unwrap(), b"inside", false)
+            .unwrap();
+        let long_node = fs.mapper().ciphertext_file_path(&long).unwrap();
+        assert!(long_node.is_shortened());
+        assert!(long_node.inflated_name_path().is_file());
+
+        fs.rename(&long, &short, false).unwrap();
+
+        let node = fs.mapper().ciphertext_file_path(&short).unwrap();
+        assert!(!node.is_shortened(), "{}", node.raw_path().display());
+        assert!(
+            node.raw_path().extension().is_some_and(|e| e == "c9r"),
+            "{}",
+            node.raw_path().display()
+        );
+        assert!(node.dir_file_path().is_file());
+        assert!(!node.raw_path().join(INFLATED_FILE_NAME).exists());
+        assert!(!long_node.raw_path().exists(), "old .c9s node removed");
+        assert_eq!(fs.read_file(&short.join("f").unwrap()).unwrap(), b"inside");
+    }
+
+    #[test]
+    fn moving_a_symlink_to_a_short_name_drops_name_c9s() {
+        let (_dir, fs) = test_fs(220, false);
+        let long = CleartextPath::root().join(&"S".repeat(200)).unwrap();
+        let short = CleartextPath::parse("/l");
+        fs.write_file(&CleartextPath::parse("/target"), b"t", false)
+            .unwrap();
+        fs.create_symlink(&long, "target").unwrap();
+        let long_node = fs.mapper().ciphertext_file_path(&long).unwrap();
+        assert!(long_node.is_shortened());
+        assert!(long_node.inflated_name_path().is_file());
+
+        fs.rename(&long, &short, false).unwrap();
+
+        let node = fs.mapper().ciphertext_file_path(&short).unwrap();
+        assert!(!node.is_shortened(), "{}", node.raw_path().display());
+        assert!(node.symlink_file_path().is_file());
+        assert!(!node.raw_path().join(INFLATED_FILE_NAME).exists());
+        assert!(!long_node.raw_path().exists(), "old .c9s node removed");
+        assert_eq!(fs.read_link(&short).unwrap(), "target");
+    }
+
+    #[test]
+    fn opening_a_symlink_to_a_directory_is_a_directory() {
+        let (_dir, fs) = test_fs(220, false);
+        let d = CleartextPath::parse("/d");
+        fs.create_dir(&d).unwrap();
+        fs.create_symlink(&CleartextPath::parse("/link"), "d")
+            .unwrap();
+        // a link chain that ends on a directory counts too
+        fs.create_symlink(&CleartextPath::parse("/link2"), "link")
+            .unwrap();
+        for path in ["/link", "/link2"] {
+            let p = CleartextPath::parse(path);
+            assert_eq!(
+                fs.open_file(&p, OpenOptions::read_only())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::IsADirectory,
+                "{path}"
+            );
+            assert_eq!(
+                fs.open_file(&p, OpenOptions::read_write())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::IsADirectory,
+                "{path}"
+            );
+            assert_eq!(
+                fs.read_file(&p).unwrap_err().kind(),
+                io::ErrorKind::IsADirectory,
+                "{path}"
+            );
+        }
     }
 }

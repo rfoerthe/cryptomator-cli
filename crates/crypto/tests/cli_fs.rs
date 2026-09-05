@@ -310,3 +310,94 @@ fn read_only_setting_and_password_errors() {
         .assert()
         .code(9);
 }
+
+/// `put` must never damage the destination: the content is encrypted into a sibling temp file and
+/// only a completely written temp file is renamed into place. The source here is a *directory*,
+/// which `File::open` accepts on Unix while every `read` fails with `EISDIR` — a mid-stream failure
+/// with no way for the destination to be half-written.
+#[cfg(unix)]
+#[test]
+fn a_failing_put_leaves_the_destination_and_no_temp_file() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create"])
+        .arg(sb.path("v"))
+        .assert()
+        .success();
+    let local = sb.path("in.txt");
+    std::fs::write(&local, "original\n").unwrap();
+    sb.crypto(&["fs", "put", "v"])
+        .arg(&local)
+        .arg("/keep.txt")
+        .assert()
+        .success();
+    let unreadable = sb.path("a-directory");
+    std::fs::create_dir(&unreadable).unwrap();
+
+    // --force: the old content survives a reader that dies half way through
+    sb.crypto(&["fs", "put", "v", "--force"])
+        .arg(&unreadable)
+        .arg("/keep.txt")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot write /keep.txt"));
+    sb.crypto(&["fs", "cat", "v", "/keep.txt"])
+        .assert()
+        .success()
+        .stdout("original\n");
+
+    // without --force: no destination is left behind either
+    sb.crypto(&["fs", "put", "v"])
+        .arg(&unreadable)
+        .arg("/fresh.txt")
+        .assert()
+        .code(1);
+    sb.crypto(&["fs", "cat", "v", "/fresh.txt"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no such file"));
+
+    let listing = sb
+        .crypto(&["fs", "ls", "v", "/"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listing = String::from_utf8(listing).unwrap();
+    assert!(
+        !listing.contains(".tmp"),
+        "temp file left behind:\n{listing}"
+    );
+    assert!(listing.contains("keep.txt"), "{listing}");
+    assert!(!listing.contains("fresh.txt"), "{listing}");
+}
+
+/// Vault ids are base64url, so roughly one in 32 starts with `-`. Without
+/// `allow_hyphen_values` clap reads such an id as an unknown flag and exits 2.
+#[test]
+fn a_vault_id_starting_with_a_hyphen_is_a_usable_reference() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", "--name", "Hyphen"])
+        .arg(sb.path("v"))
+        .assert()
+        .success();
+    let mut settings = sb.settings_json();
+    let id = "-abcDEF123456";
+    settings["directories"][0]["id"] = Value::String(id.to_string());
+    std::fs::write(sb.settings(), serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+    let out = sb
+        .crypto(&["--json", "vault", "info", id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out)["id"], id);
+    sb.crypto(&["fs", "ls", id, "/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("WELCOME.rtf"));
+    // `--` still works as the general escape hatch for any leading-dash argument
+    sb.crypto(&["fs", "ls", "--", id, "/"]).assert().success();
+}

@@ -68,16 +68,27 @@ fn ciphertext_paths_and_streaming_reads() {
     let long_dir = CleartextPath::parse(&format!("/{}", "d".repeat(200)));
     let content_dir = fs.ciphertext_path(&long_dir).unwrap();
     assert!(content_dir.starts_with(dir.path().join("d")) && content_dir.is_dir());
+    // "inner.txt" is short enough for the 220-char threshold even inside the long directory, so its
+    // ciphertext is a plain `.c9r` file; only the 200-char root file below is shortened.
     let inner = long_dir.join("inner.txt").unwrap();
+    let inner_ciphertext = fs.ciphertext_path(&inner).unwrap();
     assert!(
-        fs.ciphertext_path(&inner)
+        inner_ciphertext.extension().is_some_and(|e| e == "c9r"),
+        "{}",
+        inner_ciphertext.display()
+    );
+    assert!(
+        !inner_ciphertext.ends_with("contents.c9r"),
+        "{}",
+        inner_ciphertext.display()
+    );
+    let long_file = CleartextPath::parse(&format!("/{}.txt", "c".repeat(200)));
+    assert!(
+        fs.ciphertext_path(&long_file)
             .unwrap()
-            .ends_with("contents.c9r")
-            || fs
-                .ciphertext_path(&inner)
-                .unwrap()
-                .extension()
-                .is_some_and(|e| e == "c9r")
+            .ends_with("contents.c9r"),
+        "{}",
+        fs.ciphertext_path(&long_file).unwrap().display()
     );
     let mut out = Vec::new();
     assert_eq!(fs.copy_to_writer(&inner, &mut out).unwrap(), 16);

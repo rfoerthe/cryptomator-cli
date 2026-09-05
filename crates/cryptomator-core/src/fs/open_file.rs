@@ -352,6 +352,9 @@ impl OpenCryptoFile {
             ));
         }
         let old_size = self.size;
+        if position.checked_add(src.len() as u64).is_none() {
+            return Err(super::invalid_input("file offset out of range"));
+        }
         let written = if position > old_size {
             let gap = position - old_size;
             self.write_internal(ByteSource { zeroes: gap, src }, old_size)? - gap
@@ -368,7 +371,9 @@ impl OpenCryptoFile {
         let chunk_size = self.cryptor.file_content_cryptor().cleartext_chunk_size();
         let mut written: u64 = 0;
         while src.remaining() > 0 {
-            let current = position + written;
+            let current = position
+                .checked_add(written)
+                .ok_or_else(|| super::invalid_input("file offset out of range"))?;
             let index = current / chunk_size as u64;
             let offset = (current % chunk_size as u64) as usize;
             let len = src.remaining().min((chunk_size - offset) as u64) as usize;
@@ -387,7 +392,10 @@ impl OpenCryptoFile {
             }
             written += len as u64;
         }
-        self.size = self.size.max(position + written);
+        let end = position
+            .checked_add(written)
+            .ok_or_else(|| super::invalid_input("file offset out of range"))?;
+        self.size = self.size.max(end);
         self.last_modified = Some(SystemTime::now());
         Ok(written)
     }
@@ -493,10 +501,9 @@ impl OpenCryptoFile {
 
     /// `ChunkLoader.load`: beyond EOF the chunk is empty.
     fn load_chunk(&mut self, index: u64) -> io::Result<Zeroizing<Vec<u8>>> {
+        let position = ciphertext_position(&self.cryptor, index)?;
         let content = self.cryptor.file_content_cryptor();
         let ciphertext_chunk_size = content.ciphertext_chunk_size();
-        let position = index * ciphertext_chunk_size as u64
-            + self.cryptor.file_header_cryptor().header_size() as u64;
         let mut buf = vec![0u8; ciphertext_chunk_size];
         let read = read_fully_at(&self.file, &mut buf, position)?;
         if read == 0 {
@@ -550,13 +557,22 @@ fn encrypt_and_write(
     index: u64,
     cleartext: &[u8],
 ) -> io::Result<()> {
+    let position = ciphertext_position(cryptor, index)?;
     stats.add_bytes_encrypted(cleartext.len() as u64);
     let ciphertext = cryptor
         .file_content_cryptor()
         .encrypt_chunk(cleartext, index, header, rng);
-    let position = index * cryptor.file_content_cryptor().ciphertext_chunk_size() as u64
-        + cryptor.file_header_cryptor().header_size() as u64;
     file.write_all_at(&ciphertext, position)
+}
+
+/// Where chunk `index` starts in the ciphertext. Cleartext offsets up to `u64::MAX` map to
+/// ciphertext offsets slightly beyond it, so the arithmetic is checked instead of wrapping onto
+/// an unrelated chunk.
+fn ciphertext_position(cryptor: &Cryptor, index: u64) -> io::Result<u64> {
+    index
+        .checked_mul(cryptor.file_content_cryptor().ciphertext_chunk_size() as u64)
+        .and_then(|p| p.checked_add(cryptor.file_header_cryptor().header_size() as u64))
+        .ok_or_else(|| super::invalid_input("file offset out of range"))
 }
 
 #[cfg(test)]
@@ -589,6 +605,24 @@ mod tests {
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 7) as u8).collect()
+    }
+
+    #[test]
+    fn chunk_offsets_reject_overflow_but_cover_huge_files() {
+        let cryptor = cryptor(CipherCombo::SivGcm);
+        let cleartext_chunk = cryptor.file_content_cryptor().cleartext_chunk_size() as u64;
+        // a cleartext offset of 2^62 is still addressable
+        assert!(ciphertext_position(&cryptor, (1u64 << 62) / cleartext_chunk).is_ok());
+        let err = ciphertext_position(&cryptor, u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("out of range"), "{err}");
+        // the same guard on the writing side, before any chunk is touched
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = open(&cryptor, &dir.path().join("f"), OpenOptions::write_new()).unwrap();
+        assert_eq!(
+            f.write_at(b"x", u64::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

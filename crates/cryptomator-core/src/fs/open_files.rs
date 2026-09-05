@@ -31,6 +31,8 @@ impl std::fmt::Debug for OpenCryptoFiles {
     }
 }
 
+/// Only makes the path absolute; `..` components are kept as they are. Callers must pass paths
+/// that the `CryptoPathMapper` produced, which never contain `..`.
 fn normalize(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -139,7 +141,9 @@ impl OpenCryptoFiles {
         })
     }
 
-    /// Flushes and closes every open file (even if handles are still around).
+    /// Flushes every open file and forgets it. Handles that are still around keep their own file
+    /// descriptor and stay usable, so this is for shutting the file system down (unmount), not for
+    /// revoking access.
     pub fn close_all(&self) -> io::Result<()> {
         let files: Vec<Arc<Mutex<OpenCryptoFile>>> =
             super::lock(&self.files).drain().map(|(_, f)| f).collect();
@@ -313,6 +317,13 @@ impl Drop for TwoPhaseMove {
         }
     }
 }
+
+// A FUSE adapter hands handles to worker threads, so this must not regress into `!Send`/`!Sync`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<FileHandle>();
+    assert_send_sync::<OpenCryptoFiles>();
+};
 
 #[cfg(test)]
 mod tests {

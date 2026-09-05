@@ -16,6 +16,8 @@ use std::sync::Mutex;
 /// `DirectoryIdLoader.MAX_DIR_ID_LENGTH` (the loader tolerates more than the 36 chars of a UUID).
 pub const MAX_DIR_FILE_LENGTH: u64 = 1000;
 
+/// Caches every directory id it has read; like the mapper's cache there is no expiry, because a
+/// `crypto` process is short-lived (M4 adds one for the long-running daemon).
 pub struct DirIdLoader {
     events: EventSink,
     cache: Mutex<HashMap<PathBuf, String>>,

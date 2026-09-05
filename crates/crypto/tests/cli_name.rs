@@ -35,10 +35,20 @@ fn locate_and_decrypt_round_trip() {
         .is_file());
     let inner = locate(&format!("{long_dir}/inner.txt"), false);
     assert!(inner.ends_with(".c9r"), "{inner}");
+    // short name inside a long directory: the ciphertext stays a plain `.c9r` file, so --contents
+    // is the node itself. The 200-char root file is the shortened case.
     let inner_contents = locate(&format!("{long_dir}/inner.txt"), true);
+    assert_eq!(inner_contents, inner, "{inner_contents}");
     assert!(
-        inner_contents.ends_with("contents.c9r") || inner_contents.ends_with(".c9r"),
+        !inner_contents.ends_with("contents.c9r"),
         "{inner_contents}"
+    );
+    let long_file = format!("/{}.txt", "c".repeat(200));
+    assert!(locate(&long_file, false).ends_with(".c9s"));
+    let long_file_contents = locate(&long_file, true);
+    assert!(
+        long_file_contents.ends_with("contents.c9r"),
+        "{long_file_contents}"
     );
     sb.crypto(&["name", "locate", "long_names", "/missing"])
         .assert()

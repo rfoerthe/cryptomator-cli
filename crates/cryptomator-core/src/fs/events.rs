@@ -91,6 +91,8 @@ impl fmt::Display for FilesystemEvent {
     }
 }
 
+/// Called while file system locks are held: a sink must not call back into the file system, or it
+/// deadlocks.
 pub type EventSink = Arc<dyn Fn(FilesystemEvent) + Send + Sync>;
 
 pub fn discard_events() -> EventSink {

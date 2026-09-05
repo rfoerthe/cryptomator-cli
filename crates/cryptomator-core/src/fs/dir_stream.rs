@@ -77,11 +77,8 @@ impl DirectoryLister<'_> {
             })
             .collect();
         nodes.sort();
-        // both subtractions saturate: a manipulated vault config may carry a threshold below 25,
-        // which `CryptoPathMapper` accepts unchecked.
-        let threshold = self.mapper.shortening_threshold();
         let max_cleartext_file_name_length =
-            (threshold.saturating_sub(4) / 4 * 3).saturating_sub(16);
+            super::capabilities::max_cleartext_file_name_length(self.mapper.shortening_threshold());
         let ctx = NodeContext {
             lister: self,
             dir_id: &dir.dir_id,

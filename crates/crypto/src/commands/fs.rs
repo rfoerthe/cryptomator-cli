@@ -357,18 +357,56 @@ fn put(ctx: &Ctx, args: FsPutArgs) -> Result<u8> {
     }
     let fs = open_fs(ctx, &args.vault, &args.password, true)?;
     let path = CleartextPath::parse(&args.path);
-    let bytes = if from_stdin {
-        let stdin = io::stdin();
-        let mut lock = stdin.lock();
-        fs.write_from_reader(&path, &mut lock, args.force)
-    } else {
-        let mut file = std::fs::File::open(&args.local)
-            .map_err(io_detail)
-            .with_context(|| format!("cannot open {}", args.local.display()))?;
-        fs.write_from_reader(&path, &mut file, args.force)
+    // The destination is never opened for writing: a reader that fails half way through (or a
+    // process that dies) would otherwise leave a truncated file that looks complete. Everything is
+    // encrypted into a sibling temp file first and only a successful stream is renamed into place.
+    let existing = fs.symlink_metadata(&path).ok();
+    let resolves_to_dir = fs.metadata(&path).map(|a| a.is_dir()).unwrap_or(false);
+    let put_error = |kind: io::ErrorKind, message: &'static str| {
+        Err::<u8, io::Error>(io::Error::new(kind, message))
+            .with_context(|| format!("cannot write {path}"))
+    };
+    if resolves_to_dir || path.is_root() {
+        return put_error(io::ErrorKind::IsADirectory, "is a directory");
     }
-    .map_err(io_detail)
-    .with_context(|| format!("cannot write {path}"))?;
+    if existing.is_some() && !args.force {
+        return put_error(io::ErrorKind::AlreadyExists, "already exists");
+    }
+    let mut local = if from_stdin {
+        None
+    } else {
+        Some(
+            std::fs::File::open(&args.local)
+                .map_err(io_detail)
+                .with_context(|| format!("cannot open {}", args.local.display()))?,
+        )
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return put_error(io::ErrorKind::IsADirectory, "is a directory");
+    };
+    let tmp = parent
+        .join(&format!("{name}.{}.tmp", std::process::id()))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        .with_context(|| format!("cannot write {path}"))?;
+    let stdin = io::stdin();
+    let mut stdin_lock;
+    let input: &mut dyn io::Read = match local.as_mut() {
+        Some(file) => file,
+        None => {
+            stdin_lock = stdin.lock();
+            &mut stdin_lock
+        }
+    };
+    let bytes = match fs
+        .write_from_reader(&tmp, input, false)
+        .and_then(|bytes| fs.rename(&tmp, &path, args.force).map(|()| bytes))
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = fs.delete(&tmp); // best effort: the original error is what the user asked about
+            return Err(io_detail(e)).with_context(|| format!("cannot write {path}"));
+        }
+    };
     ctx.out
         .emit(json!({ "path": path.to_string(), "bytes": bytes }), || {
             format!("{path} ({bytes} bytes)")

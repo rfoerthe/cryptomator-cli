@@ -65,6 +65,8 @@ pub enum VaultCommand {
     /// Unregister a vault (its files are kept)
     Remove {
         /// Vault id, display name or path
+        // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+        #[arg(allow_hyphen_values = true)]
         vault: String,
     },
     /// List registered vaults with their state
@@ -72,6 +74,8 @@ pub enum VaultCommand {
     /// Show settings and configuration of a vault
     Info {
         /// Vault id, display name or path
+        // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+        #[arg(allow_hyphen_values = true)]
         vault: String,
     },
     /// Change per-vault settings
@@ -81,6 +85,8 @@ pub enum VaultCommand {
 #[derive(Args, Debug)]
 pub struct SetArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// New display name
     #[arg(long)]
@@ -179,6 +185,8 @@ pub enum PasswordCommand {
 #[derive(Args, Debug)]
 pub struct ChangePasswordArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     #[command(flatten)]
     pub password: PasswordArgs,
@@ -200,6 +208,8 @@ pub enum RecoveryKeyCommand {
 #[derive(Args, Debug)]
 pub struct ShowArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     #[command(flatten)]
     pub password: PasswordArgs,
@@ -211,6 +221,8 @@ pub struct ShowArgs {
 #[command(group = clap::ArgGroup::new("recovery-key-source").required(true))]
 pub struct ResetPasswordArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Read the recovery key from the next line of standard input
     #[arg(long, group = "recovery-key-source")]
@@ -252,6 +264,8 @@ pub enum FsCommand {
 #[derive(Args, Debug)]
 pub struct FsLsArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext directory
     #[arg(default_value = "/")]
@@ -266,6 +280,8 @@ pub struct FsLsArgs {
 #[derive(Args, Debug)]
 pub struct FsTreeArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext directory to start from
     #[arg(default_value = "/")]
@@ -280,6 +296,8 @@ pub struct FsTreeArgs {
 #[derive(Args, Debug)]
 pub struct FsPathArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext path
     pub path: String,
@@ -290,6 +308,8 @@ pub struct FsPathArgs {
 #[derive(Args, Debug)]
 pub struct FsGetArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext file
     pub path: String,
@@ -305,6 +325,8 @@ pub struct FsGetArgs {
 #[derive(Args, Debug)]
 pub struct FsPutArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Local source file, or "-" for standard input (not combinable with --password-stdin)
     pub local: PathBuf,
@@ -320,6 +342,8 @@ pub struct FsPutArgs {
 #[derive(Args, Debug)]
 pub struct FsRmArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext path
     pub path: String,
@@ -333,6 +357,8 @@ pub struct FsRmArgs {
 #[derive(Args, Debug)]
 pub struct FsMkdirArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext directory
     pub path: String,
@@ -346,6 +372,8 @@ pub struct FsMkdirArgs {
 #[derive(Args, Debug)]
 pub struct FsMvArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext source path
     pub source: String,
@@ -369,6 +397,8 @@ pub enum NameCommand {
 #[derive(Args, Debug)]
 pub struct NameDecryptArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Ciphertext nodes (.c9r files, .c9r node directories or .c9s directories)
     #[arg(required = true)]
@@ -380,6 +410,8 @@ pub struct NameDecryptArgs {
 #[derive(Args, Debug)]
 pub struct NameLocateArgs {
     /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
     pub vault: String,
     /// Cleartext path
     pub path: String,

@@ -88,10 +88,20 @@
   vault, and `crypto name decrypt|locate` to translate between cleartext and ciphertext names.
   `fs tree --json --hash` prints the same manifest shape as the Java fixture generator, sorted per
   directory by UTF-16 code units so it matches Java's `Path.toString()` order above the BMP.
+- `crypto fs put` is non-destructive: the content is encrypted into a sibling temp file
+  (`<name>.<pid>.tmp` in the destination directory) and only a completely written temp file is
+  renamed over the destination. A reader that fails half way through no longer truncates the old
+  file (with `--force`) or leaves a partial one that looks complete (without it); the temp file is
+  removed on every failure. Without `--force` an existing destination is rejected before the first
+  byte is read.
+- Vault ids that start with `-` (base64url ids do, about one in 32) work as command arguments:
+  every vault reference accepts leading dashes instead of being parsed as an unknown flag. `--`
+  remains the general escape hatch.
 - Interop is now bidirectional: besides the vaults `crypto` creates, a tree that `CryptoFs` writes
   (nesting, 200-character names, unicode incl. NFD input and emoji, sizes at the chunk boundaries
-  32767/32768/32769/65536, symlinks, a rename and an overwrite) is opened by the real cryptofs, and
-  its manifest must equal `crypto fs tree --json --hash` entry for entry
+  32767/32768/32769/65536, symlinks, renames to and from shortened names for files, directories and
+  symlinks, a truncate to a non-boundary size, a copy and an overwrite) is opened by the real
+  cryptofs, and its manifest must equal `crypto fs tree --json --hash` entry for entry
   (`cargo test -p crypto --test java_interop -- --ignored`).
 - Deliberate deviations from cryptofs, all of them chosen for a short-lived CLI process:
   1. Relative symlink targets resolve against the link's parent directory (POSIX semantics);
@@ -109,4 +119,6 @@
   directory without its dir id backup), and `bytes_written` counts only the caller's bytes, not the
   zero-filled gap of a sparse write.
 - Not in M3 (the spec assigns them to M4): cache expiry, `.c9u`/`FileIsInUseEvent` creation
-  (Hub only) and `fs` access to a mounted vault.
+  (Hub only) and `fs` access to a mounted vault. `fs`/`name` require state `LOCKED` as recorded in
+  the vault directory; a *running* mount cannot be detected yet, and the README says so instead of
+  promising a refusal that does not exist.
