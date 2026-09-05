@@ -182,6 +182,27 @@ mod tests {
     }
 
     #[test]
+    fn open_vault_rejects_traversal_in_key_id() {
+        let dir = copy_fixture("siv_gcm_basic");
+        // `kid` is read before the config signature is verified, so a hostile config must not be
+        // able to steer the masterkey load (and its backup) outside the vault directory.
+        let token = crate::VaultConfig {
+            id: "x".into(),
+            vault_version: 8,
+            cipher_combo: crate::CipherCombo::SivGcm,
+            shortening_threshold: 220,
+        }
+        .to_token("masterkeyfile:../outside", &[0u8; 64]);
+        fs::write(dir.path().join(VAULTCONFIG_FILENAME), token).unwrap();
+        let access = MasterkeyFileAccess::new(Vec::new());
+        assert!(matches!(
+            open_vault(dir.path(), &access, PASSPHRASE),
+            Err(CoreError::UnsupportedKeyId(_))
+        ));
+        assert!(backups(dir.path(), "outside").is_empty());
+    }
+
+    #[test]
     fn missing_content_root_is_reported() {
         let dir = copy_fixture("siv_gcm_basic");
         fs::remove_dir_all(dir.path().join("d")).unwrap();
