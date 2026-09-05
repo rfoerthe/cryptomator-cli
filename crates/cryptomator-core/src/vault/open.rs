@@ -70,7 +70,9 @@ fn open_with_key(
     let _ = attempt_backup(&vault_path.join(VAULTCONFIG_FILENAME));
     let cryptor = Cryptor::new(config.cipher_combo, &masterkey);
     let root = root_content_dir(vault_path, &cryptor);
-    if !root.exists() {
+    // `is_dir()` rather than `exists()`: a regular file at the content root is as unusable as a
+    // missing one, and reporting it here beats a confusing failure during the first traversal.
+    if !root.is_dir() {
         return Err(CoreError::ContentRootMissing(root));
     }
     Ok(OpenedVault {
@@ -123,10 +125,22 @@ mod tests {
         names
     }
 
+    /// Removes the `.bkup` files the fixtures ship. Without this, `attempt_backup` finds a
+    /// byte-identical backup (`VerifiedExisting`), writes nothing, and every backup assertion
+    /// would pass even if the implementation never backed anything up.
+    fn remove_shipped_backups(dir: &Path, prefix: &str) {
+        for name in backups(dir, prefix) {
+            fs::remove_file(dir.join(name)).unwrap();
+        }
+        assert!(backups(dir, prefix).is_empty());
+    }
+
     #[test]
     fn opens_fixture_and_writes_both_backups() {
         for name in ["siv_gcm_basic", "siv_ctrmac_basic"] {
             let dir = copy_fixture(name);
+            remove_shipped_backups(dir.path(), "vault.cryptomator");
+            remove_shipped_backups(dir.path(), MASTERKEY_FILENAME);
             let access = MasterkeyFileAccess::new(Vec::new());
             let opened = open_vault(dir.path(), &access, PASSPHRASE).unwrap();
             assert_eq!(opened.path, dir.path());
@@ -152,14 +166,15 @@ mod tests {
     #[test]
     fn wrong_passphrase_is_invalid_passphrase_and_writes_no_backup() {
         let dir = copy_fixture("siv_gcm_basic");
+        // Drop the backup the fixture ships, so "no backup" is an assertion about this unlock.
+        remove_shipped_backups(dir.path(), "vault.cryptomator");
+        remove_shipped_backups(dir.path(), MASTERKEY_FILENAME);
         let access = MasterkeyFileAccess::new(Vec::new());
-        // The fixture ships a committed config backup, so compare against the pre-unlock state.
-        let before = backups(dir.path(), "vault.cryptomator");
         assert!(matches!(
             open_vault(dir.path(), &access, "nope"),
             Err(CoreError::InvalidPassphrase)
         ));
-        assert_eq!(backups(dir.path(), "vault.cryptomator"), before);
+        assert!(backups(dir.path(), "vault.cryptomator").is_empty());
         assert!(backups(dir.path(), MASTERKEY_FILENAME).is_empty());
     }
 
@@ -207,6 +222,23 @@ mod tests {
         let dir = copy_fixture("siv_gcm_basic");
         fs::remove_dir_all(dir.path().join("d")).unwrap();
         let access = MasterkeyFileAccess::new(Vec::new());
+        assert!(matches!(
+            open_vault(dir.path(), &access, PASSPHRASE),
+            Err(CoreError::ContentRootMissing(_))
+        ));
+    }
+
+    #[test]
+    fn content_root_that_is_a_file_is_reported_missing() {
+        let dir = copy_fixture("siv_gcm_basic");
+        let access = MasterkeyFileAccess::new(Vec::new());
+        let key = access
+            .load(&dir.path().join(MASTERKEY_FILENAME), PASSPHRASE)
+            .unwrap();
+        let cryptor = Cryptor::new(crate::CipherCombo::SivGcm, &key);
+        let root = root_content_dir(dir.path(), &cryptor);
+        fs::remove_dir_all(&root).unwrap();
+        fs::write(&root, b"").unwrap();
         assert!(matches!(
             open_vault(dir.path(), &access, PASSPHRASE),
             Err(CoreError::ContentRootMissing(_))

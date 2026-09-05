@@ -51,8 +51,9 @@ impl KeyId {
     ///
     /// The name must be a plain file name: the `kid` header is read *before* the config signature
     /// is checked, so an attacker-supplied `masterkeyfile:../../secret` would otherwise make
-    /// callers join a path outside the vault. Empty, `.`, `..` and anything containing `/` or `\`
-    /// is rejected as an unsupported key id. (Java does not perform this check.)
+    /// callers join a path outside the vault. Empty, `.`, `..` and anything containing `/`, `\` or
+    /// `:` is rejected as an unsupported key id. `:` matters because a Windows drive-relative
+    /// prefix such as `C:evil` escapes `Path::join` too. (Java does not perform this check.)
     pub fn require_masterkey_file(&self) -> Result<&str> {
         match self {
             KeyId::MasterkeyFile { file_name } => {
@@ -61,6 +62,7 @@ impl KeyId {
                     || file_name == ".."
                     || file_name.contains('/')
                     || file_name.contains('\\')
+                    || file_name.contains(':')
                 {
                     return Err(CoreError::UnsupportedKeyId(format!(
                         "masterkeyfile:{file_name}"
@@ -472,6 +474,8 @@ mod tests {
             "masterkeyfile:",
             "masterkeyfile:.",
             "masterkeyfile:..\\x",
+            // Windows drive-relative prefix: `Path::join` does not stay inside the vault.
+            "masterkeyfile:C:evil",
         ] {
             let err = KeyId::parse(raw).require_masterkey_file().unwrap_err();
             assert!(
