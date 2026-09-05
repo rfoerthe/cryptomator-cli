@@ -44,6 +44,17 @@ impl KeyId {
             KeyId::Other(raw.to_string())
         }
     }
+
+    /// Name of the masterkey file this vault is unlocked with, or the error that explains why this
+    /// vault cannot be opened by `crypto` at all. Use this instead of matching on the variants, so
+    /// every caller rejects Hub and unknown key ids the same way.
+    pub fn require_masterkey_file(&self) -> Result<&str> {
+        match self {
+            KeyId::MasterkeyFile { file_name } => Ok(file_name),
+            KeyId::Hub { uri } => Err(CoreError::HubVaultUnsupported(uri.clone())),
+            KeyId::Other(raw) => Err(CoreError::UnsupportedKeyId(raw.clone())),
+        }
+    }
 }
 
 impl std::fmt::Display for KeyId {
@@ -422,6 +433,38 @@ mod tests {
             KeyId::parse("unknown:thing"),
             KeyId::Other("unknown:thing".into())
         );
+    }
+
+    #[test]
+    fn require_masterkey_file_returns_the_file_name() {
+        assert_eq!(
+            KeyId::parse("masterkeyfile:masterkey.cryptomator")
+                .require_masterkey_file()
+                .unwrap(),
+            "masterkey.cryptomator"
+        );
+    }
+
+    #[test]
+    fn require_masterkey_file_rejects_hub_vaults() {
+        let err = KeyId::parse("hub+https://hub.example.com/api/vaults/123")
+            .require_masterkey_file()
+            .unwrap_err();
+        assert!(matches!(err, CoreError::HubVaultUnsupported(ref uri)
+            if uri == "hub+https://hub.example.com/api/vaults/123"));
+        assert_eq!(
+            err.to_string(),
+            "Cryptomator Hub vaults are not supported (key id: hub+https://hub.example.com/api/vaults/123)"
+        );
+    }
+
+    #[test]
+    fn require_masterkey_file_rejects_unknown_key_ids() {
+        let err = KeyId::parse("unknown:thing")
+            .require_masterkey_file()
+            .unwrap_err();
+        assert!(matches!(err, CoreError::UnsupportedKeyId(ref raw) if raw == "unknown:thing"));
+        assert_eq!(err.to_string(), "unsupported key id: unknown:thing");
     }
 
     #[test]

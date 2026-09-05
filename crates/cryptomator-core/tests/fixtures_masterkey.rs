@@ -1,6 +1,8 @@
 //! Loads every Java-generated fixture: masterkey file + vault config must verify with our implementation.
 use cryptomator_core::constants::{MASTERKEY_FILENAME, VAULTCONFIG_FILENAME, VAULT_VERSION};
-use cryptomator_core::{CipherCombo, KeyId, MasterkeyFileAccess, UnverifiedVaultConfig};
+use cryptomator_core::{
+    CipherCombo, FileNameCryptor, KeyId, MasterkeyFileAccess, UnverifiedVaultConfig,
+};
 use data_encoding::HEXLOWER;
 use std::path::PathBuf;
 
@@ -80,7 +82,6 @@ fn every_fixture_unlocks_and_verifies() {
 
 #[test]
 fn root_directory_of_every_fixture_exists_under_hashed_name() {
-    use cryptomator_core::crypto::siv::FileNameCryptor;
     for dir in fixture_dirs() {
         let meta: FixtureMeta =
             serde_json::from_slice(&std::fs::read(dir.join("fixture.json")).unwrap()).unwrap();
