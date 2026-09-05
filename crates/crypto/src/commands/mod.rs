@@ -1,4 +1,5 @@
 //! Command implementations; each returns the process exit code.
+pub mod config;
 pub mod vault;
 
 use crate::output::Output;

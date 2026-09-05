@@ -5,7 +5,7 @@ mod exit;
 mod output;
 
 use clap::Parser;
-use cli::{Cli, Command, RecoveryKeyCommand, VaultCommand};
+use cli::{Cli, Command, ConfigCommand, RecoveryKeyCommand, VaultCommand};
 use commands::Ctx;
 use cryptomator_app::settings::SettingsStore;
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
@@ -53,6 +53,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             VaultCommand::Remove { vault } => commands::vault::remove(&ctx, &vault),
             VaultCommand::List => commands::vault::list(&ctx),
             VaultCommand::Info { vault } => commands::vault::info(&ctx, &vault),
+            VaultCommand::Set(args) => commands::vault::set(&ctx, args),
         },
         Command::RecoveryKey {
             command: RecoveryKeyCommand::Validate(args),
@@ -71,5 +72,9 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 Ok(exit::INVALID_PASSPHRASE)
             }
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Get { key } => commands::config::get(&ctx, key.as_deref()),
+            ConfigCommand::Set { key, value } => commands::config::set(&ctx, &key, &value),
+        },
     }
 }

@@ -314,3 +314,145 @@ fn vault_create_no_register_writes_no_settings() {
         "--no-register never touches settings.json"
     );
 }
+
+#[test]
+fn vault_set_updates_settings() {
+    let sb = Sandbox::new();
+    sb.crypto(&[
+        "vault",
+        "add",
+        "--name",
+        "B",
+        fixture("siv_gcm_basic").to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    sb.crypto(&[
+        "vault",
+        "set",
+        "B",
+        "--name",
+        "Renamed",
+        "--mount-point",
+        "/tmp/mnt-b",
+        "--read-only",
+        "true",
+        "--mount-flags",
+        "-o foo",
+        "--mounter",
+        "webdav",
+        "--port",
+        "8080",
+        "--auto-lock-idle",
+        "300",
+        "--max-filename-length",
+        "146",
+        "--action-after-unlock",
+        "REVEAL",
+    ])
+    .assert()
+    .success();
+    let v = sb.settings_json()["directories"][0].clone();
+    assert_eq!(v["displayName"], "Renamed");
+    assert_eq!(v["mountPoint"], "/tmp/mnt-b");
+    assert_eq!(v["usesReadOnlyMode"], true);
+    assert_eq!(v["mountFlags"], "-o foo");
+    assert_eq!(
+        v["mountService"],
+        "org.cryptomator.frontend.webdav.mount.FallbackMounter"
+    );
+    assert_eq!(v["port"], 8080);
+    assert_eq!(v["autoLockWhenIdle"], true);
+    assert_eq!(v["autoLockIdleSeconds"], 300);
+    assert_eq!(v["maxCleartextFilenameLength"], 146);
+    assert_eq!(v["actionAfterUnlock"], "REVEAL");
+
+    sb.crypto(&[
+        "vault",
+        "set",
+        "Renamed",
+        "--no-mount-point",
+        "--default-mount-flags",
+        "--mounter",
+        "default",
+        "--no-auto-lock",
+        "--max-filename-length",
+        "auto",
+        "--read-only",
+        "false",
+    ])
+    .assert()
+    .success();
+    let v = sb.settings_json()["directories"][0].clone();
+    assert!(v.get("mountPoint").is_none());
+    assert_eq!(v["mountFlags"], "");
+    assert!(v.get("mountService").is_none());
+    assert_eq!(v["autoLockWhenIdle"], false);
+    assert_eq!(v["maxCleartextFilenameLength"], -1);
+    assert_eq!(v["usesReadOnlyMode"], false);
+
+    sb.crypto(&["vault", "set", "Renamed", "--mounter", "bogus"])
+        .assert()
+        .code(2);
+    sb.crypto(&["vault", "set", "Renamed", "--action-after-unlock", "DANCE"])
+        .assert()
+        .code(2);
+    sb.crypto(&["vault", "set", "missing", "--name", "x"])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn config_get_and_set() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto(&["--json", "config", "get"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let cfg: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(cfg["port"], 42427);
+    assert_eq!(cfg["useKeychain"], true);
+    assert!(cfg["mountService"].is_null());
+
+    sb.crypto(&["config", "set", "mountService", "fuse-t"])
+        .assert()
+        .success();
+    sb.crypto(&["config", "set", "port", "42428"])
+        .assert()
+        .success();
+    sb.crypto(&["config", "set", "useKeychain", "false"])
+        .assert()
+        .success();
+    sb.crypto(&["config", "set", "debugMode", "true"])
+        .assert()
+        .success();
+    sb.crypto(&["config", "set", "keychainProvider", "org.example.Keychain"])
+        .assert()
+        .success();
+    sb.crypto(&["config", "get", "mountService"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "org.cryptomator.frontend.fuse.mount.FuseTMountProvider",
+        ));
+    let json = sb.settings_json();
+    assert_eq!(json["port"], 42428);
+    assert_eq!(json["useKeychain"], false);
+    assert_eq!(json["debugMode"], true);
+    assert_eq!(json["keychainProvider"], "org.example.Keychain");
+
+    sb.crypto(&["config", "set", "mountService", "default"])
+        .assert()
+        .success();
+    assert!(sb.settings_json().get("mountService").is_none());
+    sb.crypto(&["config", "set", "port", "70000"])
+        .assert()
+        .code(2);
+    sb.crypto(&["config", "set", "theme", "DARK"])
+        .assert()
+        .code(2);
+    sb.crypto(&["config", "get", "theme"]).assert().code(2);
+}

@@ -1,12 +1,14 @@
-//! `crypto vault create|add|remove|list|info`
-use crate::cli::{AddArgs, CreateArgs};
+//! `crypto vault create|add|remove|list|info|set`
+use crate::cli::{AddArgs, CreateArgs, SetArgs};
 use crate::commands::Ctx;
 use crate::exit;
 use anyhow::{Context, Result};
 use cryptomator_app::settings::{
-    generate_id, normalize_vault_path, resolve_vault_index, VaultSettingsJson,
+    generate_id, normalize_vault_path, resolve_vault_index, VaultSettingsJson, WhenUnlocked,
 };
-use cryptomator_app::{min_password_length, read_new_passphrase, AppError, SystemIo};
+use cryptomator_app::{
+    min_password_length, read_new_passphrase, resolve_mounter, AppError, SystemIo,
+};
 use cryptomator_core::recovery::{create_recovery_key, WordEncoder};
 use cryptomator_core::{
     assert_is_vault_directory, create_vault, determine_vault_state, read_vault_config, CipherCombo,
@@ -250,6 +252,90 @@ pub fn info(ctx: &Ctx, reference: &str) -> Result<u8> {
     let settings = ctx.store.load()?;
     let index = resolve_vault_index(&settings, reference)?;
     let value = vault_json(&settings.directories[index]);
+    ctx.out.emit(value.clone(), || human_info(&value))?;
+    Ok(exit::OK)
+}
+
+fn invalid(key: &str, message: impl Into<String>) -> AppError {
+    AppError::InvalidValue {
+        key: key.to_string(),
+        message: message.into(),
+    }
+}
+
+pub fn set(ctx: &Ctx, args: SetArgs) -> Result<u8> {
+    // `Option<Option<_>>`: outer = flag given, inner = the new value (`None` clears the setting).
+    let mounter = match args.mounter.as_deref() {
+        None => None,
+        Some("default") | Some("") => Some(None),
+        Some(other) => Some(Some(resolve_mounter(other)?)),
+    };
+    let action =
+        match args.action_after_unlock.as_deref() {
+            None => None,
+            Some(value) => Some(WhenUnlocked::parse(value).ok_or_else(|| {
+                invalid("--action-after-unlock", "expected IGNORE, REVEAL or ASK")
+            })?),
+        };
+    let max_name_length = match args.max_filename_length.as_deref() {
+        None => None,
+        Some("auto") => Some(-1),
+        Some(value) => Some(
+            value
+                .parse::<i32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    invalid(
+                        "--max-filename-length",
+                        "expected a positive number or \"auto\"",
+                    )
+                })?,
+        ),
+    };
+    let updated = ctx.store.update(|settings| {
+        let index = resolve_vault_index(settings, &args.vault)?;
+        let vault = &mut settings.directories[index];
+        if let Some(name) = &args.name {
+            vault.display_name = Some(name.clone());
+        }
+        if let Some(mount_point) = &args.mount_point {
+            vault.mount_point = Some(mount_point.to_string_lossy().into_owned());
+        }
+        if args.no_mount_point {
+            vault.mount_point = None;
+        }
+        if let Some(read_only) = args.read_only {
+            vault.uses_read_only_mode = read_only;
+        }
+        if let Some(flags) = &args.mount_flags {
+            vault.mount_flags = flags.clone();
+        }
+        if args.default_mount_flags {
+            vault.mount_flags = String::new();
+        }
+        if let Some(mounter) = &mounter {
+            vault.mount_service = mounter.clone();
+        }
+        if let Some(port) = args.port {
+            vault.port = port;
+        }
+        if let Some(seconds) = args.auto_lock_idle {
+            vault.auto_lock_when_idle = true;
+            vault.auto_lock_idle_seconds = seconds;
+        }
+        if args.no_auto_lock {
+            vault.auto_lock_when_idle = false;
+        }
+        if let Some(n) = max_name_length {
+            vault.max_cleartext_filename_length = n;
+        }
+        if let Some(action) = action {
+            vault.action_after_unlock = action;
+        }
+        Ok(vault.clone())
+    })?;
+    let value = vault_json(&updated);
     ctx.out.emit(value.clone(), || human_info(&value))?;
     Ok(exit::OK)
 }

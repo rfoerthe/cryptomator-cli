@@ -34,6 +34,11 @@ pub enum Command {
         #[command(subcommand)]
         command: RecoveryKeyCommand,
     },
+    /// Global settings (settings.json)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -54,6 +59,67 @@ pub enum VaultCommand {
         /// Vault id, display name or path
         vault: String,
     },
+    /// Change per-vault settings
+    Set(SetArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SetArgs {
+    /// Vault id, display name or path
+    pub vault: String,
+    /// New display name
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Mount point directory (absolute path)
+    #[arg(long, value_name = "PATH", conflicts_with = "no_mount_point")]
+    pub mount_point: Option<PathBuf>,
+    /// Let the mounter choose the mount point
+    #[arg(long)]
+    pub no_mount_point: bool,
+    /// Mount read-only (true|false)
+    #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
+    pub read_only: Option<bool>,
+    /// Custom mount flags, e.g. "-ovolname=Secret"
+    // Mount flags start with a dash; without `allow_hyphen_values` clap would read them as options.
+    #[arg(
+        long,
+        value_name = "FLAGS",
+        allow_hyphen_values = true,
+        conflicts_with = "default_mount_flags"
+    )]
+    pub mount_flags: Option<String>,
+    /// Use the mounter's default flags
+    #[arg(long)]
+    pub default_mount_flags: bool,
+    /// Mounter alias (fuse-t, macfuse, fuse, webdav), Java class name, or "default"
+    #[arg(long, value_name = "MOUNTER")]
+    pub mounter: Option<String>,
+    /// TCP port for loopback mounters (WebDAV)
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Lock automatically after this many idle seconds
+    #[arg(long, value_name = "SECONDS", conflicts_with = "no_auto_lock")]
+    pub auto_lock_idle: Option<u32>,
+    /// Disable idle auto-lock
+    #[arg(long)]
+    pub no_auto_lock: bool,
+    /// Maximum cleartext file name length, or "auto" to probe on unlock
+    #[arg(long, value_name = "N|auto")]
+    pub max_filename_length: Option<String>,
+    /// What to do after unlock: IGNORE, REVEAL or ASK
+    #[arg(long, value_name = "ACTION")]
+    pub action_after_unlock: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Print one or all global settings
+    Get {
+        /// mountService | port | useKeychain | keychainProvider | debugMode
+        key: Option<String>,
+    },
+    /// Change a global setting
+    Set { key: String, value: String },
 }
 
 #[derive(Args, Debug)]
