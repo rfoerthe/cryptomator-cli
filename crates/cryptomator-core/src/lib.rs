@@ -26,6 +26,7 @@ pub use crypto::rng::{OsRng, Rng};
 pub use crypto::siv::FileNameCryptor;
 pub use crypto::stream::{decrypt_all, encrypt_all, DecryptingReader, EncryptingWriter};
 pub use error::{CoreError, NotAVaultReason, Result};
+pub use fs::{decrypt_filename, determine_supported_cleartext_file_name_length};
 pub use fs::{
     CiphertextDirectory, CiphertextFilePath, CiphertextFileType, CleartextPath, CryptoFs,
     CryptoFsOptions, CryptoPathMapper, DirEntry, DirIdLoader, EventSink, FileAttributes,

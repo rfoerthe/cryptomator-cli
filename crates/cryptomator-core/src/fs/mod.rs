@@ -18,13 +18,13 @@ pub mod symlinks;
 
 // Re-exports of items that later tasks create; activated by the task that adds them.
 pub use attrs::FileAttributes;
-// pub use capabilities::determine_supported_cleartext_file_name_length;
+pub use capabilities::determine_supported_cleartext_file_name_length;
 pub use ciphertext_path::{CiphertextDirectory, CiphertextFilePath, CiphertextFileType};
 pub use crypto_fs::{CryptoFs, CryptoFsOptions, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH};
 pub use dir_id::DirIdLoader;
 pub use dir_stream::DirEntry;
 pub use events::{discard_events, EventCollector, EventSink, FilesystemEvent};
-// pub use name_decryptor::decrypt_filename;
+pub use name_decryptor::decrypt_filename;
 pub use open_file::{OpenCryptoFile, OpenOptions};
 pub use open_files::{FileHandle, OpenCryptoFiles, RngFactory, TwoPhaseMove};
 pub use path::{child_display, CleartextPath};

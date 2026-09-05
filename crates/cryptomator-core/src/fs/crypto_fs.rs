@@ -144,7 +144,7 @@ impl CryptoFs {
     pub fn mapper(&self) -> &CryptoPathMapper {
         &self.mapper
     }
-    // consumed by the mutating operations added in the next task
+    // only tests use this so far; task 13 adds the public `cryptor_ref` accessor
     #[allow(dead_code)]
     pub(crate) fn cryptor(&self) -> &Arc<Cryptor> {
         &self.cryptor
