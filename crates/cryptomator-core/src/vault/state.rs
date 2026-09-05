@@ -163,11 +163,6 @@ pub fn determine_vault_state(path_to_vault: &Path) -> Result<VaultState> {
     if matches!(structure, VaultState::Locked | VaultState::NeedsMigration) {
         return Ok(structure);
     }
-    // Without `d/` the directory is unrelated to any vault: there is nothing whose key files
-    // could have gone missing, so no backup is looked for (`DirStructure::Unrelated` -> `MISSING`).
-    if !path_to_vault.join(DATA_DIR_NAME).is_dir() {
-        return Ok(VaultState::Missing);
-    }
     let config_path = path_to_vault.join(VAULTCONFIG_FILENAME);
     let masterkey_path = path_to_vault.join(MASTERKEY_FILENAME);
     if !config_path.exists() {
@@ -225,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_directory_is_unrelated_and_missing() {
+    fn empty_directory_is_unrelated_and_all_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             check_dir_structure(dir.path()).unwrap(),
@@ -233,7 +228,7 @@ mod tests {
         );
         assert_eq!(
             determine_vault_state(dir.path()).unwrap(),
-            VaultState::Missing
+            VaultState::AllMissing
         );
         let err = assert_is_vault_directory(dir.path()).unwrap_err();
         assert!(matches!(
