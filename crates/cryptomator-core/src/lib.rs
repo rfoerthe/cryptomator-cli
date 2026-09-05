@@ -25,8 +25,16 @@ pub use crypto::siv::FileNameCryptor;
 pub use crypto::stream::{decrypt_all, encrypt_all, DecryptingReader, EncryptingWriter};
 pub use error::{CoreError, NotAVaultReason, Result};
 pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
+pub use vault::init::{
+    create_vault, initialize, write_root_file, CreateVaultOptions, DEFAULT_SHORTENING_THRESHOLD,
+    MAX_SHORTENING_THRESHOLD, MIN_SHORTENING_THRESHOLD,
+};
 pub use vault::open::{
     open_vault, open_vault_with_key, read_vault_config, root_content_dir, OpenedVault,
+};
+pub use vault::readme::{
+    access_location_readme_rtf, storage_location_readme_rtf, ACCESS_LOCATION_README_FILE_NAME,
+    STORAGE_LOCATION_README_FILE_NAME,
 };
 pub use vault::state::{
     assert_is_vault_directory, check_dir_structure, determine_vault_state, determine_vault_version,
