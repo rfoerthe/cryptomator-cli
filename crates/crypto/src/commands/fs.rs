@@ -17,7 +17,7 @@ use data_encoding::HEXLOWER;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Events are warnings on stderr (never on stdout, which carries data for `cat`/`get -`).
@@ -35,7 +35,7 @@ fn io_detail(err: io::Error) -> io::Error {
         io::ErrorKind::IsADirectory => "is a directory",
         io::ErrorKind::NotADirectory => "not a directory",
         io::ErrorKind::DirectoryNotEmpty => "directory not empty",
-        io::ErrorKind::ReadOnlyFilesystem => "vault is opened read-only",
+        io::ErrorKind::ReadOnlyFilesystem => "read-only file system",
         _ => return err,
     };
     io::Error::new(err.kind(), phrase)
@@ -217,7 +217,7 @@ impl Write for HashWriter {
 
 /// Depth-first, sorted like the Java fixture generator (by cleartext path).
 fn walk(fs: &CryptoFs, dir: &CleartextPath, hash: bool, out: &mut Vec<Value>) -> Result<()> {
-    for row in children(fs, dir)? {
+    for row in children(fs, dir).with_context(|| format!("cannot list {dir}"))? {
         let path = row.path;
         let mut value = json!({ "path": path.to_string(), "type": row.attrs.file_type.as_str() });
         if let Some(target) = row.target {
@@ -268,6 +268,42 @@ fn cat(ctx: &Ctx, args: FsPathArgs) -> Result<u8> {
     Ok(exit::OK)
 }
 
+/// A sibling of `local` (same directory, hence the same filesystem, so the final rename is atomic);
+/// the pid keeps concurrent `get`s of the same destination apart.
+fn temp_path(local: &Path) -> PathBuf {
+    let mut name = local.as_os_str().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Streams `path` into a fresh temp file and renames it over `local`, so a failure mid-stream
+/// leaves neither a partial nor a truncated destination. The temp file is removed on failure.
+fn stream_to_local(fs: &CryptoFs, path: &CleartextPath, local: &Path) -> Result<u64> {
+    let temp = temp_path(local);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(io_detail)
+        .with_context(|| format!("cannot create {}", temp.display()))?;
+    let copied = fs
+        .copy_to_writer(path, &mut file)
+        .map_err(io_detail)
+        .with_context(|| format!("cannot read {path}"));
+    // Closed before the rename: Windows is unhappy about renaming a file that is still open.
+    drop(file);
+    let result = copied.and_then(|bytes| {
+        std::fs::rename(&temp, local)
+            .map_err(io_detail)
+            .with_context(|| format!("cannot create {}", local.display()))?;
+        Ok(bytes)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 fn get(ctx: &Ctx, args: FsGetArgs) -> Result<u8> {
     let fs = open_fs(ctx, &args.vault, &args.password, false)?;
     let path = CleartextPath::parse(&args.path);
@@ -279,20 +315,32 @@ fn get(ctx: &Ctx, args: FsGetArgs) -> Result<u8> {
             .with_context(|| format!("cannot read {path}"))?;
         return Ok(exit::OK);
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .create_new(!args.force)
-        .truncate(true)
-        .open(&args.local)
-        .map_err(io_detail)
-        .with_context(|| format!("cannot create {}", args.local.display()))?;
-    let bytes = fs
-        .copy_to_writer(&path, &mut file)
+    // The source is checked before the destination is touched at all: a missing vault file or a
+    // directory must leave an existing local file (`--force`) and its content alone.
+    let attrs = fs
+        .metadata(&path)
         .map_err(io_detail)
         .with_context(|| format!("cannot read {path}"))?;
+    if !attrs.is_file() {
+        let kind = if attrs.is_dir() {
+            io::ErrorKind::IsADirectory
+        } else {
+            io::ErrorKind::InvalidInput
+        };
+        return Err(io_detail(io::Error::new(kind, "not a regular file")))
+            .with_context(|| format!("cannot read {path}"));
+    }
+    if !args.force && args.local.symlink_metadata().is_ok() {
+        return Err(io_detail(io::Error::from(io::ErrorKind::AlreadyExists)))
+            .with_context(|| format!("cannot create {}", args.local.display()));
+    }
+    let bytes = stream_to_local(&fs, &path, &args.local)?;
     ctx.out.emit(
-        json!({ "path": path.to_string(), "local": args.local, "bytes": bytes }),
+        json!({
+            "path": path.to_string(),
+            "local": args.local.display().to_string(),
+            "bytes": bytes,
+        }),
         || format!("{path} -> {} ({bytes} bytes)", args.local.display()),
     )?;
     Ok(exit::OK)

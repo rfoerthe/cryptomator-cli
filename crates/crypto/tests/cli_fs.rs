@@ -103,6 +103,32 @@ fn ls_cat_and_get() {
         .assert()
         .success()
         .stdout("Hello, Cryptomator!\n");
+    // a failed vault-side read never touches the destination: --force keeps the old content …
+    let keep = sb.path("keepme.txt");
+    std::fs::write(&keep, "precious\n").unwrap();
+    sb.crypto(&["fs", "get", "siv_gcm_basic", "/does-not-exist", "--force"])
+        .arg(&keep)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no such file"));
+    assert_eq!(std::fs::read_to_string(&keep).unwrap(), "precious\n");
+    // … and a directory source leaves no local file (not even an empty or temporary one) behind
+    let dir_out = sb.path("dir-out.txt");
+    sb.crypto(&["fs", "get", "siv_gcm_basic", "/docs"])
+        .arg(&dir_out)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("is a directory"));
+    assert!(!dir_out.exists());
+    let leftovers: Vec<String> = std::fs::read_dir(sb.root())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
     // symlink listing shows the target; ls of the link itself follows it
     sb.add_fixture("symlinks");
     sb.crypto(&["fs", "ls", "symlinks", "-l"])
