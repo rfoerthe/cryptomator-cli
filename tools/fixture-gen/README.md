@@ -14,6 +14,9 @@ trace and exits `3`:
     mvn -q -f tools/fixture-gen/pom.xml compile exec:exec \
         -Dfixture.cmd=verify -Dfixture.arg1=/path/to/vault -Dfixture.arg2=<passphrase>
 
+The passphrase in `-Dfixture.arg2` is visible in the process list of every user on the machine, so
+this harness is for test vaults only — never pass a real vault's passphrase to it.
+
 The cipher combo and the shortening threshold are read from the vault's own `vault.cryptomator`, so
 the same call verifies `SIV_GCM` and `SIV_CTRMAC` vaults. `crates/crypto/tests/java_interop.rs`
 drives this mode (`cargo test -p crypto --test java_interop -- --ignored`).

@@ -34,7 +34,9 @@ fn verify_with_java(vault: &Path, passphrase: &str) -> serde_json::Value {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json_line = stdout
         .lines()
-        .find(|l| l.starts_with('['))
+        // Not `starts_with('[')`: Maven prints `[WARNING] ...` on stdout, and picking such a line
+        // up would fail as a JSON parse panic instead of a legible assertion.
+        .find(|l| l.starts_with("[{") || l.trim() == "[]")
         .expect("manifest JSON on stdout");
     serde_json::from_str(json_line).unwrap()
 }
@@ -48,6 +50,8 @@ fn java_opens_vaults_created_by_crypto() {
         Command::cargo_bin("crypto")
             .unwrap()
             .env("CRYPTO_PASSWORD", "interop-passphrase")
+            .env_remove("CRYPTO_MIN_PW_LENGTH")
+            .env_remove("CRYPTO_SETTINGS_PATH")
             .arg("--settings")
             .arg(dir.path().join("settings.json"))
             .args([

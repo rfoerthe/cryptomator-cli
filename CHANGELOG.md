@@ -33,14 +33,16 @@
 ### M2 – Vault metadata
 
 - `settings.json` model and store shared with the desktop app: all fields the app uses plus unknown
-  keys preserved, Java defaults, legacy key migration, atomic save (`.tmp` + rename) with a lock file,
+  keys preserved, Java defaults, legacy key migration, atomic save (a `create_new`, pid-suffixed
+  `settings.json.<pid>.tmp` + rename, so it never collides with the desktop app's `settings.json.tmp`),
   paths for macOS/Linux and the `--settings` / `$CRYPTO_SETTINGS_PATH` overrides.
 - Vault references: resolution by id, display name or path; generated ids (base64url of 9 random
   bytes) and `normalize_display_name` following the app's mount-name rules.
 - Vault state detection (`LOCKED`, `MISSING`, `VAULT_CONFIG_MISSING`, `ALL_MISSING`, `NEEDS_MIGRATION`) including the automatic
   `masterkey.cryptomator.bkup` restore of `BackupRestorer`.
-- `crypto vault create` (config, root dir, `dirid.c9r`, `WELCOME.rtf` inside and `IMPORTANT.rtf`
-  outside the vault), `vault add`, `vault remove`, `vault list`, `vault info`, `vault set`.
+- `crypto vault create` (config, root dir, `dirid.c9r`, `WELCOME.rtf` inside the encrypted content
+  and `IMPORTANT.rtf` in the vault directory next to `vault.cryptomator`), `vault add`,
+  `vault remove`, `vault list`, `vault info`, `vault set`.
 - `crypto config get|set` for the global settings (`mountService`, `port`, `useKeychain`,
   `keychainProvider`, `debugMode`).
 - `crypto password change` (with `.bkup` of the old masterkey file) and `crypto recovery-key show` /

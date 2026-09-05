@@ -61,11 +61,14 @@ command line:
 Without a usable source the command fails with a usage error instead of hanging. Passwords are NFC
 normalised like the desktop app and never appear in error messages or logs.
 
-New passwords (`vault create`, `password change`, `recovery-key reset-password`) use the same order
-via `--new-password-stdin` / `--new-password-file` / `--new-password-env`, must be at least 8
-characters long (override with `$CRYPTO_MIN_PW_LENGTH`) and are asked twice at the prompt.
-`password change` deliberately does **not** fall back to `$CRYPTO_PASSWORD` for the *new* password:
-that variable holds the current one, and silently reusing it would keep the old password.
+New passwords must be at least 8 characters long (override with `$CRYPTO_MIN_PW_LENGTH`) and are
+asked twice when they are typed at the prompt. `vault create` reads the new passphrase through the
+plain `--password-stdin` / `--password-file` / `--password-env` flags and the `$CRYPTO_PASSWORD`
+fallback listed above, because there is no old password to keep apart from it. `password change` and
+`recovery-key reset-password` take the *new* passphrase from `--new-password-stdin` /
+`--new-password-file` / `--new-password-env` instead, in the same order. `password change`
+deliberately does **not** fall back to `$CRYPTO_PASSWORD` for the *new* password: that variable holds
+the current one, and silently reusing it would keep the old password.
 
 ## Settings file
 
@@ -76,7 +79,7 @@ that variable holds the current one, and silently reusing it would keep the old 
 
 `--settings <PATH>` overrides the location for a single run, `$CRYPTO_SETTINGS_PATH` for the whole
 environment (a `:`-separated list like Java's `-Dcryptomator.settingsPath`; the first entry is the
-file that gets written). Saving is atomic (`settings.json.tmp` + rename) and keeps unknown fields, so
+file that gets written). Saving is atomic (`settings.json.<pid>.tmp` + rename) and keeps unknown fields, so
 a file written by the desktop app survives a round trip.
 
 Because the file is shared, **close the desktop app before `crypto vault add` or `crypto vault
