@@ -34,6 +34,13 @@ pub struct BackupOutcome {
 
 /// Best-effort backup like Java: `CREATE_NEW`; if the backup exists (or is not writable) compare contents;
 /// other I/O failures while writing are reported as `Failed` rather than propagated.
+///
+/// The original file is copied, never moved or removed.
+///
+/// The name of the backup encodes the digest of the *intended* content, but the file is created before it
+/// is written: a crash or a short write in between leaves a `.bkup` whose content does not hash to the
+/// suffix in its own name (reported here as [`BackupStatus::Failed`], but a later run only sees the file).
+/// Restore code must therefore re-hash the backup's bytes and must not trust the name as an integrity check.
 pub fn attempt_backup(path: &Path) -> Result<BackupOutcome> {
     let file_bytes = std::fs::read(path)?;
     let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
