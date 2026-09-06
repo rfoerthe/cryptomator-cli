@@ -53,7 +53,7 @@ per connection and chosen by the client (`DaemonClient` counts up from 1).
 | `status` | — | [`StatusResult`](#status) |
 | `stats` | — | [`StatsResult`](#stats) |
 | `lock` | `force` | `null` |
-| `events` | `follow`, `since` | [`EventsResult`](#events), or a stream |
+| `events` | `follow`, `since` | [`EventsResult`](#eventsresult), or a stream |
 | `ping` | — | `null` |
 | `shutdown` | — | `null` |
 
@@ -102,7 +102,7 @@ so the client sees a result rather than a closed socket. A `lock` whose unmount 
 
 ### `events`
 
-Without `follow`, one batch and one response (see [`EventsResult`](#events)). With `follow`, the
+Without `follow`, one batch and one response (see [`EventsResult`](#eventsresult)). With `follow`, the
 daemon keeps the connection open and writes **stream items** until the client stops reading:
 
 ```json
@@ -168,7 +168,7 @@ instead and reports `UNLOCKED`, `STALE_MOUNT` or one of the on-disk vault states
 The per-second values are the deltas of the last sampling interval (one second); the totals are
 read at request time.
 
-### `events`
+### EventsResult
 
 ```json
 {"events":[{"seq":1,"timestamp":1788722000,"kind":"CONFLICT_RESOLVED","message":"…","cleartextPath":"/a (1).txt","ciphertextPath":null}],"nextSeq":1}

@@ -82,9 +82,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// is over on the first look.
 const MOUNT_VISIBLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often [`MOUNT_VISIBLE_TIMEOUT`] is checked. Shorter than [`POLL_INTERVAL`] because this is
-/// latency a user waits through on every unlock, and the check is a mount-table read.
-const MOUNT_VISIBLE_POLL: Duration = Duration::from_millis(50);
+/// How long [`MOUNT_VISIBLE_POLL_FAST`] is used before backing off to [`MOUNT_VISIBLE_POLL_SLOW`].
+const MOUNT_VISIBLE_POLL_FAST_FOR: Duration = Duration::from_secs(1);
+
+/// The poll interval for the first [`MOUNT_VISIBLE_POLL_FAST_FOR`] of the wait. Shorter than
+/// [`POLL_INTERVAL`] because this is latency a user waits through on every unlock, and the happy
+/// path is 1-5 looks.
+const MOUNT_VISIBLE_POLL_FAST: Duration = Duration::from_millis(50);
+
+/// The poll interval after [`MOUNT_VISIBLE_POLL_FAST_FOR`] has passed. Each look forks
+/// `/sbin/mount` on macOS, so a volume that never appears backs off instead of costing ~200
+/// processes over the full [`MOUNT_VISIBLE_TIMEOUT`].
+const MOUNT_VISIBLE_POLL_SLOW: Duration = Duration::from_millis(250);
+
+/// How long the wait must have run before it fires `--foreground`'s `notice` callback once, so a
+/// user watching the terminal is not left staring at silence.
+const MOUNT_VISIBLE_NOTICE_AFTER: Duration = Duration::from_secs(1);
 
 /// How many events the daemon keeps for `crypto events`.
 const EVENT_BUFFER_CAPACITY: usize = 1000;
@@ -619,11 +632,20 @@ fn unlock(
     // path can be looked up in the mount table, and only a service whose volumes appear there at
     // all is worth waiting for (the null mounter's never do).
     if let (true, Mountpoint::Path(path)) = (handle.appears_in_mount_table, handle.mountpoint()) {
-        if !wait_until_visible(
-            || cryptomator_mount::mounttab::is_mountpoint(&path),
+        let notice = shared.config.notice.as_deref();
+        let visible = wait_until_visible(
+            || cryptomator_mount::mounttab::lookup(&path),
+            || shared.stop_requested(),
             MOUNT_VISIBLE_TIMEOUT,
-            MOUNT_VISIBLE_POLL,
-        ) {
+            || {
+                if let Some(notice) = notice {
+                    notice(&format!(
+                        "waiting for the volume to appear at {mountpoint} …"
+                    ));
+                }
+            },
+        );
+        if !visible {
             let message = format!(
                 "the volume did not become visible at {mountpoint} within {} s",
                 MOUNT_VISIBLE_TIMEOUT.as_secs()
@@ -666,21 +688,62 @@ fn unlock(
     Ok(mountpoint)
 }
 
-/// Polls `check` every `poll` until it holds; `false` if it still does not after `timeout`.
+/// Polls `check` until it says the volume is visible, `stop` says the daemon should give up
+/// waiting, or `timeout` passes -- whichever comes first. `false` in the latter two cases.
 ///
 /// A pure helper so the wait itself is testable without a mount table: the daemon passes
-/// [`cryptomator_mount::mounttab::is_mountpoint`]. `check` is called once before the first sleep,
-/// so a volume that is already up costs no delay at all.
-fn wait_until_visible(mut check: impl FnMut() -> bool, timeout: Duration, poll: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// [`cryptomator_mount::mounttab::lookup`]. `check` is called once before the first sleep, so a
+/// volume that is already up costs no delay at all.
+///
+/// `check`'s `Err` ends the wait as a **success** (logged once as a warning): an unreadable mount
+/// table (a `/sbin/mount` that will not run, a missing `/proc/self/mountinfo`) makes "not yet
+/// visible" and "will never say yes" indistinguishable, and failing a mount that is probably fine
+/// is worse than answering the unlock without having confirmed it.
+///
+/// `stop` is checked once per look, right after `check` -- so a shutdown request during the wait
+/// (`unlock` holds the operation lock the whole time, which `shutdown_sequence` needs) ends it
+/// within one poll instead of after the full [`MOUNT_VISIBLE_TIMEOUT`].
+///
+/// The first [`MOUNT_VISIBLE_POLL_FAST_FOR`] is polled every [`MOUNT_VISIBLE_POLL_FAST`], since
+/// the happy path is 1-5 looks; after that every [`MOUNT_VISIBLE_POLL_SLOW`], since each look
+/// forks a process on macOS. `on_slow` is called at most once, the first time the wait has run
+/// longer than [`MOUNT_VISIBLE_NOTICE_AFTER`] -- the daemon uses it to fire `--foreground`'s
+/// `notice` callback.
+fn wait_until_visible(
+    mut check: impl FnMut() -> io::Result<bool>,
+    stop: impl Fn() -> bool,
+    timeout: Duration,
+    mut on_slow: impl FnMut(),
+) -> bool {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut notified = false;
     loop {
-        if check() {
-            return true;
+        match check() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("cannot read the mount table; assuming the volume is visible: {error}");
+                return true;
+            }
+        }
+        if stop() {
+            return false;
+        }
+        let elapsed = start.elapsed();
+        if !notified && elapsed > MOUNT_VISIBLE_NOTICE_AFTER {
+            notified = true;
+            on_slow();
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
         }
+        let poll = if elapsed < MOUNT_VISIBLE_POLL_FAST_FOR {
+            MOUNT_VISIBLE_POLL_FAST
+        } else {
+            MOUNT_VISIBLE_POLL_SLOW
+        };
         std::thread::sleep(remaining.min(poll));
     }
 }
@@ -2141,10 +2204,11 @@ mod tests {
         let visible = wait_until_visible(
             || {
                 looks += 1;
-                looks == 3
+                Ok(looks == 3)
             },
+            || false,
             Duration::from_secs(30),
-            Duration::from_millis(1),
+            || {},
         );
         assert!(visible, "the third look finds the volume");
         assert_eq!(looks, 3, "and nothing is checked after that");
@@ -2158,10 +2222,11 @@ mod tests {
         let visible = wait_until_visible(
             || {
                 looks += 1;
-                false
+                Ok(false)
             },
+            || false,
             timeout,
-            Duration::from_millis(20),
+            || {},
         );
         let elapsed = started.elapsed();
         assert!(!visible, "a volume that never appears is a failure");
@@ -2172,6 +2237,94 @@ mod tests {
         assert!(
             looks > 1,
             "and it is polled, not slept through: {looks} looks"
+        );
+    }
+
+    #[test]
+    fn the_visibility_wait_stops_early_when_asked_to() {
+        // `unlock` holds the operation lock for the whole wait, which `shutdown_sequence` needs
+        // to take a volume down on SIGINT/SIGTERM -- so a stop request must end the wait right
+        // away instead of after the full `MOUNT_VISIBLE_TIMEOUT`.
+        let mut looks = 0;
+        let visible = wait_until_visible(
+            || {
+                looks += 1;
+                Ok(false)
+            },
+            || true,
+            Duration::from_secs(30),
+            || {},
+        );
+        assert!(
+            !visible,
+            "a stop request is treated as failure, like a timeout"
+        );
+        assert_eq!(
+            looks, 1,
+            "it gives up after the very first look, within one poll"
+        );
+    }
+
+    #[test]
+    fn the_visibility_wait_notices_once_past_one_second() {
+        let notices = std::cell::RefCell::new(0);
+        let visible = wait_until_visible(
+            || Ok(false),
+            || false,
+            Duration::from_millis(1200),
+            || *notices.borrow_mut() += 1,
+        );
+        assert!(!visible, "the volume never appears, so this times out");
+        assert_eq!(
+            *notices.borrow(),
+            1,
+            "the notice fires exactly once, once the wait has lasted past the first second"
+        );
+    }
+
+    #[test]
+    fn the_visibility_wait_backs_off_after_the_first_second() {
+        let mut looks = 0;
+        let visible = wait_until_visible(
+            || {
+                looks += 1;
+                Ok(false)
+            },
+            || false,
+            Duration::from_secs(2),
+            || {},
+        );
+        assert!(!visible, "the volume never appears");
+        // ~1s of 50ms looks (20) plus ~1s of 250ms looks (4), plus the very first look before any
+        // sleep -- a range wide enough for scheduling jitter without pinning an exact count.
+        assert!(
+            (18..=30).contains(&looks),
+            "expected roughly 20 fast + 4 slow polls, got {looks}"
+        );
+    }
+
+    #[test]
+    fn the_visibility_wait_treats_an_unreadable_mount_table_as_visible() {
+        // An unreadable mount table (`/sbin/mount` refusing to run, a missing
+        // `/proc/self/mountinfo`) cannot tell "not yet visible" from "never will be", so this must
+        // not fail a mount that is probably fine.
+        let mut looks = 0;
+        let visible = wait_until_visible(
+            || {
+                looks += 1;
+                Err(io::Error::other("mount table unreadable"))
+            },
+            || false,
+            Duration::from_secs(30),
+            || {},
+        );
+        assert!(
+            visible,
+            "an unreadable mount table is treated as the volume being visible"
+        );
+        assert_eq!(
+            looks, 1,
+            "it gives up on the very first look, not the full timeout"
         );
     }
 

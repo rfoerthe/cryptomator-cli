@@ -2,29 +2,44 @@
 //!
 //! Used to tell a live mount from a stale one: after a crash the CLI's state directory may still
 //! claim a mount point that the kernel no longer knows about.
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Every path the system currently reports as a mount point.
 ///
 /// Reads `/proc/self/mountinfo` on Linux and runs `mount` on macOS; on other targets the list is
 /// empty. An unreadable mount table yields an empty list rather than an error - callers only ask
-/// whether a specific path is mounted, and "unknown" is safest reported as "not mounted".
+/// whether a specific path is mounted, and "unknown" is safest reported as "not mounted". Callers
+/// that need to tell "not mounted" from "could not tell" want [`lookup`] instead.
 pub fn mounted_paths() -> Vec<PathBuf> {
-    platform_mounted_paths()
+    platform_mounted_paths().unwrap_or_else(|error| {
+        log::debug!("cannot read the mount table: {error}");
+        Vec::new()
+    })
 }
 
-/// Whether `path` is a mount point according to [`mounted_paths`].
+/// Whether `path` is a mount point, or [`Err`] when the mount table itself could not be read (a
+/// `/sbin/mount` that fails to run on macOS, an unreadable `/proc/self/mountinfo` on Linux) --
+/// distinct from a clean "no, it is not mounted", which [`is_mountpoint`] collapses this into for
+/// callers that only want a bool.
 ///
 /// Paths are compared canonicalised where possible; a path that cannot be canonicalised (a broken
 /// mount, for instance) is compared as given, since the mount table lists it literally.
-pub fn is_mountpoint(path: &Path) -> bool {
+pub fn lookup(path: &Path) -> io::Result<bool> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if target == Path::new("/") {
-        return true;
+        return Ok(true);
     }
-    mounted_paths().iter().any(|entry| {
+    let mounted = platform_mounted_paths()?;
+    Ok(mounted.iter().any(|entry| {
         entry == &target || std::fs::canonicalize(entry).is_ok_and(|canonical| canonical == target)
-    })
+    }))
+}
+
+/// Whether `path` is a mount point according to [`mounted_paths`]; an unreadable mount table
+/// (see [`lookup`]) is reported as "not mounted".
+pub fn is_mountpoint(path: &Path) -> bool {
+    lookup(path).unwrap_or(false)
 }
 
 /// Mount points from the contents of `/proc/self/mountinfo`: field 5 of each line, with
@@ -88,36 +103,25 @@ fn unescape_octal(field: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_mounted_paths() -> Vec<PathBuf> {
-    match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(mountinfo) => parse_mountinfo(&mountinfo),
-        Err(error) => {
-            log::debug!("cannot read /proc/self/mountinfo: {error}");
-            Vec::new()
-        }
-    }
+fn platform_mounted_paths() -> io::Result<Vec<PathBuf>> {
+    std::fs::read_to_string("/proc/self/mountinfo").map(|mountinfo| parse_mountinfo(&mountinfo))
 }
 
 #[cfg(target_os = "macos")]
-fn platform_mounted_paths() -> Vec<PathBuf> {
-    match std::process::Command::new("/sbin/mount").output() {
-        Ok(output) if output.status.success() => {
-            parse_macos_mount(&String::from_utf8_lossy(&output.stdout))
-        }
-        Ok(output) => {
-            log::debug!("mount(8) exited with {}", output.status);
-            Vec::new()
-        }
-        Err(error) => {
-            log::debug!("cannot run mount(8): {error}");
-            Vec::new()
-        }
+fn platform_mounted_paths() -> io::Result<Vec<PathBuf>> {
+    let output = std::process::Command::new("/sbin/mount").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "mount(8) exited with {}",
+            output.status
+        )));
     }
+    Ok(parse_macos_mount(&String::from_utf8_lossy(&output.stdout)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn platform_mounted_paths() -> Vec<PathBuf> {
-    Vec::new()
+fn platform_mounted_paths() -> io::Result<Vec<PathBuf>> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -163,5 +167,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(!is_mountpoint(dir.path()));
         assert!(mounted_paths().contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn lookup_of_root_is_ok_true() {
+        assert!(matches!(lookup(Path::new("/")), Ok(true)));
+    }
+
+    #[test]
+    fn lookup_of_a_nonexistent_path_is_ok_false() {
+        assert!(matches!(
+            lookup(Path::new("/definitely/not/mounted")),
+            Ok(false)
+        ));
     }
 }

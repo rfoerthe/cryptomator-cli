@@ -318,8 +318,10 @@
   failed copy; if it does, the refusal has to become a mount flag instead of a default.
 - **Coexistence with the Cryptomator desktop app** — unlocking in one and looking at the vault in the
   other — is a manual check nobody has run.
-- `crypto name …` and `crypto password change` still accept an *unlocked* vault. Neither corrupts
-  ciphertext, but both should refuse like the `fs` commands do; deferred to M5.
+- `crypto password change` and `crypto recovery-key show`/`reset-password` still accept an
+  *unlocked* vault: they resolve it through `locked_vault_path`, which only checks the on-disk
+  state. Neither corrupts ciphertext, but both should refuse like the `fs`/`name` commands do;
+  deferred to M5.
 - The daemon reads its socket through a `BufReader`, whose internal buffer keeps the base64 vault key
   of the `unlock` line until later traffic overwrites it. Every decoded copy is wiped; the buffer is
   an M5 follow-up.

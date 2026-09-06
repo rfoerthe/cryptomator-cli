@@ -969,9 +969,12 @@ const E2E_CONTENT: &str = "written the instant unlock returned\n";
 
 /// The alias of the first mount service that really mounts and works on this machine.
 ///
-/// `crypto mounters` without `--all` lists exactly the supported ones and leaves the null mounter
-/// out, so the first entry is the FUSE back end this platform has (FUSE-T or macFUSE on macOS,
-/// `fuse` on Linux) -- or none, and the test skips.
+/// `crypto mounters` without `--all` lists exactly the *supported* ones, but that includes the
+/// null mounter whenever `CRYPTO_ENABLE_NULL_MOUNTER=1` is set -- which the sandbox always sets
+/// (`common::Sandbox`), for the non-E2E tests in this file that mount nothing on purpose. So this
+/// filters the null mounter back out explicitly: without a real FUSE back end, every remaining
+/// entry is gone and the test skips instead of "mounting" the null service and then failing with
+/// a misleading assertion about the volume never appearing.
 fn supported_real_mounter(fixture: &Fixture) -> Option<String> {
     let out = fixture
         .crypto(&["--json", "mounters"])
@@ -980,11 +983,39 @@ fn supported_real_mounter(fixture: &Fixture) -> Option<String> {
         .get_output()
         .stdout
         .clone();
-    let services = json(&out);
-    services
-        .as_array()?
-        .iter()
-        .find_map(|service| service["alias"].as_str().map(str::to_owned))
+    first_non_null_alias(&json(&out))
+}
+
+/// The pure part of [`supported_real_mounter`]: the first `alias` in a `crypto mounters --json`
+/// array whose `className` is not the null mounter's. Split out so the null-mounter filter can be
+/// unit-tested without a daemon or a real mount service.
+fn first_non_null_alias(services: &Value) -> Option<String> {
+    services.as_array()?.iter().find_map(|service| {
+        if service["className"].as_str() == Some(NULL_MOUNTER) {
+            return None;
+        }
+        service["alias"].as_str().map(str::to_owned)
+    })
+}
+
+#[test]
+fn supported_real_mounter_skips_the_null_service() {
+    // Only the null mounter is present (as it is on a machine/CI runner with no FUSE back end,
+    // once `CRYPTO_ENABLE_NULL_MOUNTER=1` lists it): the filter must leave nothing, so the E2E
+    // test skips cleanly instead of "mounting" the null service.
+    let only_null = serde_json::json!([
+        { "className": NULL_MOUNTER, "alias": "null", "supported": true }
+    ]);
+    assert_eq!(first_non_null_alias(&only_null), None);
+}
+
+#[test]
+fn supported_real_mounter_prefers_a_real_service_over_the_null_one() {
+    let mixed = serde_json::json!([
+        { "className": NULL_MOUNTER, "alias": "null", "supported": true },
+        { "className": "org.cryptomator.cli.FuseTMountProvider", "alias": "fuse-t", "supported": true }
+    ]);
+    assert_eq!(first_non_null_alias(&mixed), Some("fuse-t".to_string()));
 }
 
 /// The bug this guards: `crypto unlock` used to answer as soon as the mount call had returned,
