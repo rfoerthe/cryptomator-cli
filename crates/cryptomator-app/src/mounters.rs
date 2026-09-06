@@ -18,6 +18,9 @@ pub const MOUNTER_ALIASES: &[(&str, &str)] = &[
         "webdav",
         "org.cryptomator.frontend.webdav.mount.FallbackMounter",
     ),
+    // The built-in null mounter; only usable with CRYPTO_ENABLE_NULL_MOUNTER=1 and only listed by
+    // `crypto mounters --all`.
+    ("null", "org.cryptomator.cli.NullMountProvider"),
 ];
 
 /// Alias (case-insensitive) or a fully qualified Java class name (must contain a dot).
@@ -70,6 +73,14 @@ mod tests {
         assert_eq!(
             resolve_mounter("webdav").unwrap(),
             "org.cryptomator.frontend.webdav.mount.FallbackMounter"
+        );
+        assert_eq!(
+            resolve_mounter("null").unwrap(),
+            "org.cryptomator.cli.NullMountProvider"
+        );
+        assert_eq!(
+            alias_for("org.cryptomator.cli.NullMountProvider"),
+            Some("null")
         );
         assert_eq!(
             resolve_mounter("org.example.Custom").unwrap(),

@@ -1,4 +1,5 @@
 //! Human vs. `--json` output.
+use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
@@ -14,9 +15,9 @@ impl Output {
         human: impl FnOnce() -> String,
     ) -> anyhow::Result<()> {
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            write_line(&serde_json::to_string_pretty(&value)?)?;
         } else {
-            Self::print_human(human);
+            Self::print_human(human)?;
         }
         Ok(())
     }
@@ -33,19 +34,39 @@ impl Output {
             let rendered = Zeroizing::new(serde_json::to_string_pretty(&value)?);
             // `serde_json::Value` cannot be wiped, so drop its copy of the secret right away.
             drop(value);
-            println!("{}", rendered.as_str());
+            write_line(rendered.as_str())?;
         } else {
-            Self::print_human(human);
+            Self::print_human(human)?;
         }
         Ok(())
     }
 
-    fn print_human(human: impl FnOnce() -> String) {
+    fn print_human(human: impl FnOnce() -> String) -> io::Result<()> {
         let text = human();
-        if !text.is_empty() {
-            println!("{text}");
+        if text.is_empty() {
+            return Ok(());
         }
+        write_line(&text)
     }
+}
+
+/// Writes one line to stdout, holding the lock for the whole line.
+///
+/// Unlike `println!` a closed pipe -- `crypto events v --follow | head -1` -- is an
+/// [`io::ErrorKind::BrokenPipe`] error here rather than a panic, so a command can end the way the
+/// reader that walked away expects: quietly, and successfully.
+pub fn write_line(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{text}")
+}
+
+/// Whether `err` is a reader that closed the pipe on us, wherever in an `anyhow` chain it sits.
+pub fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// Seconds since the Unix epoch; pre-epoch instants (a clock skew or a broken file system) count as 0.

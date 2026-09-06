@@ -1,13 +1,16 @@
-//! Spike A: mount a hello-world filesystem on macOS by dlopen-ing the vendor libfuse
+//! Spike A/C: mount a hello-world filesystem on macOS by dlopen-ing the vendor libfuse
 //! (macFUSE or FUSE-T), calling `fuse_mount_compat25` and handing the fd to fuser.
+//! For `fuse-t` the session runs with `KernelAbi::Linux` (see Spike C): FUSE-T decodes the Linux
+//! struct layouts, not the macFUSE ones. `macfuse` keeps `KernelAbi::Native`.
 //! Usage: cargo run -p cryptomator-mount --example spike_macos_dlopen -- <fuse-t|macfuse> <empty-mountpoint-dir>
 //! Unmount from another shell with `umount <mountpoint>`; the program then exits.
 
 #[cfg(all(target_os = "macos", feature = "fuse"))]
 mod spike {
     use fuser::{
-        Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner,
-        OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request, Session, SessionACL,
+        Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, KernelAbi,
+        LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyStatfs,
+        Request, Session, SessionACL,
     };
     use std::ffi::{c_char, c_int, CString, OsStr};
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -24,7 +27,7 @@ mod spike {
     const TTL: Duration = Duration::from_secs(1);
     const CONTENT: &[u8] = b"Hello from crypto spike A!\n";
 
-    fn attr(ino: u64, kind: FileType, size: u64, perm: u16) -> FileAttr {
+    fn attr(ino: u64, kind: FileType, size: u64, perm: u16, nlink: u32) -> FileAttr {
         FileAttr {
             ino: INodeNo(ino),
             size,
@@ -35,7 +38,7 @@ mod spike {
             crtime: UNIX_EPOCH,
             kind,
             perm,
-            nlink: 1,
+            nlink,
             uid: unsafe { libc_geteuid() },
             gid: unsafe { libc_getegid() },
             rdev: 0,
@@ -58,7 +61,7 @@ mod spike {
             if parent == INodeNo::ROOT && name == "hello.txt" {
                 reply.entry(
                     &TTL,
-                    &attr(2, FileType::RegularFile, CONTENT.len() as u64, 0o444),
+                    &attr(2, FileType::RegularFile, CONTENT.len() as u64, 0o444, 1),
                     Generation(0),
                 );
             } else {
@@ -68,10 +71,11 @@ mod spike {
 
         fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
             match u64::from(ino) {
-                1 => reply.attr(&TTL, &attr(1, FileType::Directory, 0, 0o755)),
+                // nlink 2 for the root directory: "." plus its entry in the parent.
+                1 => reply.attr(&TTL, &attr(1, FileType::Directory, 0, 0o755, 2)),
                 2 => reply.attr(
                     &TTL,
-                    &attr(2, FileType::RegularFile, CONTENT.len() as u64, 0o444),
+                    &attr(2, FileType::RegularFile, CONTENT.len() as u64, 0o444, 1),
                 ),
                 _ => reply.error(Errno::ENOENT),
             }
@@ -121,6 +125,12 @@ mod spike {
             }
             reply.ok();
         }
+
+        // FUSE-T sends STATFS before anything else; fuser's default reply advertises 0 blocks,
+        // which some clients treat as a broken filesystem.
+        fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+            reply.statfs(1_000_000, 500_000, 500_000, 1000, 500, 4096, 255, 4096);
+        }
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,12 +139,17 @@ mod spike {
             eprintln!("usage: spike_macos_dlopen <fuse-t|macfuse> <mountpoint>");
             std::process::exit(2);
         }
-        let (lib_path, extra_opts): (&str, &[&str]) = match args[1].as_str() {
+        let (lib_path, extra_opts, abi): (&str, &[&str], KernelAbi) = match args[1].as_str() {
             "fuse-t" => (
                 "/usr/local/lib/libfuse-t.dylib",
-                &["-o", "nonamedattr", "-o", "backend=smb"],
+                &["-o", "nonamedattr"],
+                KernelAbi::Linux,
             ),
-            "macfuse" => ("/usr/local/lib/libfuse.2.dylib", &["-o", "noappledouble"]),
+            "macfuse" => (
+                "/usr/local/lib/libfuse.2.dylib",
+                &["-o", "noappledouble"],
+                KernelAbi::Native,
+            ),
             other => {
                 eprintln!("unknown backend {other}");
                 std::process::exit(2);
@@ -178,7 +193,8 @@ mod spike {
         }
         // SAFETY: raw_fd is a freshly returned, owned file descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        let config = Config::default();
+        let mut config = Config::default();
+        config.abi = abi;
         let session = Session::from_fd(HelloFs, fd, SessionACL::Owner, config)?;
         println!(
             "mounted at {mountpoint}; in another shell run: cat {mountpoint}/hello.txt && umount {mountpoint}"

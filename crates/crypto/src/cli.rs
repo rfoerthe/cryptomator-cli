@@ -14,6 +14,13 @@ pub struct Cli {
     /// Path to settings.json (default: the Cryptomator desktop app's file, or $CRYPTO_SETTINGS_PATH)
     #[arg(long, global = true, value_name = "PATH")]
     pub settings: Option<PathBuf>,
+    /// Directory holding the socket, pid and run info of every unlocked vault (default:
+    /// $CRYPTO_STATE_DIR, else a platform default)
+    // No `env` attribute here: clap's own env handling turns an empty value into a hard error
+    // ("a value is required"), while `StateDir::from_env_or_default` (main.rs) deliberately reads
+    // the variable itself and treats an empty value as unset.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub state_dir: Option<PathBuf>,
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
@@ -39,7 +46,7 @@ pub enum Command {
         #[command(subcommand)]
         command: RecoveryKeyCommand,
     },
-    /// Global settings (settings.json)
+    /// Global settings (settings.json) and CLI settings (cli.json)
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -54,6 +61,132 @@ pub enum Command {
         #[command(subcommand)]
         command: NameCommand,
     },
+    /// Unlock and mount a vault in a background daemon
+    Unlock(UnlockArgs),
+    /// Unmount and lock vaults
+    Lock(LockArgs),
+    /// Show what is registered, what is unlocked and where
+    Status(StatusArgs),
+    /// Throughput and cache counters of an unlocked vault
+    Stats(StatsArgs),
+    /// The event log of an unlocked vault
+    Events(EventsArgs),
+    /// The mount services this build knows
+    Mounters(MountersArgs),
+    /// The vault daemon itself; started by `crypto unlock`, never by hand.
+    #[command(name = "__daemon", hide = true)]
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct UnlockArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Mounter alias (fuse-t, macfuse, fuse, null) or Java class name
+    #[arg(long, value_name = "MOUNTER")]
+    pub mounter: Option<String>,
+    /// Where to mount (default: the vault's mountPoint, else <mountPointsDir>/<name>)
+    #[arg(long, value_name = "PATH")]
+    pub mount_point: Option<PathBuf>,
+    /// Extra mount flag, e.g. --mount-option=-oallow_other (repeatable)
+    // Mount options start with a dash; without `allow_hyphen_values` clap would read them as
+    // options, and `require_equals` keeps a missing value from swallowing the next flag.
+    #[arg(
+        long,
+        value_name = "OPTION",
+        allow_hyphen_values = true,
+        require_equals = true
+    )]
+    pub mount_option: Vec<String>,
+    /// Mount read-only, whatever the vault's usesReadOnlyMode says
+    #[arg(long)]
+    pub read_only: bool,
+    /// Volume name shown by the operating system
+    #[arg(long, value_name = "NAME")]
+    pub volume_name: Option<String>,
+    /// Serve the vault in this process instead of a detached daemon (Ctrl-C locks it)
+    #[arg(long)]
+    pub foreground: bool,
+    /// Open the mount point in the file manager afterwards
+    #[arg(long)]
+    pub reveal: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+// The group carries `required(true)`: one of the two ways of naming what to lock has to be given,
+// and `--all` excludes an explicit list.
+#[derive(Args, Debug)]
+#[command(group = clap::ArgGroup::new("lock-targets").required(true).multiple(false))]
+pub struct LockArgs {
+    /// Vault ids, display names or paths
+    // No `allow_hyphen_values` here, unlike the single-vault commands: on a repeated positional it
+    // swallows every following flag, so `crypto lock v --force` would look for a vault called
+    // "--force". A vault id starting with `-` is reachable as `crypto lock -- -id`.
+    #[arg(group = "lock-targets")]
+    pub vaults: Vec<String>,
+    /// Lock every unlocked vault
+    #[arg(long, group = "lock-targets")]
+    pub all: bool,
+    /// Unmount even while the volume is in use
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Vault id, display name or path; without one, every registered vault
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatsArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Keep printing one sample per interval until Ctrl-C
+    #[arg(long)]
+    pub follow: bool,
+    /// Seconds between samples with --follow
+    #[arg(long, value_name = "SECS", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Keep printing events as they happen until Ctrl-C
+    #[arg(long)]
+    pub follow: bool,
+    /// Only events after this sequence number (the `seq` of the last one you saw)
+    #[arg(long, value_name = "SEQ", default_value_t = 0)]
+    pub since: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct MountersArgs {
+    /// Include the services that do not work on this machine
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonArgs {
+    /// The vault to serve, by its id in settings.json
+    #[arg(long, value_name = "ID", allow_hyphen_values = true)]
+    pub vault_id: String,
+    /// The control socket to bind. Informational: the state directory and the vault id decide,
+    /// and `crypto unlock` passes the path it expects so a mismatch shows up in the log.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -114,7 +247,7 @@ pub struct SetArgs {
     /// Use the mounter's default flags
     #[arg(long)]
     pub default_mount_flags: bool,
-    /// Mounter alias (fuse-t, macfuse, fuse, webdav), Java class name, or "default"
+    /// Mounter alias (fuse-t, macfuse, fuse, null, webdav), Java class name, or "default"
     #[arg(long, value_name = "MOUNTER")]
     pub mounter: Option<String>,
     /// TCP port for loopback mounters (WebDAV)
@@ -136,13 +269,19 @@ pub struct SetArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Print one or all global settings
+    /// Print one or all settings
     Get {
-        /// mountService | port | useKeychain | keychainProvider | debugMode
+        /// settings.json: mountService | port | useKeychain | keychainProvider | debugMode;
+        /// cli.json: mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs
         key: Option<String>,
     },
-    /// Change a global setting
-    Set { key: String, value: String },
+    /// Change a setting
+    // Values may start with a dash (a negative number is refused later, with a reason).
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
 }
 
 #[derive(Args, Debug)]

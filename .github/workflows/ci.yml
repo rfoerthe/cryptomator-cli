@@ -9,6 +9,11 @@ jobs:
       matrix:
         os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
+    env:
+      # The daemon tests (crates/crypto/tests/cli_daemon.rs) mount through the null mounter, which
+      # only exists when this is set. They set it per command in `Sandbox::crypto`, so this is a
+      # no-op today; it is here so that a test added without that helper still finds the mounter.
+      CRYPTO_ENABLE_NULL_MOUNTER: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,3 +36,36 @@ jobs:
           java-version: "21"
           cache: maven
       - run: cargo test -p crypto --test java_interop --locked -- --ignored
+
+  # The end-to-end tests that mount a real file system. They are `#[ignore]`d twice over: `cargo
+  # test` skips them, and even `--ignored` only mounts when `CRYPTO_E2E_MOUNT=1` says the machine
+  # may be mounted on. Without a working back end they print "skipped" and pass, so a green job is
+  # only meaningful together with the "service:" line in its log.
+  mount-e2e-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `fusermount3` is what the Linux provider probes for and what fuser calls to mount.
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored
+      # The same proof one level up: `crypto unlock` must not answer before the volume is visible.
+      - run: CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored
+
+  # macOS has no FUSE back end out of the box. FUSE-T is installed from its cask; it needs no kext
+  # and no system-extension approval, but the cask ships a system daemon whose installation can
+  # still fail or need a prompt on a hosted runner. So this job may not mount, and a red mount is
+  # not a red build: `continue-on-error` keeps it advisory until the runner image is known good.
+  mount-e2e-macos:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install --cask macos-fuse-t/homebrew-cask/fuse-t
+      - run: CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored
+      # The same proof one level up, and the one that matters most on FUSE-T: `crypto unlock` must
+      # not answer before the volume is visible.
+      - run: CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored

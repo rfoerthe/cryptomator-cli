@@ -5,6 +5,8 @@ members = [
     "crates/cryptomator-app",
     "crates/cryptomator-mount",
     "crates/crypto",
+    # Vendored fork; see vendor/fuser/README-VENDORED.md.
+    "vendor/fuser",
 ]
 
 [workspace.package]
@@ -12,7 +14,9 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/rfoerthe/cryptomator-cli"
-rust-version = "1.85"
+# 1.89 because `aes 0.9.3` (and `libloading 0.9`, 1.88) need it; the workspace's own code is
+# 1.85-clean, but the lock file is what has to build.
+rust-version = "1.89"
 
 [workspace.dependencies]
 aes-siv = "0.8"
@@ -43,6 +47,15 @@ rpassword = "7.5"
 unicode-normalization = "0.1"
 regex = "1"
 proptest = "1"
+nix = { version = "0.31", features = ["process", "signal", "user", "fs"] }
+libc = "0.2"
+signal-hook = "0.3"
+log = "0.4"
+
+# fuser is vendored under vendor/fuser: FUSE-T on macOS speaks the Linux struct layouts while
+# upstream fuser hard-codes the macFUSE ones. See vendor/fuser/README-VENDORED.md.
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
 
 [profile.release]
 lto = "fat"

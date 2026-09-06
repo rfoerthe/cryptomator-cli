@@ -14,4 +14,15 @@ fuse = ["dep:fuser", "dep:libloading"]
 [dependencies]
 cryptomator-core = { path = "../cryptomator-core" }
 fuser = { workspace = true, optional = true }
+libc = { workspace = true }
 libloading = { workspace = true, optional = true }
+log = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+cryptomator-core = { path = "../cryptomator-core", features = ["det-rng"] }
+tempfile = { workspace = true }

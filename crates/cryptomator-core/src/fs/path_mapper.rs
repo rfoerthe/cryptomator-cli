@@ -2,14 +2,15 @@
 use super::ciphertext_path::{CiphertextDirectory, CiphertextFilePath, CiphertextFileType};
 use super::dir_id::DirIdLoader;
 use super::events::{EventSink, FilesystemEvent};
+use super::expiring::ExpiringMap;
 use super::long_names::deflate;
 use super::path::CleartextPath;
 use crate::constants::{CRYPTOMATOR_FILE_SUFFIX, DATA_DIR_NAME, ROOT_DIR_ID};
 use crate::Cryptor;
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub struct CryptoPathMapper {
     data_root: PathBuf,
@@ -17,8 +18,9 @@ pub struct CryptoPathMapper {
     pub(crate) dir_ids: Arc<DirIdLoader>,
     shortening_threshold: usize,
     events: EventSink,
-    /// `CiphertextDirCache` (without the 20 s expiry: the CLI process is short-lived; M4 adds it).
-    dir_cache: Mutex<HashMap<CleartextPath, CiphertextDirectory>>,
+    /// `CiphertextDirCache`: mapping plus the time it was loaded, expiring after
+    /// [`DIR_CACHE_TTL`](super::DIR_CACHE_TTL).
+    dir_cache: Mutex<ExpiringMap<CleartextPath, CiphertextDirectory>>,
     root: CiphertextDirectory,
 }
 
@@ -46,7 +48,7 @@ impl CryptoPathMapper {
             dir_ids,
             shortening_threshold: shortening_threshold as usize,
             events,
-            dir_cache: Mutex::new(HashMap::new()),
+            dir_cache: Mutex::new(ExpiringMap::new()),
             root,
         }
     }
@@ -161,16 +163,21 @@ impl CryptoPathMapper {
         super::lock(&self.dir_cache).retain(|key, _| !key.starts_with(cleartext));
     }
 
-    /// Re-keys every mapping below `src` to live below `dst`.
+    /// Re-keys every mapping below `src` to live below `dst`. The moved entries keep their load
+    /// time, so a rename cannot extend an entry's life beyond the 20 seconds it started with.
     pub fn move_path_mapping(&self, src: &CleartextPath, dst: &CleartextPath) {
         let mut cache = super::lock(&self.dir_cache);
-        let moved: Vec<(CleartextPath, CiphertextDirectory)> = cache
+        let moved: Vec<(CleartextPath, Instant, CiphertextDirectory)> = cache
             .iter()
-            .filter(|(key, _)| key.starts_with(src))
-            .filter_map(|(key, dir)| key.rebase(src, dst).map(|k| (k, dir.clone())))
+            .filter(|(key, _, _)| key.starts_with(src))
+            .filter_map(|(key, loaded, dir)| {
+                key.rebase(src, dst).map(|k| (k, *loaded, dir.clone()))
+            })
             .collect();
         cache.retain(|key, _| !key.starts_with(src));
-        cache.extend(moved);
+        for (key, loaded, dir) in moved {
+            cache.insert(key, dir, loaded);
+        }
     }
 
     /// The content directory of a cleartext directory (root without I/O; others via `dir.c9r`).
@@ -184,9 +191,12 @@ impl CryptoPathMapper {
         // not holding the lock: the lookup recurses into the parent directory
         let dir_file = self.ciphertext_file_path(cleartext)?.dir_file_path();
         let dir = self.resolve_directory(&dir_file)?;
-        super::lock(&self.dir_cache)
-            .entry(cleartext.clone())
-            .or_insert_with(|| dir.clone());
+        let mut cache = super::lock(&self.dir_cache);
+        let now = cache.now();
+        // Overwrites a concurrently inserted entry instead of cryptofs' `putIfAbsent`: both were
+        // read from the same `dir.c9r`, and this one is the younger of the two. Pruning of
+        // whatever else expired is amortised inside `insert` (finding I1), not done here.
+        cache.insert(cleartext.clone(), dir.clone(), now);
         Ok(dir)
     }
 
@@ -198,13 +208,22 @@ impl CryptoPathMapper {
     pub fn resolve_directory_id(&self, dir_id: &str) -> CiphertextDirectory {
         Self::directory_for_id(&self.data_root, &self.cryptor, dir_id)
     }
+
+    /// Ages every cached mapping by `d` (the directory ids have their own clock).
+    #[cfg(test)]
+    pub(crate) fn advance(&self, d: std::time::Duration) {
+        super::lock(&self.dir_cache).advance(d);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constants::ROOT_DIR_ID;
-    use crate::fs::{discard_events, testutil::new_vault, CiphertextFileType, CleartextPath};
+    use crate::fs::{
+        discard_events, testutil::new_vault, CiphertextFileType, CleartextPath, DIR_CACHE_TTL,
+    };
+    use std::time::Duration;
 
     fn mapper(threshold: u32) -> (tempfile::TempDir, CryptoPathMapper) {
         let (dir, cryptor, config) = new_vault(threshold);
@@ -346,5 +365,50 @@ mod tests {
         // the dir id loader also caches; drop its entry to see the new id
         mapper.dir_ids.delete(&node.dir_file_path());
         assert_eq!(mapper.ciphertext_dir(&d).unwrap().dir_id, "id-two");
+    }
+
+    #[test]
+    fn dir_cache_entries_expire_after_the_ttl() {
+        let (_dir, mapper) = mapper(220);
+        let d = CleartextPath::parse("/d");
+        let node = mapper.ciphertext_file_path(&d).unwrap();
+        std::fs::create_dir(node.raw_path()).unwrap();
+        std::fs::write(node.dir_file_path(), "id-one").unwrap();
+        assert_eq!(mapper.ciphertext_dir(&d).unwrap().dir_id, "id-one");
+        // somebody else (a sync client) rewrites dir.c9r
+        std::fs::write(node.dir_file_path(), "id-two").unwrap();
+
+        // within the expiry: still the cached mapping (half the TTL, so the wall clock the test
+        // itself spends cannot push it over)
+        let half = DIR_CACHE_TTL / 2;
+        mapper.advance(half);
+        mapper.dir_ids.advance(half);
+        assert_eq!(mapper.ciphertext_dir(&d).unwrap().dir_id, "id-one");
+
+        // past it: both caches re-read the file
+        mapper.advance(DIR_CACHE_TTL);
+        mapper.dir_ids.advance(DIR_CACHE_TTL);
+        assert_eq!(mapper.ciphertext_dir(&d).unwrap().dir_id, "id-two");
+        // and the fresh entry is cached again
+        std::fs::write(node.dir_file_path(), "id-three").unwrap();
+        assert_eq!(mapper.ciphertext_dir(&d).unwrap().dir_id, "id-two");
+    }
+
+    #[test]
+    fn a_miss_drops_the_entries_that_expired() {
+        let (_dir, mapper) = mapper(220);
+        for name in ["/a", "/b"] {
+            let node = mapper
+                .ciphertext_file_path(&CleartextPath::parse(name))
+                .unwrap();
+            std::fs::create_dir(node.raw_path()).unwrap();
+            std::fs::write(node.dir_file_path(), format!("id{name}")).unwrap();
+            mapper.ciphertext_dir(&CleartextPath::parse(name)).unwrap();
+        }
+        assert_eq!(super::super::lock(&mapper.dir_cache).len(), 2);
+        mapper.advance(DIR_CACHE_TTL + Duration::from_secs(1));
+        // the next miss is what prunes: nothing else bounds the map
+        mapper.ciphertext_dir(&CleartextPath::parse("/a")).unwrap();
+        assert_eq!(super::super::lock(&mapper.dir_cache).len(), 1);
     }
 }

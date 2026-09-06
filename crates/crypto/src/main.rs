@@ -4,13 +4,16 @@ mod commands;
 mod exit;
 mod output;
 
+use anyhow::Context;
 use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand};
 use commands::Ctx;
 use cryptomator_app::settings::SettingsStore;
+use cryptomator_app::StateDir;
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
 use output::Output;
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use zeroize::Zeroizing;
 
@@ -30,21 +33,37 @@ fn main() -> ExitCode {
     };
     match run(cli) {
         Ok(code) => ExitCode::from(code),
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            ExitCode::from(exit::code_for(&err))
-        }
+        // `None`: the reader closed the pipe (`crypto vault list | head -3`). Nothing is printed
+        // and the exit code stays 0 -- that reader got what it asked for.
+        Err(err) => match exit::failure_report(&err) {
+            None => ExitCode::from(exit::OK),
+            Some(code) => {
+                eprintln!("error: {err:#}");
+                ExitCode::from(code)
+            }
+        },
     }
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
-    let store = match cli.settings {
+    // Absolutized once, here, rather than wherever each value is later used: a detached daemon
+    // runs with its cwd at `/` (see `commands::unlock::spawn_daemon`), so a relative `--settings`
+    // or `--state-dir` would resolve to the wrong place in the child even though it was correct
+    // when the user typed it against the shell's own cwd.
+    let settings_arg = cli.settings.map(absolutize).transpose()?;
+    let store = match settings_arg.clone() {
         Some(path) => SettingsStore::at(path),
         None => SettingsStore::from_env_or_default()?,
+    };
+    let state_dir = match cli.state_dir.map(absolutize).transpose()? {
+        Some(path) => StateDir::at(path),
+        None => StateDir::from_env_or_default()?,
     };
     let ctx = Ctx {
         store,
         out: Output { json: cli.json },
+        state_dir,
+        settings_arg,
     };
     match cli.command {
         Command::Vault { command } => match command {
@@ -87,5 +106,20 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         },
         Command::Fs { command } => commands::fs::run(&ctx, command),
         Command::Name { command } => commands::name::run(&ctx, command),
+        Command::Unlock(args) => commands::unlock::unlock(&ctx, args),
+        Command::Lock(args) => commands::lock::lock(&ctx, args),
+        Command::Status(args) => commands::status::status(&ctx, args),
+        Command::Stats(args) => commands::stats::stats(&ctx, args),
+        Command::Events(args) => commands::events::events(&ctx, args),
+        Command::Mounters(args) => commands::mounters::mounters(&ctx, args),
+        Command::Daemon(args) => commands::daemon::run(&ctx, args),
     }
+}
+
+/// Resolves `path` against the current directory if it is relative; a path that is already
+/// absolute is returned unchanged. Unlike [`std::fs::canonicalize`], this does not require `path`
+/// to exist and does not resolve symlinks -- exactly what a CLI argument that may name a file not
+/// yet created (`--settings`) or a directory a detached child will create (`--state-dir`) needs.
+fn absolutize(path: PathBuf) -> anyhow::Result<PathBuf> {
+    std::path::absolute(&path).with_context(|| format!("cannot resolve path {}", path.display()))
 }

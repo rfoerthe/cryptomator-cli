@@ -7,6 +7,7 @@ pub mod crypto_fs;
 pub mod dir_id;
 pub mod dir_stream;
 pub mod events;
+mod expiring;
 pub mod long_names;
 pub mod name_decryptor;
 pub mod open_file;
@@ -35,6 +36,56 @@ pub use symlinks::Symlinks;
 use std::fmt::Display;
 use std::io;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+/// `CiphertextDirCache.MAX_CACHE_AGE`: how long a cached directory mapping (and, unlike in
+/// cryptofs, a cached directory id) stays valid. A mount runs for days, so a `dir.c9r` that a
+/// synchronisation client rewrites underneath us must eventually be re-read.
+pub const DIR_CACHE_TTL: Duration = Duration::from_secs(20);
+
+/// The monotonic clock the caches expire against. Production code always reads
+/// [`Instant::now`]; a unit test moves the clock forward with [`Clock::advance`] instead of
+/// sleeping for 20 seconds.
+#[derive(Debug, Default)]
+pub(crate) struct Clock {
+    #[cfg(test)]
+    offset: Mutex<Duration>,
+}
+
+impl Clock {
+    pub(crate) fn now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now.checked_add(*lock(&self.offset)).unwrap_or(now);
+        now
+    }
+
+    /// Moves this clock (and only this one) `d` into the future.
+    #[cfg(test)]
+    pub(crate) fn advance(&self, d: Duration) {
+        let mut offset = lock(&self.offset);
+        *offset = offset.saturating_add(d);
+    }
+}
+
+/// Whether an entry written at `loaded` is still valid at `now` (`expireAfterWrite`).
+pub(crate) fn is_fresh(loaded: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(loaded) < DIR_CACHE_TTL
+}
+
+/// Payload of the `io::Error` a symlink loop produces (`ErrorKind::Other`, because
+/// `ErrorKind::FilesystemLoop` is unstable): downcast the error's inner value to it to recognise
+/// the loop, e.g. `err.get_ref().and_then(|e| e.downcast_ref::<FilesystemLoop>())`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemLoop(pub String);
+
+impl Display for FilesystemLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: too many levels of symbolic links", self.0)
+    }
+}
+
+impl std::error::Error for FilesystemLoop {}
 
 /// Locks without propagating poisoning: the protected data are caches and counters that stay
 /// consistent even if a panic interrupted a holder.
@@ -99,9 +150,10 @@ mod io_errors {
             format!("{path}: not a symbolic link ({detail})"),
         )
     }
-    /// `ErrorKind::FilesystemLoop` is still unstable, so this uses `Other`.
+    /// `ErrorKind::FilesystemLoop` is still unstable, so this uses `Other` and carries the
+    /// [`FilesystemLoop`] marker as the payload so a FUSE adapter can still answer `ELOOP`.
     pub(crate) fn fs_loop(path: impl Display) -> io::Error {
-        io::Error::other(format!("{path}: too many levels of symbolic links"))
+        io::Error::other(FilesystemLoop(path.to_string()))
     }
 }
 

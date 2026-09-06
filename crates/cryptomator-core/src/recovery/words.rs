@@ -40,14 +40,14 @@ impl WordEncoder {
     }
 
     pub fn encode_padded(&self, input: &[u8]) -> Result<String> {
-        if input.len() % 3 != 0 {
+        if !input.len().is_multiple_of(3) {
             return Err(CoreError::InvalidArgument(
                 "input needs to be padded to a multiple of three".into(),
             ));
         }
         let mut out = Vec::with_capacity(input.len() / 3 * 2);
-        for triple in input.chunks_exact(3) {
-            let (b1, b2, b3) = (triple[0] as u32, triple[1] as u32, triple[2] as u32);
+        for &[b1, b2, b3] in input.as_chunks::<3>().0 {
+            let (b1, b2, b3) = (b1 as u32, b2 as u32, b3 as u32);
             let first = ((b1 << 4) & 0xFF0) | ((b2 >> 4) & 0x00F);
             let second = ((b2 << 8) & 0xF00) | (b3 & 0x0FF);
             out.push(self.words[first as usize]);
@@ -58,7 +58,7 @@ impl WordEncoder {
 
     pub fn decode(&self, encoded: &str) -> Result<Vec<u8>> {
         let split: Vec<&str> = encoded.split(DELIMITER).filter(|w| !w.is_empty()).collect();
-        if split.len() % 2 != 0 {
+        if !split.len().is_multiple_of(2) {
             // The messages below never quote the input: a recovery key is key material.
             return Err(CoreError::InvalidRecoveryKey(
                 "recovery key must consist of an even number of words".into(),
@@ -71,7 +71,7 @@ impl WordEncoder {
             ))
         };
         let mut out = Vec::with_capacity(split.len() / 2 * 3);
-        for (pair_index, pair) in split.chunks_exact(2).enumerate() {
+        for (pair_index, pair) in split.as_chunks::<2>().0.iter().enumerate() {
             let first = *self
                 .indices
                 .get(pair[0])
