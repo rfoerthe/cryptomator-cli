@@ -14,8 +14,12 @@ pub struct Cli {
     /// Path to settings.json (default: the Cryptomator desktop app's file, or $CRYPTO_SETTINGS_PATH)
     #[arg(long, global = true, value_name = "PATH")]
     pub settings: Option<PathBuf>,
-    /// Directory holding the socket, pid and run info of every unlocked vault
-    #[arg(long, global = true, value_name = "PATH", env = "CRYPTO_STATE_DIR")]
+    /// Directory holding the socket, pid and run info of every unlocked vault (default:
+    /// $CRYPTO_STATE_DIR, else a platform default)
+    // No `env` attribute here: clap's own env handling turns an empty value into a hard error
+    // ("a value is required"), while `StateDir::from_env_or_default` (main.rs) deliberately reads
+    // the variable itself and treats an empty value as unset.
+    #[arg(long, global = true, value_name = "PATH")]
     pub state_dir: Option<PathBuf>,
     /// Machine-readable JSON output
     #[arg(long, global = true)]

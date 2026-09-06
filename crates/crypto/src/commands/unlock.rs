@@ -9,8 +9,7 @@ use crate::exit;
 use anyhow::{anyhow, Context, Result};
 use cryptomator_app::settings::{VaultSettingsJson, WhenUnlocked};
 use cryptomator_app::{
-    read_passphrase, resolve_mounter, AppError, DaemonClient, Request, RunInfo, RuntimeState,
-    SystemIo, VaultStateFiles,
+    read_passphrase, resolve_mounter, DaemonClient, Request, SystemIo, VaultStateFiles,
 };
 use cryptomator_core::fs::{
     determine_supported_cleartext_file_name_length, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
@@ -45,7 +44,9 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     // Before the password: an unusable mounter name is a usage error, not a failed unlock.
     let mounter = args.mounter.as_deref().map(resolve_mounter).transpose()?;
     let (vault, path) = locked_vault(ctx, &args.vault)?;
-    require_not_running(ctx, &vault)?;
+    // Refuses a vault a daemon is already serving, or whose volume a crashed daemon left behind
+    // (`crypto lock --force` is the way out of the latter -- the same hint `crypto fs` gets).
+    ctx.registry().require_locked(&vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?
@@ -61,14 +62,15 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     let key = Zeroizing::new(BASE64.encode(opened.masterkey.raw()));
     drop(opened);
 
+    // `--mount-point` is sent to the daemon over the socket, not as an argument, but the same
+    // problem applies: a relative path is meaningless once it reaches a process (or a mount
+    // service call inside this one) that does not share the shell's cwd.
+    let mount_point = absolute_mount_point(args.mount_point.as_deref())?;
     let request = Request::Unlock {
         id: 0,
         key: key.as_str().to_owned(),
         mounter,
-        mount_point: args
-            .mount_point
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
+        mount_point,
         mount_options: args.mount_option.clone(),
         // `None`, not `Some(false)`: without the flag the vault's own `usesReadOnlyMode` decides.
         read_only: args.read_only.then_some(true),
@@ -86,30 +88,16 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     }
 }
 
-/// Refuses a vault a daemon is already serving, or whose volume a crashed daemon left behind.
-///
-/// # Errors
-/// [`AppError::WrongState`] (exit code 5) in both cases, plus anything `settings.json` reports.
-fn require_not_running(ctx: &Ctx, vault: &VaultSettingsJson) -> Result<()> {
-    let (state, info) = ctx.registry().runtime_state(&vault.id)?;
-    let at = |info: Option<RunInfo>| match info.and_then(|i| i.mountpoint) {
-        Some(mountpoint) => format!(" at {mountpoint}"),
-        None => String::new(),
-    };
-    let actual = match state {
-        RuntimeState::Unlocked => format!("already unlocked{}", at(info)),
-        RuntimeState::StaleMount => format!(
-            "STALE_MOUNT{} -- a previous daemon left the volume behind; take it down with `crypto lock {} --force`",
-            at(info),
-            vault.id
-        ),
-        _ => return Ok(()),
-    };
-    Err(AppError::WrongState {
-        expected: "LOCKED".to_owned(),
-        actual,
-    }
-    .into())
+/// Absolutizes `--mount-point`: `None` stays `None`, a relative path is resolved against this
+/// process's cwd before it leaves for the daemon.
+fn absolute_mount_point(mount_point: Option<&Path>) -> Result<Option<String>> {
+    mount_point
+        .map(|p| {
+            std::path::absolute(p)
+                .with_context(|| format!("cannot resolve mount point {}", p.display()))
+                .map(|abs| abs.to_string_lossy().into_owned())
+        })
+        .transpose()
 }
 
 /// The longest cleartext file name the mounted vault accepts.
@@ -299,7 +287,15 @@ fn reveal(mountpoint: &str, mounter: Option<&str>) {
 
 /// Waits for a daemon that failed its unlock (it stops itself) and kills one that does not go.
 /// Without this the parent would leave a zombie behind on every failed unlock.
+///
+/// Most callers reach this with a daemon that never got past its own unlock handshake, but a
+/// transport error can strand this here after the daemon has already mounted the volume -- so a
+/// plain `SIGKILL` is not good enough: it skips the daemon's own signal handler and the graceful
+/// unmount it runs (see `commands::daemon::install_signal_flag`), leaving the volume mounted with
+/// nothing left to lock it. `SIGTERM` first gives that handler a chance; only a daemon that still
+/// has not exited by [`CHILD_EXIT_TIMEOUT`] gets `SIGKILL`.
 fn reap(child: &mut Child) {
+    terminate(child);
     let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -310,6 +306,18 @@ fn reap(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Sends `SIGTERM` to `child`, best effort: a send that fails (the process already exited) needs
+/// no handling since `reap`'s poll notices the exit either way.
+fn terminate(child: &Child) {
+    // SAFETY: `kill(2)` has no preconditions beyond a valid signal number, which `SIGTERM` is; the
+    // pid is the one `Child` itself reports for a process this same code just spawned and still
+    // owns, so this cannot signal an unrelated process even if the child has already exited (the
+    // pid is not reused while the parent holds it unreaped).
+    unsafe {
+        let _ = libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
 }
 
 /// Prints the tail of the daemon's log to stderr and hands `err` back unchanged: the daemon's

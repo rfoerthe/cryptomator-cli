@@ -91,6 +91,29 @@ impl Sandbox {
     pub fn crypto_daemon(&self, args: &[&str]) -> Command {
         Command::from_std(self.crypto_daemon_cmd(args))
     }
+    /// Like [`Sandbox::crypto_daemon_cmd`], but `--settings`/`--state-dir` are given as the
+    /// relative names `settings.json`/`s` and the process itself runs with [`Sandbox::root`] as
+    /// its current directory -- for testing that a relative path the user typed against the
+    /// shell's cwd still reaches the detached daemon, whose own cwd is `/`.
+    pub fn crypto_daemon_cmd_relative(&self, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("crypto"));
+        cmd.current_dir(self.root())
+            .env_remove("CRYPTO_SETTINGS_PATH")
+            .env_remove("CRYPTO_MIN_PW_LENGTH")
+            .env_remove("CRYPTO_NULL_MOUNT_BUSY")
+            .env("CRYPTO_PASSWORD", PW)
+            .env("HOME", self.root())
+            .env("CRYPTO_ENABLE_NULL_MOUNTER", "1")
+            .env("CRYPTO_AUTOLOCK_TICK_SECS", "1");
+        cmd.arg("--settings").arg("settings.json");
+        cmd.arg("--state-dir").arg("s");
+        cmd.args(args);
+        cmd
+    }
+    /// [`Sandbox::crypto_daemon_cmd_relative`] ready for `assert()`.
+    pub fn crypto_daemon_relative(&self, args: &[&str]) -> Command {
+        Command::from_std(self.crypto_daemon_cmd_relative(args))
+    }
     /// Copies a fixture vault into the sandbox and registers it under its name.
     pub fn add_fixture(&self, name: &str) -> PathBuf {
         let vault = self.path(name);

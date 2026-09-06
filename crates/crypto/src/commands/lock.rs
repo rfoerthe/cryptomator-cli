@@ -21,10 +21,16 @@ pub fn lock(ctx: &Ctx, args: LockArgs) -> Result<u8> {
             .filter(|info| info.state.is_mounted())
             .collect()
     } else {
+        // `crypto lock v v` names the same vault twice: dedupe by id so it is locked once and
+        // does not show up a second time as a spurious "failed" entry.
+        let mut seen = std::collections::HashSet::new();
         args.vaults
             .iter()
             .map(|reference| registry.info(reference))
             .collect::<cryptomator_app::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|info| seen.insert(info.id.clone()))
+            .collect()
     };
 
     let mut locked: Vec<String> = Vec::new();
@@ -117,11 +123,8 @@ fn unmount_stale(ctx: &Ctx, info: &VaultInfo, force: bool) -> Result<()> {
         .mountpoint
         .as_deref()
         .ok_or_else(|| AppError::UnmountFailed(format!("vault {} has no mount point", info.id)))?;
-    let service = registry::service_by_class(mounter).ok_or_else(|| {
-        AppError::UnmountFailed(format!(
-            "the mount service {mounter} of the volume at {mountpoint} is not part of this build"
-        ))
-    })?;
+    let service = registry::service_by_class(mounter)
+        .ok_or_else(|| unknown_mounter_error(mounter, mountpoint))?;
     service
         .unmount_path(std::path::Path::new(mountpoint), force)
         .map_err(|err| AppError::UnmountFailed(format!("{mounter}: {err}")))?;
@@ -130,4 +133,31 @@ fn unmount_stale(ctx: &Ctx, info: &VaultInfo, force: bool) -> Result<()> {
         .remove_all()
         .with_context(|| format!("cannot remove the state files of vault {}", info.id))?;
     Ok(())
+}
+
+/// The error for a stale mount whose run info names a mount-service class this build does not
+/// have (`registry::service_by_class` returned `None`). A pure function of the two strings that
+/// end up in the message, so the case is unit-testable without a real mount, state directory or
+/// `VaultInfo`.
+fn unknown_mounter_error(class: &str, mountpoint: &str) -> AppError {
+    AppError::UnmountFailed(format!(
+        "the mount service {class} of the volume at {mountpoint} is not part of this build"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `registry::service_by_class(class) == None`, the arm the null mounter can never reach
+    /// end-to-end (it is always a class this build knows).
+    #[test]
+    fn an_unknown_mounter_class_names_itself_and_the_mountpoint() {
+        let err = unknown_mounter_error("com.example.NoSuchMounter", "/mnt/v");
+        assert!(matches!(err, AppError::UnmountFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains("com.example.NoSuchMounter"), "{message}");
+        assert!(message.contains("/mnt/v"), "{message}");
+        assert!(message.contains("not part of this build"), "{message}");
+    }
 }

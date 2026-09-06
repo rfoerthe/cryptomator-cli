@@ -126,10 +126,11 @@ fn unlock_mounts_the_vault_and_lock_takes_it_down() {
     assert!(alive(pid));
 
     // An unlocked vault belongs to its daemon: no second unlock, and no mount-less access either.
+    // `unlock` and `fs` now share one WrongState wording (`VaultRegistry::require_locked`).
     fx.crypto_daemon(&["unlock", "v", "--mounter", "null"])
         .assert()
         .code(5)
-        .stderr(predicates::str::contains("already unlocked"));
+        .stderr(predicates::str::contains("UNLOCKED (mounted at"));
     fx.crypto_daemon(&["fs", "ls", "v"]).assert().code(5);
     fx.crypto_daemon(&["fs", "mkdir", "v", "/x"])
         .assert()
@@ -299,6 +300,161 @@ fn lock_all_locks_every_unlocked_vault() {
         assert!(!fx.mount_points_dir().join(name).join(MARKER).exists());
     }
     assert!(!Path::new(&fx.state_file(".sock")).exists());
+}
+
+#[test]
+fn relative_settings_and_state_dir_still_reach_the_detached_daemon() {
+    // Regression for a daemon spawned with `current_dir("/")`: a relative `--settings`/
+    // `--state-dir` used to be handed to the child verbatim, so it tried to create its state
+    // files under `/` and the parent timed out waiting for a socket that never appeared.
+    let fx = Fixture::new("v");
+    let id = fx.id();
+    let out = fx
+        .crypto_daemon_relative(&["--json", "unlock", "v", "--mounter", "null"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result = json(&out);
+    assert_eq!(result["id"], id);
+    let mountpoint = mountpoint_of(&result);
+    assert!(mountpoint.is_absolute());
+    assert!(mountpoint.join(MARKER).is_file(), "the null mount's marker");
+
+    fx.crypto_daemon_relative(&["lock", "v"])
+        .assert()
+        .success()
+        .stdout("Locked v\n");
+}
+
+#[test]
+fn a_relative_mount_point_resolves_against_the_shells_cwd() {
+    let fx = Fixture::new("v");
+    std::fs::create_dir_all(fx.path("rel/mp")).unwrap();
+    let out = fx
+        .crypto_daemon_relative(&[
+            "--json",
+            "unlock",
+            "v",
+            "--mounter",
+            "null",
+            "--mount-point",
+            "rel/mp",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result = json(&out);
+    let mountpoint = mountpoint_of(&result);
+    assert!(mountpoint.is_absolute());
+    // `canonicalize`, not a plain string comparison: on macOS the sandbox's tmp dir is under
+    // `/var`, a symlink to `/private/var`, and `std::path::absolute` (used by the fix) goes
+    // through `std::env::current_dir()`, which resolves it -- so the two sides name the same
+    // directory without being byte-identical.
+    assert_eq!(
+        mountpoint.canonicalize().unwrap(),
+        fx.path("rel/mp").canonicalize().unwrap(),
+        "resolved against the shell's cwd, not the daemon's `/`"
+    );
+    assert!(mountpoint.join(MARKER).is_file());
+
+    fx.crypto_daemon_relative(&["lock", "v"]).assert().success();
+}
+
+#[test]
+fn an_empty_crypto_state_dir_env_var_is_ignored() {
+    let fx = Fixture::new("v");
+    // No `--state-dir` on the command line: `StateDir::from_env_or_default` reads the variable
+    // itself and, unlike clap's own `env` handling, treats an empty value as unset.
+    fx.crypto(&["vault", "list"])
+        .env("HOME", fx.root())
+        .env("CRYPTO_STATE_DIR", "")
+        .assert()
+        .success();
+}
+
+#[test]
+fn locking_the_same_vault_twice_dedupes() {
+    let fx = Fixture::new("v");
+    let id = fx.id();
+    fx.crypto_daemon(&["unlock", "v", "--mounter", "null"])
+        .assert()
+        .success();
+
+    let out = fx
+        .crypto_daemon(&["--json", "lock", "v", "v"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result = json(&out);
+    assert!(result.get("failed").is_none(), "{result}");
+    let locked: Vec<&str> = result["locked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        locked,
+        vec![id.as_str()],
+        "the vault is locked exactly once"
+    );
+}
+
+#[test]
+fn unlock_grammar_applies_volume_name_read_only_and_mount_options() {
+    let fx = Fixture::new("v");
+    let out = fx
+        .crypto_daemon(&[
+            "unlock",
+            "v",
+            "--mounter",
+            "null",
+            "--volume-name",
+            "Foo",
+            "--read-only",
+            "--mount-option=-onoappledouble",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result = json(&out);
+    let mountpoint = mountpoint_of(&result);
+    assert_eq!(
+        std::fs::read_to_string(mountpoint.join(MARKER)).unwrap(),
+        "Foo",
+        "the null mount's marker records --volume-name"
+    );
+
+    let info = json(&std::fs::read(fx.state_file(".json")).unwrap());
+    assert_eq!(info["readOnly"], true);
+}
+
+#[test]
+fn a_space_separated_mount_option_is_a_usage_error() {
+    let fx = Fixture::new("v");
+    // `require_equals` on `--mount-option` rejects the space-separated form so it cannot swallow
+    // whatever token follows it.
+    fx.crypto_daemon(&["unlock", "v", "--mounter", "null", "--mount-option", "-oro"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn lock_all_with_nothing_unlocked_prints_nothing_to_lock() {
+    let fx = Fixture::new("v");
+    fx.crypto_daemon(&["lock", "--all"])
+        .assert()
+        .success()
+        .stdout("nothing to lock\n");
 }
 
 #[test]

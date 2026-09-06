@@ -249,7 +249,10 @@ impl VaultRegistry {
             .collect())
     }
 
-    /// Requires the vault to be locked, as the `fs` commands do.
+    /// Requires the vault to be locked: refuses one a daemon is already serving, or whose volume
+    /// a crashed daemon left behind. Used by both the `fs` commands and `crypto unlock` -- a
+    /// single wording for one condition, with the `crypto lock --force` hint that gets a stale
+    /// mount out of the way.
     ///
     /// # Errors
     /// [`AppError::WrongState`] when a daemon serves the vault or left a mount behind.
@@ -263,9 +266,18 @@ impl VaultRegistry {
             .and_then(|i| i.mountpoint)
             .map(|mp| format!(" (mounted at {mp})"))
             .unwrap_or_default();
+        let hint = if state == RuntimeState::StaleMount {
+            format!(
+                " -- a previous daemon left the volume behind; take it down with \
+                 `crypto lock {} --force`",
+                vault.id
+            )
+        } else {
+            String::new()
+        };
         Err(AppError::WrongState {
             expected: VaultState::Locked.to_string(),
-            actual: format!("{state}{where_}"),
+            actual: format!("{state}{where_}{hint}"),
         })
     }
 }
