@@ -7,11 +7,12 @@ pub mod error;
 pub mod mounters;
 pub mod mounting;
 pub mod password;
+pub mod platform;
 pub mod registry;
 pub mod settings;
 pub mod state_dir;
 
-pub use cli_config::CliConfig;
+pub use cli_config::{default_mount_points_dir, CliConfig};
 pub use error::{AppError, Result};
 pub use mounters::{alias_for, resolve_mounter};
 pub use mounting::{
@@ -22,7 +23,8 @@ pub use password::{
     read_new_passphrase_no_env_fallback, read_passphrase, read_secret_file, NewPasswordArgs,
     PasswordArgs, PasswordIo, SystemIo,
 };
+pub use platform::Platform;
 pub use registry::{RuntimeState, VaultInfo, VaultRegistry};
 pub use state_dir::{
-    default_state_dir, process_alive, RunInfo, StateDir, VaultStateFiles, STATE_DIR_ENV,
+    check_root, default_state_dir, process_alive, RunInfo, StateDir, VaultStateFiles, STATE_DIR_ENV,
 };

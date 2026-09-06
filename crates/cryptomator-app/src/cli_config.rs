@@ -6,9 +6,11 @@
 //! separate file so a future desktop version cannot collide with it. Unknown keys are preserved,
 //! for the same reason they are in `settings.json`.
 use crate::error::{AppError, Result};
+use crate::platform::Platform;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// The file name, always a sibling of `settings.json`.
@@ -17,6 +19,8 @@ pub const CLI_CONFIG_FILE_NAME: &str = "cli.json";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// How long a shutting-down daemon tries a graceful unmount before forcing it.
 pub const DEFAULT_FORCE_UNMOUNT_AFTER_SECS: u32 = 10;
+/// The mode `cli.json` is written with; it names the user's vault mount points.
+const FILE_MODE: u32 = 0o600;
 
 /// The contents of `cli.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,7 +81,8 @@ impl CliConfig {
     }
 
     /// Writes `path` through a process-unique temporary file that is renamed over it, like
-    /// [`crate::settings::SettingsStore::save`].
+    /// [`crate::settings::SettingsStore::save`]. The temporary file -- and therefore `cli.json`
+    /// itself -- is created 0600, like the state files.
     ///
     /// # Errors
     /// Any I/O error while creating the directory, writing or renaming.
@@ -98,6 +103,7 @@ impl CliConfig {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(FILE_MODE)
             .open(&tmp)
             .and_then(|mut file| {
                 file.write_all(json.as_bytes())?;
@@ -115,23 +121,37 @@ impl CliConfig {
         Ok(())
     }
 
-    /// Where mount directories are created: the configured value, else
-    /// `~/Library/Application Support/Cryptomator/mnt` on macOS and `~/.local/share/Cryptomator/mnt`
-    /// elsewhere (Cryptomator's `Environment.getMountPointsDir`).
+    /// Where mount directories are created: the configured value, else the platform's default,
+    /// see [`default_mount_points_dir`].
     pub fn mount_points_dir(&self, home: &Path) -> PathBuf {
+        self.mount_points_dir_on(Platform::current(), home)
+    }
+
+    /// [`CliConfig::mount_points_dir`] for an explicit platform; pure, so both branches can be
+    /// checked on any host.
+    pub fn mount_points_dir_on(&self, platform: Platform, home: &Path) -> PathBuf {
         match self.mount_points_dir.as_deref().map(str::trim) {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ if cfg!(target_os = "macos") => {
-                home.join("Library/Application Support/Cryptomator/mnt")
-            }
-            _ => home.join(".local/share/Cryptomator/mnt"),
+            _ => default_mount_points_dir(platform, home),
         }
+    }
+}
+
+/// The platform's default mount-point base: `~/Library/Application Support/Cryptomator/mnt` on
+/// macOS and `~/.local/share/Cryptomator/mnt` elsewhere (Cryptomator's
+/// `Environment.getMountPointsDir`).
+pub fn default_mount_points_dir(platform: Platform, home: &Path) -> PathBuf {
+    if platform.is_macos() {
+        home.join("Library/Application Support/Cryptomator/mnt")
+    } else {
+        home.join(".local/share/Cryptomator/mnt")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn defaults_apply_to_a_missing_file() {
@@ -151,12 +171,25 @@ mod tests {
     #[test]
     fn the_mount_points_dir_falls_back_to_the_platform_default() {
         let home = Path::new("/home/u");
-        let expected = if cfg!(target_os = "macos") {
-            PathBuf::from("/home/u/Library/Application Support/Cryptomator/mnt")
-        } else {
-            PathBuf::from("/home/u/.local/share/Cryptomator/mnt")
-        };
-        assert_eq!(CliConfig::default().mount_points_dir(home), expected);
+        let macos = PathBuf::from("/home/u/Library/Application Support/Cryptomator/mnt");
+        let linux = PathBuf::from("/home/u/.local/share/Cryptomator/mnt");
+        // Both branches are checked on every host: the platform is a parameter, not a `cfg!`.
+        assert_eq!(default_mount_points_dir(Platform::MacOs, home), macos);
+        assert_eq!(default_mount_points_dir(Platform::Linux, home), linux);
+        assert_eq!(
+            CliConfig::default().mount_points_dir_on(Platform::MacOs, home),
+            macos
+        );
+        assert_eq!(
+            CliConfig::default().mount_points_dir_on(Platform::Linux, home),
+            linux
+        );
+        assert_eq!(
+            CliConfig::default().mount_points_dir(home),
+            default_mount_points_dir(Platform::current(), home),
+            "the convenience wrapper uses the host's platform"
+        );
+
         let configured = CliConfig {
             mount_points_dir: Some("/mnt/vaults".to_owned()),
             ..CliConfig::default()
@@ -170,8 +203,8 @@ mod tests {
             ..CliConfig::default()
         };
         assert_eq!(
-            blank.mount_points_dir(home),
-            expected,
+            blank.mount_points_dir_on(Platform::Linux, home),
+            linux,
             "a blank value is none"
         );
     }
@@ -211,6 +244,12 @@ mod tests {
             !dir.path().join("deep/cli.json.tmp").exists(),
             "no temporary file is left behind"
         );
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, FILE_MODE, "cli.json is written 0600, got {mode:o}");
     }
 
     #[test]

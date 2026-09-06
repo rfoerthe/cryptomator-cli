@@ -14,10 +14,11 @@
 //! the 0700/0600 modes: the key never touches these files, but the mount point and the vault path
 //! do, and the socket accepts the vault key.
 use crate::error::{AppError, Result};
+use crate::platform::Platform;
 use serde::{Deserialize, Serialize};
-use std::fs::Permissions;
+use std::fs::{DirBuilder, Metadata, Permissions};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Overrides the state directory (`crypto --state-dir`).
@@ -32,10 +33,15 @@ const FILE_MODE: u32 = 0o600;
 ///
 /// macOS has no per-user run-time directory, so the state lives next to `settings.json`; Linux
 /// uses `$XDG_RUNTIME_DIR` when the session has one and falls back to a uid-suffixed directory in
-/// `/tmp` (which is why `uid` is a parameter rather than read here -- this function stays pure so
-/// the tests can check every branch on any host).
-pub fn default_state_dir(home: &Path, xdg_runtime: Option<&Path>, uid: u32) -> PathBuf {
-    if cfg!(target_os = "macos") {
+/// `/tmp`. Every input -- the platform included -- is a parameter rather than read here, so this
+/// function stays pure and the tests can check every branch on any host.
+pub fn default_state_dir(
+    platform: Platform,
+    home: &Path,
+    xdg_runtime: Option<&Path>,
+    uid: u32,
+) -> PathBuf {
+    if platform.is_macos() {
         home.join("Library/Application Support/Cryptomator/cli-run")
     } else if let Some(runtime) = xdg_runtime.filter(|p| !p.as_os_str().is_empty()) {
         runtime.join("crypto")
@@ -66,6 +72,7 @@ impl StateDir {
                 return Ok(Self::at(PathBuf::from(value)));
             }
         }
+        let platform = Platform::current();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
         let uid = nix::unistd::geteuid().as_raw();
@@ -73,10 +80,15 @@ impl StateDir {
         // session without $HOME still gets a state directory there.
         let home = match home {
             Some(home) => home,
-            None if cfg!(target_os = "macos") => return Err(AppError::NoHomeDirectory),
+            None if platform.is_macos() => return Err(AppError::NoHomeDirectory),
             None => PathBuf::new(),
         };
-        Ok(Self::at(default_state_dir(&home, xdg.as_deref(), uid)))
+        Ok(Self::at(default_state_dir(
+            platform,
+            &home,
+            xdg.as_deref(),
+            uid,
+        )))
     }
 
     /// The directory itself.
@@ -84,21 +96,32 @@ impl StateDir {
         &self.root
     }
 
-    /// Creates the directory (and its parents) and narrows it to 0700.
+    /// Creates the directory (and its parents), refuses one that is not ours and narrows it to
+    /// 0700.
     ///
-    /// The mode is only forced on a directory that belongs to us: `$XDG_RUNTIME_DIR` and `/tmp`
-    /// are shared, and chmod-ing someone else's directory is both futile and rude. A pre-existing
-    /// directory of another user is left as it is -- creating the state files in it will fail,
-    /// which is the honest error.
+    /// `create_dir_all` succeeds on a directory that is already there, and the default locations
+    /// live in shared places (`$XDG_RUNTIME_DIR`, `/tmp/crypto-<uid>`): another local user can
+    /// create `/tmp/crypto-<uid>` world-writable before the first run, or put a symbolic link
+    /// there, and would then see the run infos and -- worse -- own the path the control socket is
+    /// bound to. So the directory has to be a real directory that belongs to us before anything
+    /// is written into it; anything else is refused instead of chmod-ed (see [`check_root`]).
     ///
     /// # Errors
-    /// Any I/O error from creating the directory or reading its metadata.
+    /// [`AppError::Io`] with [`std::io::ErrorKind::PermissionDenied`], naming the path, when the
+    /// root is a symbolic link, is not a directory or belongs to someone else; plus any I/O error
+    /// from creating the directory, reading its metadata or changing its mode.
     pub fn ensure(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        let metadata = std::fs::metadata(&self.root)?;
-        if metadata.uid() == nix::unistd::geteuid().as_raw()
-            && metadata.permissions().mode() & 0o777 != DIR_MODE
-        {
+        // `symlink_metadata`, not `metadata`: the latter follows a symbolic link and would report
+        // the *target's* type and owner.
+        let metadata = std::fs::symlink_metadata(&self.root)?;
+        if let Err(reason) = check_root(&metadata, nix::unistd::geteuid().as_raw()) {
+            return Err(permission_denied(format!(
+                "state directory {}: {reason}",
+                self.root.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o777 != DIR_MODE {
             std::fs::set_permissions(&self.root, Permissions::from_mode(DIR_MODE))?;
         }
         Ok(())
@@ -140,6 +163,38 @@ impl StateDir {
     }
 }
 
+/// Whether the state directory's own metadata is acceptable: a real directory (not a symbolic
+/// link, not a file) owned by `euid`.
+///
+/// Split out of [`StateDir::ensure`] and pure, so the ownership rule can be tested without
+/// creating a directory of another user.
+///
+/// # Errors
+/// [`AppError::Io`] with [`std::io::ErrorKind::PermissionDenied`] and the reason as its message.
+pub fn check_root(metadata: &Metadata, euid: u32) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(permission_denied("is a symbolic link".to_owned()));
+    }
+    if !metadata.is_dir() {
+        return Err(permission_denied("is not a directory".to_owned()));
+    }
+    let uid = metadata.uid();
+    if uid != euid {
+        return Err(permission_denied(format!(
+            "belongs to uid {uid}, not to uid {euid}"
+        )));
+    }
+    Ok(())
+}
+
+/// `EACCES`-flavoured [`AppError::Io`] carrying `message`.
+fn permission_denied(message: String) -> AppError {
+    AppError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        message,
+    ))
+}
+
 /// A vault id as a file-name stem: the generated ids are base64url already, so this only guards
 /// against a hand-edited `settings.json` steering the state files out of the directory.
 fn sanitize_id(vault_id: &str) -> String {
@@ -176,6 +231,9 @@ pub struct VaultStateFiles {
 impl VaultStateFiles {
     /// Writes the daemon's pid.
     ///
+    /// This is the **first** of the three state files a daemon publishes; see [`RunInfo`] for why
+    /// the order matters.
+    ///
     /// # Errors
     /// Any I/O error while writing.
     pub fn write_pid(&self, pid: u32) -> Result<()> {
@@ -192,6 +250,10 @@ impl VaultStateFiles {
     }
 
     /// Writes the run info.
+    ///
+    /// Must not run before [`VaultStateFiles::write_pid`]: a run info without a live pid and
+    /// without a socket looks exactly like the leftover of a crashed daemon, and a concurrent
+    /// `crypto status` removes it. See [`RunInfo`] for the whole order.
     ///
     /// # Errors
     /// Any I/O error while writing.
@@ -230,6 +292,19 @@ impl VaultStateFiles {
 }
 
 /// What a running daemon publishes about its mount.
+///
+/// # Write order
+///
+/// A daemon publishes its state files in exactly this order:
+///
+/// 1. `<id>.pid` ([`VaultStateFiles::write_pid`]), as early as possible;
+/// 2. `<id>.json` (this type, [`VaultStateFiles::write_info`]), once the mount point is known;
+/// 3. `<id>.sock`, when the control socket is bound.
+///
+/// The reason is [`crate::registry::VaultRegistry::runtime_state`]: it recognises a starting
+/// daemon by its live pid, and everything it finds without a live pid and without a listening
+/// socket is a leftover it removes. Writing the run info first opens a window in which a
+/// concurrent `crypto status` deletes the state of a perfectly healthy daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunInfo {
@@ -270,9 +345,17 @@ pub fn process_alive(pid: u32) -> bool {
 /// Writes `bytes` to `path` through a process-unique temporary file that is renamed over it, so a
 /// reader never sees a half-written file. The file is created 0600 and the temporary one is
 /// removed again on every failure.
+///
+/// A missing parent directory is created 0700 rather than with the process umask, which would
+/// leave the state directory world-traversable. This is a safety net only: the normal
+/// precondition is [`StateDir::ensure`], which is the one place that also verifies the directory
+/// is not a symbolic link and belongs to us.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(parent)?;
     }
     let file_name = path
         .file_name()
@@ -327,21 +410,30 @@ mod tests {
     #[test]
     fn the_default_state_dir_follows_the_platform() {
         let home = Path::new("/home/u");
-        let with_runtime = default_state_dir(home, Some(Path::new("/run/user/501")), 501);
-        let without_runtime = default_state_dir(home, None, 501);
-        if cfg!(target_os = "macos") {
-            let expected = PathBuf::from("/home/u/Library/Application Support/Cryptomator/cli-run");
-            assert_eq!(with_runtime, expected, "macOS ignores XDG_RUNTIME_DIR");
-            assert_eq!(without_runtime, expected);
-        } else {
-            assert_eq!(with_runtime, PathBuf::from("/run/user/501/crypto"));
-            assert_eq!(without_runtime, PathBuf::from("/tmp/crypto-501"));
-            assert_eq!(
-                default_state_dir(home, Some(Path::new("")), 7),
-                PathBuf::from("/tmp/crypto-7"),
-                "an empty XDG_RUNTIME_DIR is no runtime dir"
-            );
-        }
+        let runtime = Some(Path::new("/run/user/501"));
+        // Both branches are checked on every host: the platform is a parameter, not a `cfg!`.
+        assert_eq!(
+            default_state_dir(Platform::MacOs, home, runtime, 501),
+            PathBuf::from("/home/u/Library/Application Support/Cryptomator/cli-run"),
+            "macOS ignores XDG_RUNTIME_DIR"
+        );
+        assert_eq!(
+            default_state_dir(Platform::MacOs, home, None, 501),
+            PathBuf::from("/home/u/Library/Application Support/Cryptomator/cli-run")
+        );
+        assert_eq!(
+            default_state_dir(Platform::Linux, home, runtime, 501),
+            PathBuf::from("/run/user/501/crypto")
+        );
+        assert_eq!(
+            default_state_dir(Platform::Linux, home, None, 501),
+            PathBuf::from("/tmp/crypto-501")
+        );
+        assert_eq!(
+            default_state_dir(Platform::Linux, home, Some(Path::new("")), 7),
+            PathBuf::from("/tmp/crypto-7"),
+            "an empty XDG_RUNTIME_DIR is no runtime dir"
+        );
     }
 
     #[test]
@@ -369,6 +461,81 @@ mod tests {
             0o700
         );
         assert_eq!(state.root(), root.as_path());
+    }
+
+    #[test]
+    fn ensure_refuses_a_state_directory_that_is_not_ours() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("target");
+        std::fs::set_permissions(&target, Permissions::from_mode(0o755)).expect("chmod");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = StateDir::at(link.clone())
+            .ensure()
+            .expect_err("a symlinked state directory is refused");
+        let AppError::Io(io) = &err else {
+            panic!("expected an I/O error, got {err:?}")
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        let message = err.to_string();
+        assert!(message.contains(&link.display().to_string()), "{message}");
+        assert!(message.contains("symbolic link"), "{message}");
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the link's target was not chmod-ed through the link"
+        );
+    }
+
+    #[test]
+    fn check_root_wants_our_own_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let metadata = std::fs::symlink_metadata(dir.path()).expect("metadata");
+        let euid = metadata.uid();
+        check_root(&metadata, euid).expect("our own directory is fine");
+
+        // The case that cannot be built in a test: a directory of another user.
+        let err = check_root(&metadata, euid.wrapping_add(1)).expect_err("foreign owner");
+        let AppError::Io(io) = &err else {
+            panic!("expected an I/O error, got {err:?}")
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains(&format!("belongs to uid {euid}")),
+            "{err}"
+        );
+
+        // `create_dir_all` already fails on a plain file, so this branch only ever guards against
+        // a future caller that skips it.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+        let metadata = std::fs::symlink_metadata(&file).expect("metadata");
+        let err = check_root(&metadata, euid).expect_err("a file is no state directory");
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn a_pid_written_into_a_fresh_state_directory_creates_it_0700() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("fresh/state");
+        // No `ensure()`: `write_private` must not leave the directory at the umask default.
+        let files = StateDir::at(root.clone()).files("AAAAAAAAAAAA");
+        files.write_pid(std::process::id()).expect("write pid");
+        assert_eq!(files.read_pid(), Some(std::process::id()));
+        for path in [root.as_path(), &dir.path().join("fresh")] {
+            let mode = std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{} has mode {mode:o}", path.display());
+        }
     }
 
     #[test]

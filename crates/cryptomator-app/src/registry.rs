@@ -129,7 +129,12 @@ impl VaultRegistry {
     /// The state of the vault with this id, and the daemon's [`RunInfo`] if there is one.
     ///
     /// Leftover state files of a daemon that is gone are removed on the way, so a crashed daemon
-    /// heals the next time anything asks for the state.
+    /// heals the next time anything asks for the state. Precisely: the files are removed when the
+    /// pid file is absent or names a dead process **and** the socket does not accept a connection
+    /// **and** the run info's mount point is no longer mounted. A *live* pid is a daemon that is
+    /// still starting up and never reaches this branch (step 2 above reports it as
+    /// [`RuntimeState::Unlocked`]), which is why a daemon must write `<id>.pid` before it writes
+    /// `<id>.json` and bind `<id>.sock` -- see [`RunInfo`]'s write order.
     ///
     /// # Errors
     /// Anything [`SettingsStore::load`] reports.
@@ -165,7 +170,10 @@ impl VaultRegistry {
                 return (RuntimeState::StaleMount, info);
             }
         }
-        if info.is_some() || files.pid.exists() || files.socket.exists() {
+        // `files.info.exists()`, not `info.is_some()`: a corrupt `<id>.json` cannot be parsed but
+        // is a leftover all the same, and would otherwise keep `list_run_infos` skipping it
+        // forever.
+        if files.info.exists() || files.pid.exists() || files.socket.exists() {
             log::debug!("removing leftover state files of vault {vault_id}");
             if let Err(e) = files.remove_all() {
                 log::warn!("cannot remove the state files of vault {vault_id}: {e}");
@@ -378,6 +386,22 @@ mod tests {
         assert!(!files.pid.exists());
         assert!(!files.socket.exists());
         assert!(f.registry.running_mounters().expect("mounters").is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_run_info_is_removed_like_any_other_leftover() {
+        let f = fixture();
+        let files = f.registry.state_dir().files("AAAAAAAAAAAA");
+        std::fs::write(&files.info, b"{not json").expect("write");
+        assert!(files.read_info().is_none(), "nothing to parse");
+
+        let (state, info) = f.registry.runtime_state("AAAAAAAAAAAA").expect("state");
+        assert_eq!(state, RuntimeState::Locked);
+        assert!(info.is_none());
+        assert!(
+            !files.info.exists(),
+            "an unparsable run info is a leftover too"
+        );
     }
 
     #[test]

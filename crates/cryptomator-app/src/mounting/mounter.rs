@@ -32,6 +32,10 @@ pub struct MountRequest<'a> {
     pub home: &'a Path,
     /// What `crypto unlock` was told on the command line.
     pub overrides: MountOverrides,
+    /// The Java class names of the mount services other unlocked vaults are using, from
+    /// [`crate::registry::VaultRegistry::running_mounters`]. [`mount`] refuses a service that
+    /// conflicts with one of them (macFUSE vs. FUSE-T); empty means "nothing else is mounted".
+    pub running_services: Vec<String>,
 }
 
 /// The command line's say in how a vault is mounted. Every field that is `None`/empty leaves the
@@ -57,8 +61,9 @@ pub struct MountHandle {
     pub mount: Box<dyn Mount>,
     /// Whether the service implements [`Mount::unmount_forced`].
     pub supports_forced: bool,
-    /// The mount directory the mounter created; removed by [`MountHandle::close`] once the volume
-    /// is gone (Java's `specialCleanup`).
+    /// The mount directory this mount created; removed by [`MountHandle::close`] once the volume
+    /// is gone (Java's `specialCleanup`). `None` when the mount point was already there, whoever
+    /// made it.
     pub cleanup: Option<PathBuf>,
     /// The Java class name of the mount service that produced this mount.
     pub service_class: String,
@@ -129,14 +134,26 @@ impl MountHandle {
 /// processes, so the caller passes the mounters of the currently unlocked vaults instead (see
 /// [`crate::registry::VaultRegistry::running_mounters`]).
 pub fn conflicts_with(class: &str, running: &[String]) -> bool {
+    conflicting_running(class, running).is_some()
+}
+
+/// The first of `running` that `class` must not be used alongside, for the error message.
+fn conflicting_running<'a>(class: &str, running: &'a [String]) -> Option<&'a str> {
     let conflicting = conflicting_classes(class);
     running
         .iter()
-        .any(|other| conflicting.contains(&other.as_str()))
+        .map(String::as_str)
+        .find(|other| conflicting.contains(other))
 }
 
 /// The first mount service named by the command line, the vault, `cli.json` or `settings.json`;
 /// without any of those, the first supported one in `services` (they are ordered by priority).
+///
+/// `services` is expected to be [`cryptomator_mount::registry::all_services`], the *unfiltered*
+/// list: a named service that this build knows but that does not work on this machine then gets
+/// the accurate "not available on this system" instead of the misleading hint to run
+/// `crypto mounters --all`. Passing the pre-filtered
+/// [`cryptomator_mount::registry::services`] makes that branch unreachable.
 ///
 /// # Errors
 /// [`AppError::MountFailed`] if the named service is unknown to this build or does not work on
@@ -184,18 +201,27 @@ fn named(value: Option<&str>) -> Option<&str> {
 
 /// Mounts `fs` as the vault's settings and the command line ask for.
 ///
-/// Follows `Mounter.mount`: pick the service, configure the builder as far as its capabilities
-/// allow, prepare the mount point and mount.
+/// Follows `Mounter.mount`: pick the service, refuse it if it conflicts with one another unlocked
+/// vault is using (Java's `isConflictingMountService`, here over
+/// [`MountRequest::running_services`]), configure the builder as far as its capabilities allow,
+/// prepare the mount point and mount.
 ///
 /// # Errors
-/// [`AppError::MountFailed`] if no service fits or the mount itself fails, and
-/// [`AppError::MountPointInvalid`] if the chosen mount point cannot be used.
+/// [`AppError::MountFailed`] if no service fits, if the chosen one conflicts with a running one
+/// or if the mount itself fails, and [`AppError::MountPointInvalid`] if the chosen mount point
+/// cannot be used.
 pub fn mount(
     req: &MountRequest<'_>,
     services: &[Box<dyn MountService>],
     fs: Arc<CryptoFs>,
 ) -> Result<MountHandle> {
     let service = choose_service(req, services)?;
+    let class = service.java_class_name();
+    if let Some(other) = conflicting_running(class, &req.running_services) {
+        return Err(AppError::MountFailed(format!(
+            "mount service {class} conflicts with running {other}"
+        )));
+    }
     let mut builder = service.for_file_system(fs);
     apply_capabilities(req, service, builder.as_mut())?;
     let cleanup = prepare_mount_point(req, service, builder.as_mut())?;
@@ -364,12 +390,17 @@ fn prepare_mount_point(
         .cli
         .mount_points_dir(req.home)
         .join(req.vault.mount_name());
+    // Only a directory this call created is ours to remove again: `<mountPointsDir>/<name>` may
+    // well be a directory the user made himself, and Java never removes that one either.
+    let created = !dir.exists();
     std::fs::create_dir_all(&dir)?;
     builder.set_mountpoint(&dir).map_err(|e| {
-        let _ = std::fs::remove_dir(&dir);
+        if created {
+            let _ = std::fs::remove_dir(&dir);
+        }
         AppError::MountPointInvalid(dir.clone(), e.to_string())
     })?;
-    Ok(Some(dir))
+    Ok(created.then_some(dir))
 }
 
 #[cfg(test)]
@@ -556,6 +587,7 @@ mod tests {
                       cli: &CliConfig,
                       overrides: MountOverrides| {
             let req = MountRequest {
+                running_services: Vec::new(),
                 vault,
                 settings,
                 cli,
@@ -623,6 +655,7 @@ mod tests {
             ("org.example.Unsupported", "not available on this system"),
         ] {
             let request = MountRequest {
+                running_services: Vec::new(),
                 vault: &vault,
                 settings: &settings,
                 cli: &cli,
@@ -637,6 +670,7 @@ mod tests {
         }
         // Nothing supported at all.
         let request = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &settings,
             cli: &cli,
@@ -663,6 +697,53 @@ mod tests {
     }
 
     #[test]
+    fn a_service_conflicting_with_a_running_one_is_refused() {
+        let (_vault_dir, fs) = test_fs();
+        let vault = vault();
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let macfuse = cryptomator_mount::registry::MAC_FUSE_CLASS;
+        let fuse_t = cryptomator_mount::registry::FUSE_T_CLASS;
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FakeService::new(macfuse, true))];
+        let request = |running: Vec<String>| MountRequest {
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+            running_services: running,
+        };
+
+        let err = mount(
+            &request(vec![fuse_t.to_owned()]),
+            &services,
+            Arc::clone(&fs),
+        )
+        .expect_err("macFUSE cannot join a running FUSE-T");
+        assert!(matches!(err, AppError::MountFailed(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("mount failed: mount service {macfuse} conflicts with running {fuse_t}")
+        );
+        assert!(
+            !home.path().join("Library").exists() && !home.path().join(".local").exists(),
+            "the refusal comes before any mount directory is created"
+        );
+
+        // The same mount with nothing else running.
+        let handle = mount(&request(Vec::new()), &services, fs).expect("mount");
+        assert_eq!(handle.service_class, macfuse);
+        handle.close().expect("close");
+
+        // A vault using the same service is no conflict.
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FakeService::new(fuse_t, true))];
+        let (_second_dir, fs) = test_fs();
+        let handle = mount(&request(vec![fuse_t.to_owned()]), &services, fs).expect("mount");
+        handle.close().expect("close");
+    }
+
+    #[test]
     fn capabilities_are_applied_like_the_desktop_app() {
         let (_vault_dir, fs) = test_fs();
         let mut vault = vault();
@@ -674,6 +755,7 @@ mod tests {
         let recorded = Arc::clone(&service.recorded);
         let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &settings,
             cli: &cli,
@@ -724,6 +806,7 @@ mod tests {
         let recorded = Arc::clone(&service.recorded);
         let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &settings,
             cli: &cli,
@@ -759,6 +842,7 @@ mod tests {
         let recorded = Arc::clone(&service.recorded);
         let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &settings,
             cli: &cli,
@@ -806,6 +890,7 @@ mod tests {
         let setup = null_setup();
         let vault = vault();
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &setup.settings,
             cli: &setup.cli,
@@ -832,12 +917,38 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_directory_that_was_already_there_is_kept() {
+        let setup = null_setup();
+        let vault = vault();
+        // The very same path the mounter would create, but made by the user beforehand.
+        let existing = setup.home.path().join("mnt/My Vault");
+        std::fs::create_dir_all(&existing).expect("mkdir");
+        let req = MountRequest {
+            vault: &vault,
+            settings: &setup.settings,
+            cli: &setup.cli,
+            home: setup.home.path(),
+            overrides: MountOverrides::default(),
+            running_services: Vec::new(),
+        };
+        let handle = mount(&req, &setup.services, Arc::clone(&setup.fs)).expect("mount");
+        assert_eq!(handle.mountpoint(), Mountpoint::Path(existing.clone()));
+        assert!(
+            handle.cleanup.is_none(),
+            "only a directory this mount created is removed again"
+        );
+        handle.close().expect("close");
+        assert!(existing.is_dir(), "the user's directory stays");
+    }
+
+    #[test]
     fn a_mount_point_that_does_not_exist_is_reported_with_its_path() {
         let setup = null_setup();
         let mut vault = vault();
         let missing = setup.home.path().join("nowhere");
         vault.mount_point = Some(missing.to_string_lossy().into_owned());
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &setup.settings,
             cli: &setup.cli,
@@ -857,6 +968,7 @@ mod tests {
         let file = setup.home.path().join("file");
         std::fs::write(&file, b"x").expect("write");
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &setup.settings,
             cli: &setup.cli,
@@ -881,6 +993,7 @@ mod tests {
         std::fs::create_dir_all(&chosen).expect("mkdir");
         vault.mount_point = Some(chosen.to_string_lossy().into_owned());
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &setup.settings,
             cli: &setup.cli,
@@ -907,6 +1020,7 @@ mod tests {
         setup.services = vec![Box::new(NullMountProvider::enabled(true, true))];
         let vault = vault();
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &setup.settings,
             cli: &setup.cli,
@@ -937,6 +1051,7 @@ mod tests {
         service.capabilities = NO_FORCE;
         let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
         let req = MountRequest {
+            running_services: Vec::new(),
             vault: &vault,
             settings: &settings,
             cli: &cli,
