@@ -12,15 +12,24 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// `DirectoryIdLoader.MAX_DIR_ID_LENGTH` (the loader tolerates more than the 36 chars of a UUID).
 pub const MAX_DIR_FILE_LENGTH: u64 = 1000;
 
-/// Caches every directory id it has read; like the mapper's cache there is no expiry, because a
-/// `crypto` process is short-lived (M4 adds one for the long-running daemon).
+/// Caches every directory id it has read. cryptofs caches these forever; a mount runs for days,
+/// so an entry here expires after [`DIR_CACHE_TTL`](super::DIR_CACHE_TTL) like the mapper's, and a
+/// `dir.c9r` a synchronisation client rewrote is picked up at the latest 20 seconds later.
 pub struct DirIdLoader {
     events: EventSink,
-    cache: Mutex<HashMap<PathBuf, String>>,
+    cache: Mutex<HashMap<PathBuf, CachedId>>,
+    clock: super::Clock,
+}
+
+/// One cache entry with the time it was read (`expireAfterWrite`).
+struct CachedId {
+    id: String,
+    loaded: Instant,
 }
 
 impl std::fmt::Debug for DirIdLoader {
@@ -36,17 +45,41 @@ impl DirIdLoader {
         Self {
             events,
             cache: Mutex::new(HashMap::new()),
+            clock: super::Clock::default(),
         }
+    }
+
+    /// Ages every cached id by `d`.
+    #[cfg(test)]
+    pub(crate) fn advance(&self, d: std::time::Duration) {
+        self.clock.advance(d);
     }
 
     /// Reads `dir.c9r`. A missing file yields a fresh random UUID (which is cached, so a later
     /// `create_dir` writes exactly that id); empty or oversized files are broken.
+    ///
+    /// The cache lock is held across the read, so a miss loads exactly once: two threads that race
+    /// on a *missing* `dir.c9r` would otherwise invent two different random UUIDs and one of them
+    /// would create the directory under an id nobody else can find. A `BrokenDirFile` event is
+    /// therefore emitted with the cache locked -- an event sink must not call back into the file
+    /// system (the daemon's only appends to a queue).
     pub fn load(&self, dir_file: &Path) -> io::Result<String> {
-        if let Some(id) = super::lock(&self.cache).get(dir_file) {
-            return Ok(id.clone());
+        let mut cache = super::lock(&self.cache);
+        let now = self.clock.now();
+        if let Some(entry) = cache.get(dir_file) {
+            if super::is_fresh(entry.loaded, now) {
+                return Ok(entry.id.clone());
+            }
         }
         let id = self.load_uncached(dir_file)?;
-        super::lock(&self.cache).insert(dir_file.to_path_buf(), id.clone());
+        cache.retain(|_, entry| super::is_fresh(entry.loaded, now));
+        cache.insert(
+            dir_file.to_path_buf(),
+            CachedId {
+                id: id.clone(),
+                loaded: now,
+            },
+        );
         Ok(id)
     }
 
@@ -83,7 +116,8 @@ impl DirIdLoader {
         super::lock(&self.cache).remove(dir_file);
     }
 
-    /// `DirectoryIdProvider.move`: transfers a cached id to the new dir file path.
+    /// `DirectoryIdProvider.move`: transfers a cached id to the new dir file path (with its load
+    /// time, so a rename does not extend its life).
     pub fn move_id(&self, src: &Path, dst: &Path) {
         let mut cache = super::lock(&self.cache);
         if let Some(id) = cache.remove(src) {
@@ -175,6 +209,30 @@ mod tests {
         loader.delete(&dir_file);
         assert_eq!(loader.load(&dir_file).unwrap(), "changed");
         assert!(events.take().is_empty());
+    }
+
+    #[test]
+    fn cached_ids_expire_after_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = DirIdLoader::new(crate::fs::discard_events());
+        let dir_file = dir.path().join("dir.c9r");
+        std::fs::write(&dir_file, "id-one").unwrap();
+        assert_eq!(loader.load(&dir_file).unwrap(), "id-one");
+        std::fs::write(&dir_file, "id-two").unwrap();
+        loader.advance(crate::fs::DIR_CACHE_TTL / 2);
+        assert_eq!(loader.load(&dir_file).unwrap(), "id-one", "still fresh");
+        loader.advance(crate::fs::DIR_CACHE_TTL);
+        assert_eq!(
+            loader.load(&dir_file).unwrap(),
+            "id-two",
+            "expired, re-read"
+        );
+        // the expired entries of other files leave the map on the next miss
+        loader.advance(crate::fs::DIR_CACHE_TTL);
+        let other = dir.path().join("other.c9r");
+        std::fs::write(&other, "id-other").unwrap();
+        loader.load(&other).unwrap();
+        assert_eq!(crate::fs::lock(&loader.cache).len(), 1);
     }
 
     #[test]

@@ -35,6 +35,42 @@ pub use symlinks::Symlinks;
 use std::fmt::Display;
 use std::io;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+/// `CiphertextDirCache.MAX_CACHE_AGE`: how long a cached directory mapping (and, unlike in
+/// cryptofs, a cached directory id) stays valid. A mount runs for days, so a `dir.c9r` that a
+/// synchronisation client rewrites underneath us must eventually be re-read.
+pub const DIR_CACHE_TTL: Duration = Duration::from_secs(20);
+
+/// The monotonic clock the caches expire against. Production code always reads
+/// [`Instant::now`]; a unit test moves the clock forward with [`Clock::advance`] instead of
+/// sleeping for 20 seconds.
+#[derive(Debug, Default)]
+pub(crate) struct Clock {
+    #[cfg(test)]
+    offset: Mutex<Duration>,
+}
+
+impl Clock {
+    pub(crate) fn now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now.checked_add(*lock(&self.offset)).unwrap_or(now);
+        now
+    }
+
+    /// Moves this clock (and only this one) `d` into the future.
+    #[cfg(test)]
+    pub(crate) fn advance(&self, d: Duration) {
+        let mut offset = lock(&self.offset);
+        *offset = offset.saturating_add(d);
+    }
+}
+
+/// Whether an entry written at `loaded` is still valid at `now` (`expireAfterWrite`).
+pub(crate) fn is_fresh(loaded: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(loaded) < DIR_CACHE_TTL
+}
 
 /// Payload of the `io::Error` a symlink loop produces (`ErrorKind::Other`, because
 /// `ErrorKind::FilesystemLoop` is unstable): downcast the error's inner value to it to recognise

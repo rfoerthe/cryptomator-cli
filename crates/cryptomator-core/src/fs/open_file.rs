@@ -111,6 +111,9 @@ impl ChunkCache {
         v.sort_unstable();
         v
     }
+    fn any_dirty(&self) -> bool {
+        self.chunks.values().any(|c| c.dirty)
+    }
     fn clear(&mut self) {
         self.chunks.clear();
         self.lru.clear();
@@ -429,6 +432,12 @@ impl OpenCryptoFile {
         self.size = new_size;
         self.last_modified = Some(SystemTime::now());
         Ok(())
+    }
+
+    /// Whether [`flush`](Self::flush) would write anything -- an unwritten header or a dirty
+    /// chunk. Always `false` for a read-only file, whose `flush` is a no-op.
+    pub fn is_dirty(&self) -> bool {
+        self.writable && (!self.header_persisted || self.chunks.any_dirty())
     }
 
     /// Persists the header (if new) and every dirty chunk; a no-op for read-only files.

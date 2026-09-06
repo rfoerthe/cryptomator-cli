@@ -392,6 +392,7 @@ dependencies = [
  "data-encoding",
  "getrandom 0.4.3",
  "hmac",
+ "log",
  "proptest",
  "regex",
  "scrypt",

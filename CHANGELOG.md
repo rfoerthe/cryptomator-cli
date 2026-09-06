@@ -108,8 +108,10 @@
      cryptofs resolves them against the vault root.
   2. A vault opened read-only never resolves sync conflicts on disk. cryptofs renames the
      conflicting node anyway; `crypto` reports it as an event and leaves it out of the listing.
-  3. The directory cache has no 20 s expiry (M4 adds it with the daemon) — a CLI process is short
-     lived, and a stale entry cannot outlive it.
+  3. ~~The directory cache has no 20 s expiry~~ — resolved in M4: both the directory mapping cache
+     and the directory id cache expire 20 s after they were loaded (cryptofs' `expireAfterWrite`;
+     the id cache has no expiry in cryptofs, but a mount that runs for days has to notice a
+     `dir.c9r` a sync client rewrote).
   4. `fs mv` never moves *into* an existing directory: the destination is always the complete new
      path, so a typo renames instead of silently filing the source away somewhere.
   5. `.c9s` node directories for shortened names are only created when a file is opened for
@@ -118,7 +120,7 @@
   (Java's `CiphertextDirectoryDeleter` removes it with the other leftovers and leaves a surviving
   directory without its dir id backup), and `bytes_written` counts only the caller's bytes, not the
   zero-filled gap of a sparse write.
-- Not in M3 (the spec assigns them to M4): cache expiry, `.c9u`/`FileIsInUseEvent` creation
+- Not in M3 (the spec assigns them to M4): cache expiry (now shipped, see M4), `.c9u`/`FileIsInUseEvent` creation
   (Hub only) and `fs` access to a mounted vault. `fs`/`name` require state `LOCKED` as recorded in
   the vault directory; a *running* mount cannot be detected yet, and the README says so instead of
   promising a refusal that does not exist.
@@ -184,3 +186,10 @@
   is still exit `10`.
 - A closed pipe is a successful end for every command, not just for the follow streams:
   `crypto vault list | head -3` exits `0` and prints nothing about it.
+- Three core changes a mount that runs for days needs: the directory mapping and directory id
+  caches expire 20 s after a load (cryptofs' `CiphertextDirCache.MAX_CACHE_AGE`, so foreign changes
+  to `dir.c9r` are picked up; the M3 deviation "no dir-cache expiry" is resolved), dropping a
+  `CryptoFs` without calling `close` flushes its open files instead of losing the buffered
+  cleartext, and closing a file handle flushes it with only that file locked, so one slow `close`
+  no longer blocks every other `open`, `rename` or `delete`. A directory id is also loaded under
+  the cache lock now, so two threads racing on a missing `dir.c9r` cannot invent two different ids.

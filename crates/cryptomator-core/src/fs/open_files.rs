@@ -144,6 +144,10 @@ impl OpenCryptoFiles {
     /// Flushes every open file and forgets it. Handles that are still around keep their own file
     /// descriptor and stay usable, so this is for shutting the file system down (unmount), not for
     /// revoking access.
+    ///
+    /// Idempotent: the registry is drained first (even when a flush then fails), so a second call
+    /// finds it empty and flushes nothing. [`CryptoFs::close`](crate::fs::CryptoFs::close) relies
+    /// on that -- its `Drop` runs this again right after it.
     pub fn close_all(&self) -> io::Result<()> {
         let files: Vec<Arc<Mutex<OpenCryptoFile>>> =
             super::lock(&self.files).drain().map(|(_, f)| f).collect();
@@ -249,15 +253,30 @@ impl FileHandle {
         self.release()
     }
 
+    /// Flushing is the slow part -- it encrypts and writes every dirty chunk -- and it runs with
+    /// only this file locked, so a `close()` cannot stall every other `open`, `rename` or `delete`
+    /// on the registry. The lock order stays registry → file: the flush takes the file lock and
+    /// gives it back *before* the registry lock is taken for the bookkeeping.
+    ///
+    /// Between the two steps another thread may `open` the same path (the entry is still in the
+    /// registry) and write to it. That is why the handle count decides: while it is above zero the
+    /// entry stays, and when it reaches zero the dirty flag is re-checked under the file lock, so a
+    /// write that landed after the flush is written out rather than dropped with the entry.
     fn release(&mut self) -> io::Result<()> {
         if self.released {
             return Ok(());
         }
         self.released = true;
+        let mut result = super::lock(&self.file).flush();
         let mut files = super::lock(&self.files);
         let mut file = super::lock(&self.file);
-        let result = file.flush();
         if file.release() == 0 {
+            if file.is_dirty() {
+                let late = file.flush();
+                if result.is_ok() {
+                    result = late;
+                }
+            }
             files.retain(|_, f| !Arc::ptr_eq(f, &self.file));
             let mtime = file.persist_last_modified();
             // a deleted file has no mtime to restore
@@ -331,6 +350,8 @@ mod tests {
     use crate::crypto::rng::DetRng;
     use crate::crypto::stream::decrypt_all;
     use crate::fs::{discard_events, testutil};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn registry(cryptor: Arc<Cryptor>) -> OpenCryptoFiles {
         OpenCryptoFiles::new(
@@ -393,6 +414,103 @@ mod tests {
         assert_eq!(
             decrypt_all(&cryptor, &std::fs::read(&path).unwrap()).unwrap(),
             b"data"
+        );
+    }
+
+    /// Fails the test instead of hanging forever when a lock-order regression deadlocks the
+    /// workers: every worker reports completion, and this waits at most 10 seconds for all of them.
+    fn join_within_10s(workers: Vec<std::thread::JoinHandle<()>>, done: mpsc::Receiver<()>) {
+        for _ in 0..workers.len() {
+            done.recv_timeout(Duration::from_secs(10))
+                .expect("a worker did not finish within 10 s (deadlock?)");
+        }
+        for worker in workers {
+            worker.join().expect("worker panicked");
+        }
+    }
+
+    #[test]
+    fn concurrent_writes_and_releases_on_two_files_do_not_deadlock() {
+        let (dir, cryptor, _) = testutil::new_vault(220);
+        let files = Arc::new(registry(cryptor.clone()));
+        let payload = |round: u32| format!("round {round:04}").into_bytes();
+        let (tx, rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for name in ["a", "b"] {
+            let (files, path, tx) = (files.clone(), dir.path().join(name), tx.clone());
+            workers.push(std::thread::spawn(move || {
+                for round in 0..200u32 {
+                    let options = if round == 0 {
+                        OpenOptions::write_new()
+                    } else {
+                        OpenOptions::read_write()
+                    };
+                    let handle = files.open(&path, options).expect("open");
+                    handle.write_all_at(&payload(round), 0).expect("write");
+                    handle.close().expect("close");
+                }
+                tx.send(()).expect("report");
+            }));
+        }
+        drop(tx);
+        join_within_10s(workers, rx);
+
+        assert_eq!(files.len(), 0, "every entry left the registry");
+        for name in ["a", "b"] {
+            assert_eq!(
+                decrypt_all(&cryptor, &std::fs::read(dir.path().join(name)).unwrap()).unwrap(),
+                payload(199)
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_next_to_a_concurrent_open_of_the_same_path_keeps_the_data() {
+        let (dir, cryptor, _) = testutil::new_vault(220);
+        let files = Arc::new(registry(cryptor.clone()));
+        let path = dir.path().join("shared");
+        let payload = b"the same bytes every round";
+        // start from a complete file, so a reader can always expect the full payload
+        let first = files.open(&path, OpenOptions::write_new()).unwrap();
+        first.write_all_at(payload, 0).unwrap();
+        first.close().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        // one worker rewrites and releases; the entry leaves the registry whenever it wins the race
+        let (w_files, w_path, w_tx) = (files.clone(), path.clone(), tx.clone());
+        workers.push(std::thread::spawn(move || {
+            for _ in 0..300 {
+                let handle = w_files
+                    .open(&w_path, OpenOptions::read_write())
+                    .expect("open for writing");
+                handle.write_all_at(payload, 0).expect("write");
+                handle.close().expect("close");
+            }
+            w_tx.send(()).expect("report");
+        }));
+        // the other opens the same path in between and must never see a half-written file
+        let (r_files, r_path, r_tx) = (files.clone(), path.clone(), tx.clone());
+        workers.push(std::thread::spawn(move || {
+            for _ in 0..300 {
+                let handle = r_files
+                    .open(&r_path, OpenOptions::read_only())
+                    .expect("open for reading");
+                assert_eq!(handle.size(), payload.len() as u64);
+                let mut buf = vec![0u8; payload.len()];
+                handle.read_exact_at(&mut buf, 0).expect("read");
+                assert_eq!(buf, payload, "a concurrent release lost data");
+                handle.close().expect("close");
+            }
+            r_tx.send(()).expect("report");
+        }));
+        drop(tx);
+        join_within_10s(workers, rx);
+
+        assert_eq!(files.len(), 0);
+        assert_eq!(
+            decrypt_all(&cryptor, &std::fs::read(&path).unwrap()).unwrap(),
+            payload
         );
     }
 

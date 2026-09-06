@@ -461,7 +461,12 @@ impl CryptoFs {
         self.symlinks.read_symbolic_link(path)
     }
 
-    /// Flushes and closes every open file.
+    /// Flushes and closes every open file, and reports the first error while doing so.
+    ///
+    /// The `Drop` below runs immediately afterwards and calls the same
+    /// [`OpenCryptoFiles::close_all`], which is idempotent: this one already drained the registry
+    /// (a failing flush included), so the second call finds it empty, flushes nothing and cannot
+    /// turn a reported error into a second, silent one.
     pub fn close(self) -> io::Result<()> {
         self.flush_all()
     }
@@ -477,6 +482,23 @@ impl CryptoFs {
     /// The first error any of the flushes reports; the remaining files are still flushed.
     pub fn flush_all(&self) -> io::Result<()> {
         self.open_files.close_all()
+    }
+}
+
+impl Drop for CryptoFs {
+    /// The safety net under [`CryptoFs::close`]: a mount that ends by dropping its `Arc<CryptoFs>`
+    /// -- a panicking FUSE worker, a daemon that never reaches its own teardown -- must not lose
+    /// the cleartext its callers wrote and this file system still buffers.
+    ///
+    /// A `Drop` cannot return an error, so the first one is logged. After an explicit `close` this
+    /// finds an empty registry and does nothing at all.
+    fn drop(&mut self) {
+        if let Err(err) = self.open_files.close_all() {
+            log::warn!(
+                "flushing the open files of {} failed: {err}",
+                self.vault_path.display()
+            );
+        }
     }
 }
 
@@ -1254,6 +1276,53 @@ mod tests {
         // Unlike `close`, this leaves the file system usable.
         assert_eq!(fs.read_file(&path).unwrap(), b"payload");
         fs.close().unwrap();
+    }
+
+    #[test]
+    fn dropping_the_file_system_flushes_open_files() {
+        let (dir, fs) = test_fs(220, false);
+        let path = CleartextPath::parse("/buffered");
+        let handle = fs.open_file(&path, OpenOptions::write_new()).unwrap();
+        handle.write_all_at(b"payload", 0).unwrap();
+        let ciphertext = fs.ciphertext_path(&path).unwrap();
+        // only the header is on disk so far; the chunk sits in the write buffer
+        let buffered = std::fs::metadata(&ciphertext).unwrap().len();
+
+        drop(fs); // no close(): the Drop is the only thing that can still write the chunk out
+
+        assert!(
+            std::fs::metadata(&ciphertext).unwrap().len() > buffered,
+            "the Drop wrote the dirty chunk out"
+        );
+
+        // reopen the vault: what is on disk must be the complete file
+        let fs2 = reopen(dir.path());
+        assert_eq!(fs2.read_file(&path).unwrap(), b"payload");
+        drop(handle);
+    }
+
+    #[test]
+    fn close_and_the_following_drop_do_not_flush_twice() {
+        let (dir, fs) = test_fs(220, false);
+        let path = CleartextPath::parse("/buffered");
+        let handle = fs.open_file(&path, OpenOptions::write_new()).unwrap();
+        handle.write_all_at(b"payload", 0).unwrap();
+        // close() drains the registry, so the Drop that follows it finds nothing left to flush
+        fs.close().unwrap();
+        let fs2 = reopen(dir.path());
+        assert_eq!(fs2.read_file(&path).unwrap(), b"payload");
+        drop(handle);
+    }
+
+    /// A second `CryptoFs` on the same vault directory, for reading back what a dropped one wrote.
+    fn reopen(vault: &Path) -> CryptoFs {
+        let opened = open_vault_with_key(vault, testutil::masterkey()).unwrap();
+        CryptoFs::with_rng(
+            opened,
+            CryptoFsOptions::default(),
+            Box::new(DetRng::default()),
+            Arc::new(|| Box::new(DetRng::default())),
+        )
     }
 
     #[test]

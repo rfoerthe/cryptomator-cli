@@ -23,6 +23,7 @@ sha2.workspace = true
 scrypt.workspace = true
 aes-kw.workspace = true
 data-encoding.workspace = true
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
