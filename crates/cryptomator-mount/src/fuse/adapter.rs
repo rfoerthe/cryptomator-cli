@@ -552,6 +552,7 @@ mod tests {
             options,
             read_only: false,
             delete_apple_double: false,
+            refuse_apple_double: false,
             max_name_length: 255,
         };
         let ops = Arc::new(VaultOps::new(Arc::new(fs), cfg));

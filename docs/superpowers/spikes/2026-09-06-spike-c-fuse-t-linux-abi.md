@@ -215,6 +215,79 @@ Für die Adapter-Task (Task 6/7) daraus:
    unter `/private/tmp/...`. Wer den Mount-Status per `mount`/`statfs` prüft, darf nicht auf
    `fusefs` als Dateisystemtyp testen. `umount` ohne Sonderrechte genügt.
 
+## E2E-Befunde (Task 8, echter Mount eines Vaults)
+
+Task 8 mountet erstmals einen echten Vault durch den fertigen Provider
+(`crates/cryptomator-mount/tests/mount_e2e.rs`, FUSE-T 1.2.7, macOS 26.6.2). Was dabei über die
+Spike-Beobachtungen hinaus auffiel:
+
+1. **Der Kanal ist ein Stream-Socket — Message-Framing muss der Leser machen.** `SO_TYPE` des von
+   `fuse_mount_compat25` gelieferten Deskriptors ist `SOCK_STREAM` (RCVBUF/SNDBUF je 4 MiB).
+   fuser behandelt jeden `read` als genau einen Request; auf einem Stream-Socket stimmt das in
+   **beide** Richtungen nicht:
+   * **Zu wenig:** FUSE-T schickt einen WRITE als **zwei** `write()`s (`wire: send unique=31
+     opcode=16 … bytes=80` + `wire: send data bytes=4096`). Ein einzelner `read` lieferte nur die
+     ersten 80 Bytes; der Parser sah einen Request ohne Nutzdaten, die Antwort blieb aus, der
+     NFS-Client wartete ~40 s pro Schreibvorgang und die Session war danach tot. Intermittierend,
+     weil die beiden `write()`s meist im Socket-Puffer verschmelzen — bei 10 KiB Nutzlast fiel es
+     nie auf, bei 100 KiB immer.
+   * **Zu viel:** genau dieses Verschmelzen trifft auch **zwei aufeinanderfolgende Requests**. Der
+     Event-Loop beantwortete den ersten und verwarf den zweiten stillschweigend; auf dessen Antwort
+     wartete der Client ewig, der Mount stand. Symptom im E2E-Test: „the mount stopped answering:
+     no result within 30 s“, danach hing der Testprozess in einem unterbrechbaren `U`-State auf dem
+     Mountpoint. Trat in ~1 von 5 Läufen auf und wurde erst durch Wiederholungsläufe sichtbar.
+   Fix im Fork: `Channel::receive_retrying` liefert **genau einen** Request — es liest weiter, bis
+   der Puffer die im `fuse_in_header` angekündigte `len` enthält, und hebt alles darüber hinaus
+   Gelesene in `Channel::spill` für den nächsten Aufruf auf (`vendor/fuser/src/channel.rs`, Tests
+   `session::abi_session_test::a_request_split_across_two_writes_is_read_as_one` und
+   `…::two_requests_that_arrive_in_one_read_are_both_answered`). Auf `/dev/fuse` ist beides ein
+   No-op: dort liefert jeder `read` genau einen vollständigen Request, der Spill-Puffer bleibt leer.
+   **Konsequenz für jeden weiteren Socket-Transport: Message-Framing ist Pflicht — in beide
+   Richtungen.**
+2. **macOS' NFS-Client legt zu jedem neuen Knoten eine AppleDouble-Sidecar-Datei `._<name>` an.**
+   Nach `mkdir docs` folgt sofort ein `Create` von `._docs`, nach jeder Datei ein `._datei`, auch
+   für Symlinks. Ohne Gegenmaßnahme landet für jeden Knoten ein zusätzlicher verschlüsselter
+   Eintrag im Vault. `-ononamedattr` ändert daran nichts (mit **und** ohne die Option identisch);
+   macFUSE verhindert das mit `-onoappledouble` im Kernel, FUSE-T hat kein Gegenstück.
+   Fix im Adapter: `VaultOpsConfig::refuse_apple_double` (bei FUSE-T an) beantwortet
+   `create`/`mkdir`/`symlink`/`rename` auf `._*` mit `EPERM` — derselbe Errno, den macFUSEs
+   Kernel-Extension liefert. Der Client verwirft die Sidecar-Datei und die eigentliche Operation
+   des Nutzers bleibt erfolgreich; der Vault bleibt sauber. `.DS_Store` ist bewusst **nicht**
+   betroffen (das schreibt der Finder für den Nutzer; dafür gibt es den `rmdir`-Sweep).
+   Die Sidecar-Datei wird vom Client übrigens mitgelöscht, wenn ihr Knoten verschwindet — ein
+   `rmdir` eines gerade angelegten Verzeichnisses scheitert also nicht daran.
+3. **`ro` wird akzeptiert.** Ein read-only-Mount (`-o ro` an `fuse_mount_compat25`) erscheint als
+   `fuse-t:/e2e-ro on … (nfs, nodev, nosuid, read-only, mounted by rfoerthe)`; `write(2)` und
+   `mkdir(2)` scheitern mit **EROFS (30)**, Lesen funktioniert. Der Adapter-EROFS bleibt als
+   zweite Verteidigungslinie erhalten.
+4. **Der Mount erscheint asynchron in der Mount-Tabelle.** `fuse_mount_compat25` kehrt zurück,
+   sobald der Server lauscht; das `mount -t nfs` läuft danach. Wer sofort `umount` ruft, bekommt
+   „not currently mounted", die Session läuft weiter und der Mount taucht danach auf. Der E2E-Test
+   wartet deshalb (bis 20 s) auf `is_mountpoint`. Für Task 9/10 heißt das: nach `mount()` erst auf
+   die Mount-Tabelle warten, bevor der Zustand als „gemountet" gemeldet wird.
+5. **Mountpoint-Pfade sind kanonisiert.** Ein Tempdir unter `/var/folders/...` steht als
+   `/private/var/folders/...` in der Tabelle; `mounttab::is_mountpoint` kanonisiert beide Seiten
+   und trifft deshalb.
+6. **NFSv4-Locking wird von FUSE-T nicht implementiert** (`Implement txLockCommon`,
+   `Implement txLocku`, `opReleaseLockowner: implement` im Log, bei jedem Schreibvorgang). Der
+   Client kommt trotzdem klar; Byte-Range-Locks über den Mount sind also nicht zu erwarten.
+7. **Restrauschen wie in Spike C:** `._.`, `.DS_Store`, `.hidden`, `.Spotlight-V100`, `Applications`,
+   `DCIM` werden weiter angefragt und mit `ENOENT` beantwortet; STATFS läuft weiter vor fast jeder
+   Operation. Nach beiden Fixes braucht der komplette E2E-Baum (100 000 Bytes schreiben, lesen,
+   anhängen, umbenennen, Symlink, NFD-Name, unlink, rmdir, zwei Listings, `stat`) **~130 ms**.
+8. **`umount` ohne `-f` genügt weiterhin**, und die Session endet per EOF; `close()` ist seit
+   Task 8 auf zehn Sekunden begrenzt und meldet danach `Busy` statt zu blockieren.
+9. **`umount` direkt nach dem letzten Schreibzugriff meldet sporadisch „filesystem busy“**, obwohl
+   nichts mehr offen ist — der NFS-Client hält den Mount noch einen Moment. Ein paar hundert
+   Millisekunden später klappt derselbe Aufruf. `umount_macos` wiederholt einen `Busy` deshalb bis
+   zu 5 s lang (`UNMOUNT_BUSY_RETRY`), bevor es aufgibt; ein wirklich belegter Mount wird weiterhin
+   als `Busy` gemeldet, nur eben 5 s später.
+10. **Ein `umount` kann im Kernel festhängen** (Prozess-State `U`, nicht per `SIGKILL` zu beenden),
+   wenn der NFS-Server unter dem Mount weg ist — beobachtet als Folgeschaden des stehenden Mounts
+   aus Punkt 1, einmal über zehn Minuten lang. `run_unmount_command` wartet nach dem `kill` deshalb
+   nicht mehr selbst auf das Kind, sondern übergibt es einem Wegwerf-Thread (`reap`); der Aufrufer
+   ist damit auch in diesem Fall nach `UNMOUNT_COMMAND_TIMEOUT` wieder frei.
+
 ## Reproduktion
 
 ```bash

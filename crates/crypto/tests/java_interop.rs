@@ -3,7 +3,11 @@
 use assert_cmd::Command;
 use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions, OpenOptions};
 use cryptomator_core::{open_vault, MasterkeyFileAccess};
+use cryptomator_mount::api::{Mount, MountBuilder, MountError, MountService};
+use cryptomator_mount::mounttab::is_mountpoint;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -368,5 +372,239 @@ fn java_reads_a_tree_written_by_crypto_fs() {
             .iter()
             .any(|e| e["path"] == "/caf\u{e9}.txt"),
         "NFC name"
+    );
+}
+
+// --- the mount cross-check -------------------------------------------------------------------
+//
+// Everything below writes its tree through a real FUSE mount instead of through `CryptoFs`, so
+// the whole stack -- kernel/NFS client, the back end, the FUSE adapter, the core -- is between the
+// test and the ciphertext. The real cryptofs then has to read exactly the same tree.
+
+/// Set to `1` to allow this file to mount a real file system.
+const E2E_ENV: &str = "CRYPTO_E2E_MOUNT";
+/// How long the writing through the mount may take before the mount is taken down and the test
+/// fails, rather than hanging the suite.
+const MOUNT_WORK_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the volume may take to appear in the mount table after `mount()` returned; FUSE-T
+/// mounts its NFS share a moment after handing back the session socket.
+const MOUNT_APPEARS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A live mount that takes itself down whatever happens to the test around it.
+struct TestMount {
+    mount: Option<Box<dyn Mount>>,
+    mountpoint: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl TestMount {
+    fn new(service: &dyn MountService, fs: Arc<CryptoFs>) -> Result<Self, String> {
+        let dir = tempfile::tempdir().map_err(|err| format!("temp dir: {err}"))?;
+        let mountpoint = dir.path().to_path_buf();
+        let mut builder = service.for_file_system(fs);
+        let configure = |builder: &mut Box<dyn MountBuilder>| -> Result<(), MountError> {
+            builder.set_mountpoint(&mountpoint)?;
+            builder.set_mount_flags(&service.default_mount_flags())?;
+            builder.set_volume_name("java-interop")
+        };
+        configure(&mut builder).map_err(|err| format!("configuring the mount: {err}"))?;
+        let mount = builder.mount().map_err(|err| format!("mounting: {err}"))?;
+        let mounted = Self {
+            mount: Some(mount),
+            mountpoint,
+            _dir: dir,
+        };
+        // From here on every failure goes through `Drop`, which unmounts.
+        let deadline = Instant::now() + MOUNT_APPEARS_TIMEOUT;
+        while !is_mountpoint(&mounted.mountpoint) {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{} did not appear in the mount table",
+                    mounted.mountpoint.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(mounted)
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        let mut mount = self.mount.take().ok_or("already released")?;
+        mount.unmount().map_err(|err| format!("unmount: {err}"))?;
+        mount.close().map_err(|err| format!("close: {err}"))?;
+        if is_mountpoint(&self.mountpoint) {
+            return Err(format!("{} is still mounted", self.mountpoint.display()));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TestMount {
+    fn drop(&mut self) {
+        if let Some(mut mount) = self.mount.take() {
+            let _ = mount.unmount_forced();
+            let _ = mount.close();
+        }
+        if is_mountpoint(&self.mountpoint) {
+            let out = std::process::Command::new("umount")
+                .arg("-f")
+                .arg("--")
+                .arg(&self.mountpoint)
+                .output();
+            eprintln!(
+                "cleanup: {} was still mounted, umount -f said {out:?}",
+                self.mountpoint.display()
+            );
+        }
+    }
+}
+
+/// Writes the tree the cross-check is about, on the mount point.
+fn write_tree_through_the_mount(mp: &Path) -> Result<(), String> {
+    let e = |what: &str, err: std::io::Error| format!("{what}: {err}");
+    let long = "n".repeat(200);
+
+    std::fs::create_dir(mp.join("dir")).map_err(|err| e("create_dir dir", err))?;
+    std::fs::create_dir_all(mp.join("dir/deeper/still")).map_err(|err| e("create_dir_all", err))?;
+    std::fs::write(mp.join("dir/small.txt"), b"written through the mount\n")
+        .map_err(|err| e("write small.txt", err))?;
+    std::fs::write(mp.join("dir/deeper/still/deep.txt"), b"deep\n")
+        .map_err(|err| e("write deep.txt", err))?;
+    // Larger than one 32 KiB cleartext chunk, so the ciphertext spans several of them.
+    let big: Vec<u8> = (0..100_000)
+        .map(|i| ((i * 31 + i / 251) % 251) as u8)
+        .collect();
+    std::fs::write(mp.join("dir/big.bin"), &big).map_err(|err| e("write big.bin", err))?;
+    // A name long enough to be stored shortened (`.c9s`), written through the mount.
+    std::fs::write(mp.join(format!("dir/{long}.txt")), b"200 chars\n")
+        .map_err(|err| e("write the long name", err))?;
+    std::os::unix::fs::symlink("small.txt", mp.join("dir/link"))
+        .map_err(|err| e("symlink dir/link", err))?;
+    // Unicode, decomposed as macOS hands it to FUSE; the vault stores it composed.
+    std::fs::write(
+        mp.join("dir/cafe\u{301}.txt"),
+        b"nfd in, nfc in the vault\n",
+    )
+    .map_err(|err| e("write the NFD name", err))?;
+    Ok(())
+}
+
+/// The tree of the previous test, but written through a mounted vault: the real cryptofs must read
+/// it, and its manifest must equal `crypto fs tree --json --hash`.
+#[test]
+#[ignore = "needs Java + Maven and mounts a real FUSE filesystem; run with CRYPTO_E2E_MOUNT=1"]
+fn java_reads_files_written_through_the_mount() {
+    if std::env::var(E2E_ENV).as_deref() != Ok("1") {
+        println!("skipped: {E2E_ENV} is not set to 1");
+        return;
+    }
+    let Some(service) = cryptomator_mount::registry::services()
+        .into_iter()
+        .find(|service| {
+            service.java_class_name() != cryptomator_mount::registry::NULL_MOUNTER_CLASS
+        })
+    else {
+        println!("skipped: no FUSE service supported");
+        return;
+    };
+    println!("service: {}", service.display_name());
+
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    let vault = dir.path().join("mounted-vault");
+    let crypto = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("crypto").unwrap();
+        cmd.env_remove("CRYPTO_SETTINGS_PATH")
+            .env_remove("CRYPTO_MIN_PW_LENGTH")
+            .env("CRYPTO_PASSWORD", "interop-passphrase")
+            .arg("--settings")
+            .arg(&settings)
+            .args(args);
+        cmd
+    };
+    // A masterkey file is needed, so the vault is created by the CLI rather than by `initialize`.
+    crypto(&["vault", "create", "--name", "mounted"])
+        .arg(&vault)
+        .assert()
+        .success();
+
+    {
+        let opened = open_vault(
+            &vault,
+            &MasterkeyFileAccess::new(Vec::new()),
+            "interop-passphrase",
+        )
+        .unwrap();
+        let fs = Arc::new(CryptoFs::open(opened, CryptoFsOptions::default()));
+        let mounted = TestMount::new(service.as_ref(), fs).expect("mount the vault");
+        println!("mounted at {}", mounted.mountpoint.display());
+        for line in String::from_utf8_lossy(
+            &std::process::Command::new("/sbin/mount")
+                .output()
+                .expect("mount(8)")
+                .stdout,
+        )
+        .lines()
+        .filter(|line| line.to_lowercase().contains("fuse"))
+        {
+            println!("mount: {line}");
+        }
+
+        // On a helper thread with a deadline: a mount that stops answering must fail the test,
+        // not hang the suite. The mount is taken down either way.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mp = mounted.mountpoint.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_tree_through_the_mount(&mp));
+        });
+        let written = match rx.recv_timeout(MOUNT_WORK_TIMEOUT) {
+            Ok(result) => result,
+            Err(err) => Err(format!("writing through the mount did not finish: {err}")),
+        };
+        println!("wrote the tree: {written:?}");
+        mounted.finish().expect("unmount");
+        written.expect("the tree was written through the mount");
+    }
+
+    let java = verify_with_java(&vault, "interop-passphrase");
+    let out = crypto(&["--json", "fs", "tree", "mounted", "--hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rust: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        rust, java,
+        "Java manifest differs from crypto fs tree for a vault written through the mount"
+    );
+
+    let entries = java.as_array().unwrap();
+    println!("java manifest: {} entries", entries.len());
+    // `WELCOME.rtf` from `vault create`, plus the nine nodes written through the mount.
+    assert_eq!(entries.len(), 10, "{java}");
+    let entry = |path: &str| {
+        entries
+            .iter()
+            .find(|e| e["path"] == path)
+            .unwrap_or_else(|| panic!("{path} missing from {java}"))
+            .clone()
+    };
+    assert_eq!(entry("/dir")["type"], "dir");
+    assert_eq!(
+        entry("/dir/big.bin")["size"],
+        100_000,
+        "the multi-chunk file"
+    );
+    assert_eq!(entry("/dir/deeper/still/deep.txt")["size"], 5);
+    assert_eq!(entry("/dir/link")["type"], "symlink");
+    entry(&format!("/dir/{}.txt", "n".repeat(200)));
+    // The decomposed name macOS handed FUSE has to be composed in the vault.
+    entry("/dir/caf\u{e9}.txt");
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e["path"].as_str().is_some_and(|p| p.contains("/._"))),
+        "AppleDouble side cars reached the vault: {java}"
     );
 }

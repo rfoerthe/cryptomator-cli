@@ -10,11 +10,12 @@
 use crate::api::{Mount, MountBuilder, MountCapability, MountError, MountService, UnmountError};
 use crate::flags::{current_uid_gid, parse_mount_flags, MountFlags};
 use crate::fuse::macos_dl::LibFuse;
-use crate::fuse::mount::{push_flag, umount_macos, FuseMount};
-use crate::fuse::ops::{VaultOps, VaultOpsConfig};
+use crate::fuse::mount::{
+    macos_mount_options, macos_ops_config, push_flag, umount_macos, FuseMount,
+};
+use crate::fuse::ops::VaultOps;
 use crate::fuse::session::{FuseSessionHandle, Unmounter};
 use crate::registry::FUSE_T_CLASS;
-use crate::transcoder::{FuseNormalization, NameTranscoder};
 use cryptomator_core::fs::CryptoFs;
 use fuser::KernelAbi;
 use std::path::{Path, PathBuf};
@@ -155,33 +156,24 @@ impl MountBuilder for FuseTMountBuilder {
         let flags = MountFlags::from_flags(&self.combined_flags(), uid, gid)?;
         let read_only = flags.read_only || self.read_only;
 
-        // What the mount itself gets: every option the adapter does not handle, plus the volume
-        // name -- FUSE-T puts that in the NFS mount, where the Finder reads it. `uid`/`gid`,
-        // `attr_timeout`, `entry_timeout` and `noappledouble` stay out: this adapter applies them
-        // itself, the way libfuse's high-level API does for Cryptomator.
-        let mut options = flags.passthrough.clone();
-        if let Some(volname) = &flags.adapter.volname {
-            options.push(format!("volname={volname}"));
-        }
+        // What the mount itself gets, and what stays with the adapter: see `macos_mount_options`.
+        let options = macos_mount_options(&flags, read_only);
 
-        let library = LibFuse::load(&FuseTMountProvider::library_path())?;
+        // `Arc`, not a plain value: the closure below has to own a reference for the life of the
+        // session, and this frame has to keep one until the error path is done -- unloading the
+        // library while FUSE-T's threads run inside it would take the process down.
+        let library = Arc::new(LibFuse::load(&FuseTMountProvider::library_path())?);
         let fd = library.mount(&mountpoint, &options)?;
 
         let max_name_length =
             u32::try_from(self.fs.max_cleartext_name_length()).unwrap_or(u32::MAX);
         let ops = Arc::new(VaultOps::new(
             self.fs,
-            VaultOpsConfig {
-                // macOS hands FUSE decomposed names, whatever the vault stores.
-                transcoder: NameTranscoder::new(FuseNormalization::Nfd),
-                options: flags.adapter,
-                read_only,
-                delete_apple_double: true,
-                max_name_length,
-            },
+            macos_ops_config(flags, read_only, max_name_length, true),
         ));
 
         let unmount_target = mountpoint.clone();
+        let keep_loaded = Arc::clone(&library);
         let unmounter: Unmounter = Box::new(move |forced| {
             // Holding the library here keeps it loaded for as long as the session lives: FUSE-T's
             // server threads run inside it, and unloading it under them would take the process
@@ -200,8 +192,12 @@ impl MountBuilder for FuseTMountBuilder {
             Ok(session) => Ok(Box::new(FuseMount::new(session, mountpoint, true))),
             Err(err) => {
                 // The volume is mounted but nothing serves it; leaving it would strand the mount
-                // point.
+                // point. `spawn_from_fd` has already dropped the unmounter and with it one
+                // reference to the library, so `keep_loaded` is what stops `dlclose` from running
+                // while FUSE-T's threads are still inside it -- it is only released once the
+                // volume is gone.
                 let _ = umount_macos(&mountpoint, true);
+                drop(keep_loaded);
                 Err(MountError::Io(err))
             }
         }

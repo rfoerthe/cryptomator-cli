@@ -3,9 +3,10 @@
 Upstream: https://github.com/cberner/fuser (MIT, see LICENSE.md). Vendored because FUSE-T on macOS
 speaks the Linux struct layouts while fuser hard-codes the macFUSE layouts under `target_os = "macos"`.
 
-Patches. All but the last are under `#[cfg(target_os = "macos")]` and change nothing on Linux;
-the EOF patch is unconditional but unreachable on `/dev/fuse`, which never returns a zero-length
-read (see the last bullet):
+Patches. All but the last two are under `#[cfg(target_os = "macos")]` and change nothing on Linux;
+the EOF patch and the request-framing patch are unconditional but inert on `/dev/fuse`, which
+never returns a zero-length read and never splits a request across two reads (see the last two
+bullets):
 - `KernelAbi { Native, Linux }` and `Config.abi: KernelAbi` in `src/mnt/mount_options.rs`
   (`Native` = upstream behaviour, `Linux` = Linux struct layouts), re-exported from `src/lib.rs`.
 - Linux-layout twins `fuse_attr_linux`, `fuse_entry_out_linux`, `fuse_attr_out_linux`,
@@ -39,14 +40,39 @@ read (see the last bullet):
   FUSE-T `umount` announces itself. Covered by
   `src/session.rs::abi_session_test::linux_abi_session_answers_getattr_and_ends_cleanly_on_eof`,
   which runs a whole `KernelAbi::Linux` session over a `socketpair`.
+- `Channel::receive_retrying` returns **exactly one** request (`src/channel.rs`): it keeps reading
+  until the buffer holds the `len` bytes the `fuse_in_header` announces, and keeps whatever was
+  read past that request (`Channel::spill`) for the next call. The caller
+  (`SessionEventLoop::event_loop`) has always treated one read as one request, so both halves are
+  needed to keep that true on a channel without message boundaries.
+  On `/dev/fuse` neither half ever triggers: the device is message oriented and hands out exactly
+  one whole request per `read`, so the first read already satisfies the loop and the spill buffer
+  stays empty -- on Linux nothing changes but one `Mutex` lock on an empty `Vec` per request.
+  FUSE-T's channel is a **stream socket**, and both halves were found by the crypto CLI's mount
+  end-to-end test:
+  - It sends a WRITE as a header write followed by a separate data write, so a single `read` may
+    return only the first 80 bytes of a 4176-byte request. The parser then saw a request without
+    its payload, the peer never got a reply, and the mount stalled for ~40 s per write before the
+    client gave up. Intermittent, because the two writes usually coalesce in the socket buffer.
+  - Conversely, two requests written in quick succession *do* coalesce and arrive in one `read`.
+    The event loop answered the first and dropped the second on the floor; nobody ever replied to
+    it and the volume stalled until the NFS client gave up. Also intermittent -- it took a few
+    end-to-end runs to hit, and it is what a 30 s "the mount stopped answering" looked like.
+  Covered by two tests in `src/session.rs::abi_session_test`, both of which run a whole
+  `KernelAbi::Linux` session over a `socketpair`:
+  `a_request_split_across_two_writes_is_read_as_one` writes a 4 KiB WRITE request in two pieces
+  with a pause in between, and `two_requests_that_arrive_in_one_read_are_both_answered` writes
+  INIT+GETATTR and then three GETATTRs in single `write_all`s and insists on a reply for each.
+  Both peers have a read timeout, so a regression fails rather than hangs.
 
 ## Touched upstream files
 
-Exactly nine files under `src/` differ from the registry source (`diff -qr` against
+Exactly ten files under `src/` differ from the registry source (`diff -qr` against
 `~/.cargo/registry/src/*/fuser-0.18.0/src`), plus one deletion:
 
 | File | Why |
 |---|---|
+| `src/channel.rs` | `Channel::receive_retrying` returns exactly one request: it reassembles one that arrives in several reads and spills what follows it into `Channel::spill` (stream-socket channels) |
 | `src/lib.rs` | `pub use ... KernelAbi`; `#![allow(clippy::io_other_error)]`; dropped the `experimental` module declaration |
 | `src/ll/fuse_abi.rs` | the eight Linux-layout twins + `From` impls; `IntoBytes` on the three request twins (so tests can build wire buffers); five per-item `#[allow(dead_code)]` |
 | `src/ll/mod.rs` | re-exports `ResponseEntry`, `ResponseAttr` and `ResponseCreate` |

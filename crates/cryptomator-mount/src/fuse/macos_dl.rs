@@ -83,9 +83,16 @@ impl LibFuse {
             argv_owned
                 .push(cstring(opt).map_err(|_| MountError::UnsupportedFlag(format!("-o{opt}")))?);
         }
-        let argv: Vec<*const c_char> = argv_owned.iter().map(|arg| arg.as_ptr()).collect();
-        let argc = c_int::try_from(argv.len())
+        let argc = c_int::try_from(argv_owned.len())
             .map_err(|_| MountError::Failed("too many mount options".to_owned()))?;
+        // A C `argv` is NULL-terminated and the terminator is not counted in `argc`; libfuse's
+        // option parser walks the array with `argv[argc]` in a few places, so the sentinel has to
+        // be there even though every caller passes `argc` as well.
+        let argv: Vec<*const c_char> = argv_owned
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
         let args = FuseArgs {
             argc,
             argv: argv.as_ptr(),

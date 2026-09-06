@@ -170,6 +170,7 @@ impl MountBuilder for LinuxFuseMountBuilder {
                 options: flags.adapter.clone(),
                 read_only: flags.read_only,
                 delete_apple_double: false,
+                refuse_apple_double: false,
                 max_name_length,
             },
         ));

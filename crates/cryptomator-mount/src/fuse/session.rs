@@ -216,6 +216,36 @@ impl FuseSessionHandle {
         }
     }
 
+    /// Waits up to ten seconds for the session to end and reports what the event loop returned.
+    ///
+    /// The bounded twin of [`join`](Self::join), for callers that must not hang on a mount whose
+    /// last request never comes back. On a timeout the session stays in its ending state -- the
+    /// helper thread keeps waiting for it, and a later call keeps waiting too -- and this reports
+    /// [`UnmountError::Busy`]. Dropping the handle after either outcome does not block.
+    ///
+    /// The verdict is consumed: a second call on a session that already ended reports `Ok(())`.
+    ///
+    /// # Errors
+    /// [`UnmountError::Io`] with the event loop's error, [`UnmountError::Busy`] on a timeout.
+    pub fn join_bounded(&mut self) -> Result<(), UnmountError> {
+        self.join_within(UNMOUNT_TIMEOUT)
+    }
+
+    /// [`join_bounded`](Self::join_bounded) with the wait spelled out, so the tests need not take
+    /// ten seconds to observe a timeout.
+    fn join_within(&mut self, timeout: Duration) -> Result<(), UnmountError> {
+        self.wait_for_end(timeout);
+        // The placeholder is only observed if the state was `Ended`, whose arm returns without
+        // putting anything back; every other state is restored unchanged.
+        match std::mem::replace(&mut self.session, SessionState::Ended(Ok(()))) {
+            SessionState::Ended(result) => result.map_err(UnmountError::Io),
+            other => {
+                self.session = other;
+                Err(UnmountError::Busy)
+            }
+        }
+    }
+
     /// Waits for the session to end, however long it takes, and reports what the event loop
     /// returned. A clean unmount is `Ok(())` -- including the EOF FUSE-T ends with.
     ///
@@ -323,6 +353,7 @@ mod tests {
             options: AdapterOptions::for_user(501, 20),
             read_only: false,
             delete_apple_double: false,
+            refuse_apple_double: false,
             max_name_length: 255,
         };
         let ops = Arc::new(VaultOps::new(Arc::new(fs), cfg));
@@ -519,7 +550,12 @@ mod tests {
         drop(peer);
         handle.unmount(false).expect("unmount");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        handle.join().expect("the session ended cleanly");
+        handle
+            .join_bounded()
+            .expect("the session ended cleanly, so the bounded wait returns at once");
+        handle
+            .join()
+            .expect("the verdict was consumed by the first wait");
     }
 
     /// A session whose peer never hangs up cannot end: the graceful unmount has to report `Busy`
@@ -545,6 +581,10 @@ mod tests {
             .unmount_within(true, short)
             .expect("a forced unmount does not fail on a busy session");
         assert_eq!(*seen.lock().expect("not poisoned"), vec![false, true]);
+
+        // `FuseMount::close` waits the same bounded way: a session that is still serving is
+        // reported as busy rather than blocking the caller forever.
+        assert!(matches!(handle.join_within(short), Err(UnmountError::Busy)));
 
         drop(peer);
         handle.join().expect("the session ended cleanly");

@@ -737,12 +737,22 @@ mod abi_session_test {
     ) -> Vec<u8> {
         match try_read_reply(peer) {
             Ok(body) => body,
-            Err(error) => match session.take().map(JoinHandle::join) {
-                Some(Ok(Ok(()))) => panic!("no {what} reply ({error}): the session ended early"),
-                Some(Ok(Err(failure))) => panic!("no {what} reply: session failed with {failure}"),
-                Some(Err(_)) => panic!("no {what} reply: the session thread panicked"),
-                None => panic!("no {what} reply: {error}"),
-            },
+            // Only a session that has already ended may be joined here: one that is still running
+            // is blocked waiting for the next request, and joining it would hang the test instead
+            // of failing it.
+            Err(error) if session.as_ref().is_none_or(JoinHandle::is_finished) => {
+                match session.take().map(JoinHandle::join) {
+                    Some(Ok(Ok(()))) => {
+                        panic!("no {what} reply ({error}): the session ended early")
+                    }
+                    Some(Ok(Err(failure))) => {
+                        panic!("no {what} reply: session failed with {failure}")
+                    }
+                    Some(Err(_)) => panic!("no {what} reply: the session thread panicked"),
+                    None => panic!("no {what} reply: {error}"),
+                }
+            }
+            Err(error) => panic!("no {what} reply ({error}): the session never answered"),
         }
     }
 
@@ -760,6 +770,9 @@ mod abi_session_test {
         )
         .expect("socketpair");
         let mut peer = UnixStream::from(theirs);
+        // A reply that never comes has to fail this test rather than hang it.
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
 
         let config = Config {
             abi: KernelAbi::Linux,
@@ -799,6 +812,165 @@ mod abi_session_test {
 
         // Closing the peer is what `umount` does to a FUSE-T session: the session must end with
         // `Ok(())`, not with the "Invalid request" that a zero-length read used to produce.
+        drop(peer);
+        let result = session
+            .take()
+            .expect("session still running")
+            .join()
+            .expect("join");
+        assert!(result.is_ok(), "session ended with {result:?}");
+    }
+
+    /// Two requests that arrive in one `read` have to be answered one after the other.
+    ///
+    /// The other half of the framing problem: FUSE-T's stream socket coalesces requests that are
+    /// written in quick succession, and the event loop treats one read as exactly one request. The
+    /// second request used to be dropped on the floor -- nobody ever answered it, and the volume
+    /// stalled until the NFS client gave up.
+    #[test]
+    fn two_requests_that_arrive_in_one_read_are_both_answered() {
+        let (ours, theirs) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair");
+        let mut peer = UnixStream::from(theirs);
+        // A reply that never comes must fail this test rather than hang it: that is exactly the
+        // symptom the fix is about.
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+
+        let config = Config {
+            abi: KernelAbi::Linux,
+            ..Default::default()
+        };
+        let handle = thread::Builder::new()
+            .name("coalesced-request-test".to_string())
+            .spawn(move || {
+                Session::from_fd(RootDirFs, ours, SessionACL::All, config).and_then(|s| s.run())
+            })
+            .expect("spawn");
+        let mut session = Some(handle);
+
+        // Even the very first read can carry more than one request: INIT and the GETATTR that
+        // follows it arrive together here.
+        let mut both = init_request();
+        both.extend_from_slice(&request(3, 2, &[0u8; 16]));
+        peer.write_all(&both).expect("write init + getattr");
+
+        let init_reply = read_reply(&mut peer, &mut session, "init");
+        assert_eq!(u32_at(&init_reply, 0), 7, "init major");
+        let first = read_reply(&mut peer, &mut session, "the first getattr");
+        assert_eq!(first.len(), ATTR_OUT_PREFIX + ATTR_LINUX);
+
+        // And again once the session is up, with three at once for good measure.
+        let mut three = request(3, 3, &[0u8; 16]);
+        three.extend_from_slice(&request(3, 4, &[0u8; 16]));
+        three.extend_from_slice(&request(3, 5, &[0u8; 16]));
+        peer.write_all(&three).expect("write three getattrs");
+        for nth in ["second", "third", "fourth"] {
+            let reply = read_reply(&mut peer, &mut session, nth);
+            assert_eq!(
+                reply.len(),
+                ATTR_OUT_PREFIX + ATTR_LINUX,
+                "the {nth} getattr was not answered"
+            );
+        }
+
+        drop(peer);
+        let result = session
+            .take()
+            .expect("session still running")
+            .join()
+            .expect("join");
+        assert!(result.is_ok(), "session ended with {result:?}");
+    }
+
+    /// A request that arrives in two pieces has to be reassembled before it is parsed.
+    ///
+    /// FUSE-T's channel is a stream socket and it writes a WRITE request as a header write
+    /// followed by a separate data write. Reading only what the first `read` returned handed the
+    /// parser a request without its payload; the peer then waited forever for a reply.
+    #[test]
+    fn a_request_split_across_two_writes_is_read_as_one() {
+        /// `fuse_write_in`: fh(8) + offset(8) + size(4) + write_flags(4) + lock_owner(8) +
+        /// flags(4) + padding(4).
+        const WRITE_IN: usize = 40;
+        const PAYLOAD: usize = 4096;
+
+        struct WriteFs(std::sync::mpsc::Sender<usize>);
+
+        impl Filesystem for WriteFs {
+            fn write(
+                &self,
+                _req: &Request,
+                _ino: INodeNo,
+                _fh: FileHandle,
+                _offset: u64,
+                data: &[u8],
+                _write_flags: crate::WriteFlags,
+                _flags: crate::OpenFlags,
+                _lock_owner: Option<crate::LockOwner>,
+                reply: crate::ReplyWrite,
+            ) {
+                let _ = self.0.send(data.len());
+                reply.written(data.len() as u32);
+            }
+        }
+
+        let (ours, theirs) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair");
+        let mut peer = UnixStream::from(theirs);
+        // A reply that never comes has to fail this test rather than hang it.
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let (tx, seen) = std::sync::mpsc::channel();
+
+        let config = Config {
+            abi: KernelAbi::Linux,
+            ..Default::default()
+        };
+        let handle = thread::Builder::new()
+            .name("split-request-test".to_string())
+            .spawn(move || {
+                Session::from_fd(WriteFs(tx), ours, SessionACL::All, config).and_then(|s| s.run())
+            })
+            .expect("spawn");
+        let mut session = Some(handle);
+
+        peer.write_all(&init_request()).expect("write init");
+        read_reply(&mut peer, &mut session, "init");
+
+        let mut arg = vec![0u8; WRITE_IN];
+        arg[16..20].copy_from_slice(&(PAYLOAD as u32).to_ne_bytes()); // size
+        arg.extend_from_slice(&vec![0x5au8; PAYLOAD]);
+        let full = request(16, 2, &arg);
+        assert_eq!(full.len(), IN_HEADER + WRITE_IN + PAYLOAD);
+
+        // Exactly what FUSE-T does: header and `fuse_write_in` first, the data in a second write.
+        let (head, data) = full.split_at(IN_HEADER + WRITE_IN);
+        peer.write_all(head).expect("write the request header");
+        // Give the session a chance to wake up on the first part alone, which is the case that
+        // used to break: without a second read it would parse a request with no payload.
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(data).expect("write the request payload");
+
+        let reply = read_reply(&mut peer, &mut session, "write");
+        assert_eq!(u32_at(&reply, 0), PAYLOAD as u32, "bytes written");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5))
+                .expect("the filesystem saw the write"),
+            PAYLOAD,
+            "the whole payload has to reach the filesystem"
+        );
+
         drop(peer);
         let result = session
             .take()

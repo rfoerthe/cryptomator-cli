@@ -59,6 +59,16 @@ pub struct VaultOpsConfig {
     /// Sweep `._*` and `.DS_Store` out of a directory before removing it (macOS providers write
     /// them behind the user's back, like Java's `deleteAppleDoubleFiles`).
     pub delete_apple_double: bool,
+    /// Refuse to create AppleDouble side cars (`._<name>`) at all, with `EPERM`.
+    ///
+    /// macFUSE's `-onoappledouble` is a *kernel* feature: the extension answers those names
+    /// itself and the file system never hears of them. FUSE-T has no such option -- its volume is
+    /// an NFS mount, and macOS' NFS client writes a `._<name>` side car next to **every** node it
+    /// creates. Without this, a vault mounted through FUSE-T fills up with encrypted macOS
+    /// metadata: one `._x` per file, directory and symlink (found by the mount end-to-end test).
+    /// Answering the side car's `create` with `EPERM` -- the errno macFUSE's kernel returns --
+    /// makes the client drop it and leaves the user's own operation untouched.
+    pub refuse_apple_double: bool,
     /// `statfs`' `namelen`: the longest cleartext name the vault accepts.
     pub max_name_length: u32,
 }
@@ -371,9 +381,20 @@ impl VaultOps {
 
     pub fn mkdir(&self, parent: u64, name: &OsStr) -> Result<Attr, Errno> {
         self.assert_writable()?;
+        self.assert_not_apple_double(name)?;
         let path = self.child_of(parent, name)?;
         self.fs.create_dir(&path).map_err(|e| errno_for(&e))?;
         self.attr_for_new_path(&path)
+    }
+
+    /// Rejects an AppleDouble side car when the back end asked for that, see
+    /// [`VaultOpsConfig::refuse_apple_double`]. Every operation that puts a new name into the
+    /// vault goes through this.
+    fn assert_not_apple_double(&self, name: &OsStr) -> Result<(), Errno> {
+        if self.cfg.refuse_apple_double && is_apple_double_sidecar(&name.to_string_lossy()) {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
     }
 
     /// Removes a file or symlink; a directory is `EISDIR` (that is `rmdir`'s job).
@@ -429,6 +450,7 @@ impl VaultOps {
 
     pub fn symlink(&self, parent: u64, link_name: &OsStr, target: &Path) -> Result<Attr, Errno> {
         self.assert_writable()?;
+        self.assert_not_apple_double(link_name)?;
         let path = self.child_of(parent, link_name)?;
         let target = self
             .cfg
@@ -457,6 +479,7 @@ impl VaultOps {
             return Err(Errno::EINVAL);
         }
         self.assert_writable()?;
+        self.assert_not_apple_double(newname)?;
         let src = self.child_of(parent, name)?;
         let dst = self.child_of(newparent, newname)?;
         self.fs
@@ -498,6 +521,7 @@ impl VaultOps {
     /// Creates and opens in one step. `O_EXCL` makes it exclusive (`EEXIST` if the name is
     /// taken); without it an existing file is opened (and truncated for `O_TRUNC`).
     pub fn create(&self, parent: u64, name: &OsStr, flags: OpenFlags) -> Result<Created, Errno> {
+        self.assert_not_apple_double(name)?;
         let path = self.child_of(parent, name)?;
         let options = self.open_options(flags, true)?;
         let handle = self
@@ -760,7 +784,14 @@ fn block_size(raw: impl TryInto<u32>) -> u32 {
 }
 
 fn is_apple_double(name: &str) -> bool {
-    name.starts_with("._") || name == DS_STORE
+    is_apple_double_sidecar(name) || name == DS_STORE
+}
+
+/// An AppleDouble side car, i.e. a name the operating system invents for a node of its own
+/// accord. `.DS_Store` is deliberately not one of them: the Finder writes that on the user's
+/// behalf, and [`VaultOpsConfig::refuse_apple_double`] is about the names nobody asked for.
+fn is_apple_double_sidecar(name: &str) -> bool {
+    name.starts_with("._")
 }
 
 #[cfg(test)]
@@ -783,10 +814,14 @@ mod tests {
     }
 
     fn test_ops(read_only: bool) -> (TempDir, VaultOps) {
-        test_ops_with(read_only, false)
+        test_ops_with(read_only, false, false)
     }
 
-    fn test_ops_with(read_only: bool, delete_apple_double: bool) -> (TempDir, VaultOps) {
+    fn test_ops_with(
+        read_only: bool,
+        delete_apple_double: bool,
+        refuse_apple_double: bool,
+    ) -> (TempDir, VaultOps) {
         let dir = tempfile::tempdir().expect("temp dir");
         let config: VaultConfig = initialize(
             dir.path(),
@@ -811,6 +846,7 @@ mod tests {
             options: AdapterOptions::for_user(501, 20),
             read_only,
             delete_apple_double,
+            refuse_apple_double,
             max_name_length: MAX_NAME_LENGTH,
         };
         (dir, VaultOps::new(Arc::new(fs), cfg))
@@ -1033,7 +1069,7 @@ mod tests {
     #[test]
     fn rmdir_sweeps_apple_double_files_when_configured() {
         for sweep in [false, true] {
-            let (_dir, ops) = test_ops_with(false, sweep);
+            let (_dir, ops) = test_ops_with(false, sweep, false);
             let d = ops.mkdir(1, OsStr::new("d")).expect("mkdir");
             for name in ["._x", ".DS_Store"] {
                 let c = ops
@@ -1054,5 +1090,52 @@ mod tests {
                 assert!(ops.lookup(1, OsStr::new("d")).is_ok());
             }
         }
+    }
+
+    /// What FUSE-T needs: the side cars macOS' NFS client invents never reach the vault. Only
+    /// `._*` is refused -- `.DS_Store` is the Finder acting for the user, and a user may name a
+    /// file that.
+    #[test]
+    fn apple_double_side_cars_are_refused_when_configured() {
+        let (_dir, ops) = test_ops_with(false, false, true);
+        let create = |name: &str| {
+            ops.create(
+                1,
+                OsStr::new(name),
+                OpenFlags(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL),
+            )
+        };
+        assert_eq!(create("._x").unwrap_err(), Errno::EPERM);
+        assert_eq!(ops.mkdir(1, OsStr::new("._d")).unwrap_err(), Errno::EPERM);
+        assert_eq!(
+            ops.symlink(1, OsStr::new("._l"), Path::new("x"))
+                .unwrap_err(),
+            Errno::EPERM
+        );
+
+        // The user's own names are untouched, and so is `.DS_Store`.
+        let real = create("x").expect("a normal file");
+        ops.release(real.fh).expect("release");
+        let store = create(".DS_Store").expect(".DS_Store is the user's business");
+        ops.release(store.fh).expect("release");
+        assert_eq!(
+            ops.rename(1, OsStr::new("x"), 1, OsStr::new("._x"), false, false)
+                .unwrap_err(),
+            Errno::EPERM,
+            "renaming into a side car name is the same thing"
+        );
+        ops.rename(1, OsStr::new("x"), 1, OsStr::new("y"), false, false)
+            .expect("a normal rename");
+
+        // Without the switch the very same names are ordinary files again.
+        let (_dir, plain) = test_ops_with(false, false, false);
+        let created = plain
+            .create(
+                1,
+                OsStr::new("._x"),
+                OpenFlags(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL),
+            )
+            .expect("no refusal configured");
+        plain.release(created.fh).expect("release");
     }
 }
