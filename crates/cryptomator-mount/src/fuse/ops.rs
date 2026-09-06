@@ -35,7 +35,12 @@ const MIN_STATFS_BLOCK_SIZE: u32 = 512;
 /// The `d_ino` reported for a listed entry the inode table does not know yet. `readdir` takes no
 /// reference on the inodes it names, so allocating real ones would leak the table; this number is
 /// only advisory (`ls -i`) and is never handed to a `lookup`.
-const UNKNOWN_INO: u64 = u64::MAX;
+///
+/// The value is libfuse's `FUSE_UNKNOWN_INO`, which the kernel recognises in a plain `readdir`.
+/// It must never appear in a **`readdirplus`** reply: there the inode is the one the kernel caches
+/// for the name, and a placeholder would alias a real file. The adapter answers `READDIRPLUS` with
+/// `ENOSYS` for exactly that reason.
+const UNKNOWN_INO: u64 = 0xffff_ffff;
 /// macOS resource-fork side car; swept with the `._*` files when `delete_apple_double` is set.
 const DS_STORE: &str = ".DS_Store";
 
@@ -218,16 +223,53 @@ impl VaultOps {
         self.inodes.forget(ino, n);
     }
 
-    /// Attributes of an inode; an open handle supplies the size the file has right now.
+    /// Attributes of an inode; an open handle supplies the size the file has right now -- and, for
+    /// a file that was unlinked while it is open, the attributes altogether.
     pub fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<Attr, Errno> {
         let path = self.path_of(ino)?;
-        let attrs = self.fs.symlink_metadata(&path).map_err(|e| errno_for(&e))?;
+        let open = fh.and_then(|fh| self.files.get(fh));
+        let attrs = match self.fs.symlink_metadata(&path) {
+            Ok(attrs) => attrs,
+            // `fstat` on a descriptor whose name is gone must keep working (POSIX): the inode
+            // table hands the path out until the kernel forgets the inode, but nothing is behind
+            // it any more, so only the handle can still describe the file.
+            Err(e) => {
+                return match open {
+                    Some(entry) if is_not_found(&e) => Ok(self.attr_of_open_file(ino, &entry)),
+                    _ => Err(errno_for(&e)),
+                };
+            }
+        };
         let mut attr = self.attr_of(ino, &attrs);
-        if let Some(entry) = fh.and_then(|fh| self.files.get(fh)) {
+        if let Some(entry) = open {
             attr.size = entry.handle.size();
             attr.blocks = attr.size.div_ceil(STAT_BLOCK);
         }
         Ok(attr)
+    }
+
+    /// Attributes synthesised for a file that lost its name while it was open. Everything the
+    /// vault stored went with the directory entry, so the size comes from the handle and the rest
+    /// is the neutral shape of a private temporary file. `nlink` stays 1 rather than the 0 a local
+    /// `fstat` reports: spike C found FUSE-T sensitive to `nlink`, and a 0 buys nothing here.
+    fn attr_of_open_file(&self, ino: u64, entry: &OpenFileEntry) -> Attr {
+        let size = entry.handle.size();
+        let now = SystemTime::now();
+        Attr {
+            ino,
+            size,
+            blocks: size.div_ceil(STAT_BLOCK),
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::RegularFile,
+            perm: 0o600,
+            nlink: 1,
+            uid: self.cfg.options.uid,
+            gid: self.cfg.options.gid,
+            blksize: BLOCK_SIZE,
+        }
     }
 
     /// Truncation and time stamps; `mode`, `uid` and `gid` are accepted and ignored (a vault has
@@ -248,23 +290,28 @@ impl VaultOps {
             self.truncate(&path, fh, size)?;
         }
         if atime.is_some() || mtime.is_some() {
-            self.fs
-                .set_times(&path, mtime.map(resolve_time), atime.map(resolve_time))
-                .map_err(|e| errno_for(&e))?;
+            self.set_times(&path, fh, atime, mtime)?;
         }
         self.getattr(ino, fh)
     }
 
     /// `ftruncate` through the open handle if there is a writable one, `truncate` through a
-    /// short-lived handle otherwise.
+    /// short-lived handle otherwise. A file that was unlinked while it is open has no path left to
+    /// open, so there the handle is the only way -- and a read-only one is `EBADF`.
     fn truncate(&self, path: &CleartextPath, fh: Option<u64>, size: u64) -> Result<(), Errno> {
-        let attrs = self.fs.symlink_metadata(path).map_err(|e| errno_for(&e))?;
-        if attrs.is_dir() {
-            return Err(Errno::EISDIR);
-        }
-        if let Some(entry) = fh.and_then(|fh| self.files.get(fh)) {
+        let open = fh.and_then(|fh| self.files.get(fh));
+        let unlinked = match self.fs.symlink_metadata(path) {
+            Ok(attrs) if attrs.is_dir() => return Err(Errno::EISDIR),
+            Ok(_) => false,
+            Err(e) if open.is_some() && is_not_found(&e) => true,
+            Err(e) => return Err(errno_for(&e)),
+        };
+        if let Some(entry) = open {
             if entry.writable {
                 return entry.handle.truncate(size).map_err(handle_errno_for);
+            }
+            if unlinked {
+                return Err(Errno::EBADF);
             }
         }
         let handle = self
@@ -274,6 +321,33 @@ impl VaultOps {
         let result = handle.truncate(size).map_err(handle_errno_for);
         let closed = handle.close().map_err(|e| errno_for(&e));
         result.and(closed)
+    }
+
+    /// `utimensat` through the path. A file that was unlinked while it is open has no path left,
+    /// so its modification time is kept on the handle instead -- which is what `futimens` on an
+    /// unlinked descriptor does.
+    fn set_times(
+        &self,
+        path: &CleartextPath,
+        fh: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+    ) -> Result<(), Errno> {
+        let Err(e) = self
+            .fs
+            .set_times(path, mtime.map(resolve_time), atime.map(resolve_time))
+        else {
+            return Ok(());
+        };
+        match fh.and_then(|fh| self.files.get(fh)) {
+            Some(entry) if is_not_found(&e) => {
+                if let Some(mtime) = mtime {
+                    entry.handle.set_last_modified(resolve_time(mtime));
+                }
+                Ok(())
+            }
+            _ => Err(errno_for(&e)),
+        }
     }
 
     /// The target of a symlink, in the FUSE peer's normal form.
@@ -638,12 +712,20 @@ fn is_set(flags: OpenFlags, flag: i32) -> bool {
 
 /// Like [`errno_for`], but for the handle layer: it reports "not opened for reading/writing" as
 /// `PermissionDenied`, which the kernel expects as `EBADF` (a wrong descriptor), not `EACCES`.
+///
+/// Only the core's own synthetic errors are re-classified. An error carrying an OS code came from
+/// the operating system, where `EACCES` means exactly `EACCES`, and passes through [`errno_for`].
 fn handle_errno_for(err: io::Error) -> Errno {
-    if err.kind() == io::ErrorKind::PermissionDenied {
+    if err.raw_os_error().is_none() && err.kind() == io::ErrorKind::PermissionDenied {
         Errno::EBADF
     } else {
         errno_for(&err)
     }
+}
+
+/// Whether `err` says "no such file or directory", however the core phrased it.
+fn is_not_found(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOENT)
 }
 
 fn block_size(raw: impl TryInto<u32>) -> u32 {
@@ -839,6 +921,45 @@ mod tests {
         assert!(ro.access(1, AccessFlags::R_OK).is_ok());
         let s = ro.statfs().expect("statfs");
         assert!(s.bsize > 0 && s.namelen == MAX_NAME_LENGTH);
+    }
+
+    #[test]
+    fn unlinked_open_file_keeps_fstat_and_ftruncate_working() {
+        let (_dir, ops) = test_ops(false);
+        let c = ops
+            .create(
+                1,
+                OsStr::new("doomed.txt"),
+                OpenFlags(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL),
+            )
+            .expect("create");
+        assert_eq!(ops.write(c.fh, 0, b"hello").expect("write"), 5);
+        ops.unlink(1, OsStr::new("doomed.txt")).expect("unlink");
+        assert_eq!(
+            ops.lookup(1, OsStr::new("doomed.txt")).unwrap_err(),
+            Errno::ENOENT,
+            "the name is gone"
+        );
+        // `fstat` through the handle still works, and reports what the handle holds.
+        let attr = ops.getattr(c.attr.ino, Some(c.fh)).expect("fstat");
+        assert_eq!((attr.size, attr.kind), (5, FileType::RegularFile));
+        assert_eq!(attr.ino, c.attr.ino);
+        // ... while `stat` on the (forgotten) name does not.
+        assert_eq!(ops.getattr(c.attr.ino, None).unwrap_err(), Errno::ENOENT);
+        // `ftruncate` goes through the handle as well, `futimens` is accepted.
+        let truncated = ops
+            .setattr(c.attr.ino, Some(c.fh), Some(2), None, Some(TimeOrNow::Now))
+            .expect("ftruncate");
+        assert_eq!(truncated.size, 2);
+        assert_eq!(ops.read(c.fh, 0, 10).expect("read"), b"he");
+        ops.release(c.fh).expect("release");
+        assert!(!ops.is_in_use());
+        // Without a handle there is nothing left to describe.
+        assert_eq!(
+            ops.setattr(c.attr.ino, None, Some(1), None, None)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     #[test]
