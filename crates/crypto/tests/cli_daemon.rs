@@ -524,14 +524,43 @@ fn signal(pid: u32, signal: &str) {
     assert!(status.success(), "kill {signal} {pid} failed");
 }
 
-/// Spawns `args` in the sandbox with its three standard streams out of the way.
-fn spawn(fx: &Fixture, args: &[&str]) -> Child {
-    fx.crypto_daemon_cmd(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+/// Spawns `args` in the sandbox with its three standard streams out of the way, wrapped so a
+/// panic before the test itself takes the child down does not leave it running.
+fn spawn(fx: &Fixture, args: &[&str]) -> Reaper {
+    Reaper(
+        fx.crypto_daemon_cmd(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// Guards a foreground daemon's `Child`: `Fixture::drop` (`lock --all --force`) reaps everything
+/// that already published its state files when a test panics, but a panic between `spawn` and the
+/// first `wait_until` -- before the daemon has published anything -- would otherwise leave the
+/// process running with nothing left to find it by. `Drop` here closes that gap.
+struct Reaper(Child);
+
+impl std::ops::Deref for Reaper {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaper {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// The null mount's marker inside the fixture's mount point.
@@ -726,15 +755,16 @@ fn a_busy_volume_is_forced_down_after_the_configured_delay() {
     fx.crypto_daemon(&["config", "set", "forceUnmountOnSignalAfterSecs", "1"])
         .assert()
         .success();
-    let mut child = fx
-        .crypto_daemon_cmd(&["unlock", "u", "--mounter", "null", "--foreground"])
-        // The graceful unmount of this volume fails; only the forced one gets through.
-        .env("CRYPTO_NULL_MOUNT_BUSY", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = Reaper(
+        fx.crypto_daemon_cmd(&["unlock", "u", "--mounter", "null", "--foreground"])
+            // The graceful unmount of this volume fails; only the forced one gets through.
+            .env("CRYPTO_NULL_MOUNT_BUSY", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     wait_until("the foreground daemon to mount", || {
         fx.state_file(".json").exists()
     });
@@ -750,6 +780,11 @@ fn a_busy_volume_is_forced_down_after_the_configured_delay() {
     assert!(
         took >= Duration::from_secs(1),
         "the forced unmount waits out forceUnmountOnSignalAfterSecs first, took {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "a regression that ignored forceUnmountOnSignalAfterSecs would flake against \
+         wait_for_exit's 10s deadline instead of failing cleanly, took {took:?}"
     );
     assert!(
         !fx.state_file(".json").exists(),

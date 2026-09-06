@@ -3,7 +3,7 @@
 //! The numbers come from the daemon over its control socket, so the vault has to be unlocked --
 //! a locked one has nobody to ask, which is a state error (exit code 5), not an empty result.
 use crate::cli::StatsArgs;
-use crate::commands::{daemon_gone, install_interrupt, unlocked_vault, vault_label, Ctx};
+use crate::commands::{install_interrupt, stream_ended, unlocked_vault, vault_label, Ctx};
 use crate::exit;
 use crate::output::{is_broken_pipe, write_line};
 use anyhow::Result;
@@ -43,11 +43,11 @@ pub fn stats(ctx: &Ctx, args: StatsArgs) -> Result<u8> {
     while !interrupted.load(Ordering::Relaxed) {
         let stats = match client.stats() {
             Ok(stats) => stats,
-            // The daemon went away -- the vault was locked, auto-locked or signalled while this
-            // loop was watching it. After at least one sample that is how a follow stream ends,
-            // not a failure; before the first one nothing was ever delivered and the daemon being
-            // unreachable is the honest answer (exit code 10).
-            Err(err) if samples > 0 && daemon_gone(&err) => return Ok(exit::OK),
+            // The daemon went away, or answered from mid-teardown (`NOT_UNLOCKED`, `Phase::Locking`)
+            // -- the vault was locked, auto-locked or signalled while this loop was watching it.
+            // After at least one sample that is how a follow stream ends, not a failure; before the
+            // first one nothing was ever delivered and the daemon's answer is the honest one.
+            Err(err) if samples > 0 && stream_ended(&err) => return Ok(exit::OK),
             Err(err) => return Err(err.into()),
         };
         let line = if ctx.out.json {

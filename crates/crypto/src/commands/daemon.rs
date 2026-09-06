@@ -46,6 +46,9 @@ pub fn config(ctx: &Ctx, vault_id: &str, log_file: Option<PathBuf>) -> Result<Da
         stats_interval: STATS_INTERVAL,
         autolock_tick: Duration::from_secs(autolock_tick_secs()),
         log_file,
+        // The detached daemon has no terminal; `crypto unlock --foreground` adds its own notice
+        // that writes to this process's stderr, see `commands::unlock::serve_in_foreground`.
+        notice: None,
     })
 }
 

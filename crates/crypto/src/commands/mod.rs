@@ -16,7 +16,7 @@ pub mod vault;
 use crate::output::Output;
 use anyhow::Result;
 use cryptomator_app::settings::{resolve_vault_index, SettingsStore, VaultSettingsJson};
-use cryptomator_app::{AppError, RuntimeState, StateDir, VaultInfo, VaultRegistry};
+use cryptomator_app::{AppError, ErrorBody, RuntimeState, StateDir, VaultInfo, VaultRegistry};
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -72,6 +72,19 @@ pub fn daemon_gone(err: &AppError) -> bool {
     matches!(err, AppError::DaemonUnreachable(_))
 }
 
+/// Whether `err` is the honest end of a `--follow` stream rather than a failure of it.
+///
+/// [`daemon_gone`] covers the socket disappearing entirely, but `crypto stats --follow` can also
+/// land its next poll while the daemon is still there and mid-teardown (`Phase::Locking`): it
+/// answers `NOT_UNLOCKED` right up until the socket itself goes away. Both are the same event --
+/// the vault was locked, auto-locked or signalled while the stream was watching it -- just caught
+/// at different points of the daemon's shutdown, so both end the stream the same way (after at
+/// least one sample was ever delivered; see the call sites).
+pub fn stream_ended(err: &AppError) -> bool {
+    daemon_gone(err)
+        || matches!(err, AppError::DaemonError { code, .. } if code == ErrorBody::NOT_UNLOCKED)
+}
+
 /// How a vault is named in a message to the user: its display name, or its id when it has none.
 pub fn vault_label(info: &VaultInfo) -> &str {
     info.display_name.as_deref().unwrap_or(&info.id)
@@ -113,4 +126,32 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
 
 pub fn locked_vault_path(ctx: &Ctx, reference: &str) -> Result<PathBuf> {
     locked_vault(ctx, reference).map(|(_, path)| path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_ended_matches_a_gone_daemon() {
+        assert!(stream_ended(&AppError::DaemonUnreachable(
+            "connection refused".to_string()
+        )));
+    }
+
+    #[test]
+    fn stream_ended_matches_not_unlocked() {
+        assert!(stream_ended(&AppError::DaemonError {
+            code: ErrorBody::NOT_UNLOCKED.to_string(),
+            message: "vault is locking".to_string(),
+        }));
+    }
+
+    #[test]
+    fn stream_ended_does_not_match_other_daemon_errors() {
+        assert!(!stream_ended(&AppError::DaemonError {
+            code: ErrorBody::MOUNT_FAILED.to_string(),
+            message: "mount failed".to_string(),
+        }));
+    }
 }

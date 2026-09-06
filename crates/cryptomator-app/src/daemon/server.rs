@@ -79,6 +79,9 @@ const EVENT_BUFFER_CAPACITY: usize = 1000;
 /// The mode of the control socket: only its owner may talk to the daemon.
 const SOCKET_MODE: u32 = 0o600;
 
+/// A callback told about a notice-worthy event as one line of text; see [`DaemonConfig::notice`].
+pub type NoticeFn = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Everything one daemon needs to know before it starts.
 pub struct DaemonConfig {
     /// The vault's id in `settings.json`; it names the state files and the socket.
@@ -107,6 +110,14 @@ pub struct DaemonConfig {
     /// Where to write the daemon's log, or `None` to leave the process's logger alone (tests, and
     /// anything embedding the daemon).
     pub log_file: Option<PathBuf>,
+    /// Told about it once a graceful unmount fails and the daemon is about to wait out
+    /// [`DaemonConfig::force_unmount_after`] before forcing it.
+    ///
+    /// The daemon itself has no terminal -- a detached daemon's stderr goes nowhere anybody is
+    /// watching, so this stays `None` for one. `crypto unlock --foreground` is the one caller with
+    /// a terminal in front of it, and passes a closure that writes to its stderr, so the person who
+    /// just sent the first signal learns there is a wait ahead and a second signal skips it.
+    pub notice: Option<NoticeFn>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -126,6 +137,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("autolock_tick", &self.autolock_tick)
             .field("force_unmount_after", &self.force_unmount_after)
             .field("log_file", &self.log_file)
+            .field("notice", &self.notice.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -136,6 +148,14 @@ impl std::fmt::Debug for DaemonConfig {
 /// [`DaemonConfig::force_unmount_after`], forcefully -- the file system is closed and the state
 /// files are gone. `shutdown` is the flag a signal handler sets; the daemon notices it within
 /// [`POLL_INTERVAL`] and then runs exactly the teardown a `lock` request runs.
+///
+/// `shutdown` is re-armed to `false` the moment its first `true` has taken effect -- once the
+/// accept loop has stopped accepting new connections because of it. From then on the flag turning
+/// `true` again can only be a *second* signal, and the forced-unmount wait a busy volume runs
+/// (inside [`shutdown_sequence`]) treats exactly that as "force it now": it polls the flag every
+/// [`POLL_INTERVAL`] instead of sleeping through the whole [`DaemonConfig::force_unmount_after`],
+/// so a second Ctrl-C (or `kill`, or `SIGHUP`) does not sit out a wait that can run for as long as
+/// `cli.forceUnmountOnSignalAfterSecs` says.
 ///
 /// This function never calls `std::process::exit` -- the CLI (`crypto unlock --foreground`, the
 /// detached daemon's `main`) turns the returned error into an exit code.
@@ -199,6 +219,11 @@ fn run_daemon_with_hook(
 
     let outcome = accept_loop(&shared, &listener);
     shared.request_stop();
+    // Re-arms the external flag now that its first `true` has done its job (the accept loop has
+    // already stopped because of it, or because of an internal stop that leaves this a no-op): a
+    // signal that fires from here on sets it fresh, and `shutdown_sequence`'s forced-unmount wait
+    // reads that as a second signal asking to escalate right now. See `run_daemon`'s docs.
+    shared.external_shutdown.store(false, Ordering::Relaxed);
     drop(listener);
     // The workers first: the auto-lock thread may be in the middle of an unmount, and the
     // teardown must see the state it leaves behind, not the state halfway through it.
@@ -590,7 +615,7 @@ fn unlock(
     if let Err(err) = shared.files.write_info(&info) {
         // Nothing may stay mounted that the CLI cannot find again, so this is the full escalation
         // the teardown does -- graceful, then forced.
-        if let Some(failure) = release_mount(handle, true, shared.config.force_unmount_after) {
+        if let Some(failure) = release_mount(handle, true, shared) {
             log::error!("cannot unmount after a failed run info: {}", failure.error);
             if let Some(handle) = failure.handle {
                 // The volume is still there. It goes back into the state -- together with the file
@@ -748,7 +773,7 @@ fn shutdown_sequence(shared: &Arc<Shared>) -> Option<AppError> {
     if let Some(handle) = handle {
         // The mount is out of the shared state, so the wait for a forced unmount blocks nothing
         // but this teardown.
-        if let Some(failure) = release_mount(handle, true, shared.config.force_unmount_after) {
+        if let Some(failure) = release_mount(handle, true, shared) {
             // The daemon is on its way out; there is nobody left to hand the handle back to.
             log::error!(
                 "cannot unmount {}: {}",
@@ -761,6 +786,11 @@ fn shutdown_sequence(shared: &Arc<Shared>) -> Option<AppError> {
             if failure.handle.is_some() {
                 stuck = Some(failure.error);
             }
+            // Explicit, not incidental: a real FUSE `MountHandle` unmounts its `BackgroundSession`
+            // on drop, and this process is on its way out either way, so dropping it here -- right
+            // before `close_fs` below closes the file system it served -- is deliberate rather than
+            // something that happens to fall out of scope.
+            drop(failure.handle);
         }
     }
     let fs = shared.lock_state().fs.take();
@@ -800,7 +830,8 @@ struct ReleaseFailure {
 }
 
 /// Unmounts `handle` and releases it. With `retry_forced` a failed graceful unmount is retried
-/// forcefully after `force_after`, if the service has a forced unmount at all.
+/// forcefully after [`DaemonConfig::force_unmount_after`], if the service has a forced unmount at
+/// all.
 ///
 /// Returns [`None`] when the volume is down and released, and a [`ReleaseFailure`] carrying
 /// [`AppError::UnmountFailed`] otherwise -- with the handle while the volume is still mounted,
@@ -809,7 +840,7 @@ struct ReleaseFailure {
 fn release_mount(
     mut handle: MountHandle,
     retry_forced: bool,
-    force_after: Duration,
+    shared: &Arc<Shared>,
 ) -> Option<ReleaseFailure> {
     if let Err(error) = handle.unmount(false) {
         if !retry_forced || !handle.supports_forced {
@@ -818,8 +849,15 @@ fn release_mount(
                 error,
             });
         }
+        let force_after = shared.config.force_unmount_after;
         log::warn!("graceful unmount failed ({error}); forcing it in {force_after:?}");
-        std::thread::sleep(force_after);
+        if let Some(notice) = &shared.config.notice {
+            notice(&format!(
+                "unmount busy; forcing in {}s (press Ctrl-C again to force now)",
+                force_after.as_secs()
+            ));
+        }
+        wait_or_escalate(shared, force_after);
         if let Err(error) = handle.unmount(true) {
             return Some(ReleaseFailure {
                 handle: Some(handle),
@@ -831,6 +869,27 @@ fn release_mount(
         handle: None,
         error,
     })
+}
+
+/// Waits out `force_after` before a forced unmount, in [`POLL_INTERVAL`] slices so a second
+/// shutdown signal ends the wait early instead of being sat out.
+///
+/// `run_daemon` re-arms `Shared::external_shutdown` to `false` the moment the first signal that
+/// got the daemon this far has taken effect (see its docs), so the flag reading `true` here can
+/// only be a fresh signal -- there is no internal-stop case to confuse it with, since an internal
+/// stop (`lock`, auto-lock) never sets this flag at all.
+fn wait_or_escalate(shared: &Arc<Shared>, force_after: Duration) {
+    let deadline = Instant::now() + force_after;
+    loop {
+        if shared.external_shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::sleep(remaining.min(POLL_INTERVAL));
+    }
 }
 
 /// Flushes and closes the file system.
@@ -1579,12 +1638,33 @@ mod tests {
             )
         }
 
-        /// Starts a daemon over a freshly initialised vault, picking from `services`;
-        /// `settings` gets to change the vault's entry before it is saved.
+        /// [`Daemon::start_full`] with the 10 ms `force_unmount_after` every other test needs and
+        /// no notice callback.
         fn start_with(
             services: Vec<Box<dyn MountService>>,
             timeouts: (Duration, Duration),
             stats_interval: Duration,
+            settings: impl FnOnce(&mut VaultSettingsJson),
+        ) -> Self {
+            Self::start_full(
+                services,
+                timeouts,
+                stats_interval,
+                Duration::from_millis(10),
+                None,
+                settings,
+            )
+        }
+
+        /// Starts a daemon over a freshly initialised vault, picking from `services`;
+        /// `settings` gets to change the vault's entry before it is saved.
+        #[allow(clippy::too_many_arguments)]
+        fn start_full(
+            services: Vec<Box<dyn MountService>>,
+            timeouts: (Duration, Duration),
+            stats_interval: Duration,
+            force_unmount_after: Duration,
+            notice: Option<NoticeFn>,
             settings: impl FnOnce(&mut VaultSettingsJson),
         ) -> Self {
             // `tempfile` builds below `std::env::temp_dir()`, which keeps the socket path inside
@@ -1629,10 +1709,11 @@ mod tests {
                 unlock_timeout,
                 stats_interval,
                 autolock_tick,
-                force_unmount_after: Duration::from_millis(10),
+                force_unmount_after,
                 // The `log` crate allows one logger per process and the test binary shares one,
                 // so the daemons under test write no log file.
                 log_file: None,
+                notice,
             };
 
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -1727,6 +1808,7 @@ mod tests {
             autolock_tick: Duration::from_secs(3600),
             force_unmount_after: Duration::from_millis(10),
             log_file: None,
+            notice: None,
         }
     }
 
@@ -2182,6 +2264,53 @@ mod tests {
         assert!(
             daemon.mount_dir.is_dir(),
             "the mount directory of a volume that is still mounted stays too"
+        );
+    }
+
+    #[test]
+    fn a_second_signal_escalates_a_stuck_unmount_immediately() {
+        let notices: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&notices);
+        // A generous 5s `force_unmount_after`: if the second signal below did not shorten the
+        // wait, this test would still be sitting it out well past the 2s deadline it asserts.
+        let daemon = Daemon::start_full(
+            vec![Box::new(NullMountProvider::enabled(true, true))],
+            (DEADLINE, Duration::from_secs(3600)),
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            Some(Box::new(move |message: &str| {
+                recorder
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(message.to_owned());
+            })),
+            |_| {},
+        );
+        let mut client = daemon.client();
+        client.call(unlock_request(&encoded(KEY))).expect("unlock");
+
+        let started = Instant::now();
+        // Exactly what the first signal does: set the flag, nothing else.
+        daemon.shutdown.store(true, Ordering::SeqCst);
+        // Gives the accept loop time to notice the first signal and re-arm the flag (see
+        // `run_daemon`'s docs) before the second one below, so that one lands as a fresh `true`
+        // instead of being folded into the first.
+        std::thread::sleep(Duration::from_millis(200));
+        daemon.shutdown.store(true, Ordering::SeqCst);
+
+        assert!(
+            daemon.wait().is_ok(),
+            "the forced unmount gets the volume down"
+        );
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(2),
+            "a second signal should skip the 5s wait instead of sitting it out, took {took:?}"
+        );
+        assert_eq!(
+            *notices.lock().unwrap_or_else(PoisonError::into_inner),
+            vec!["unmount busy; forcing in 5s (press Ctrl-C again to force now)".to_owned()],
+            "the notice fires exactly once, when the graceful unmount first fails"
         );
     }
 }

@@ -204,7 +204,7 @@ fn spawn_daemon(
 
 /// Serves the vault in this process (`--foreground`): the daemon runs on a thread, the main
 /// thread does the same handshake a detached unlock does and then waits for the daemon to end.
-/// SIGINT and SIGTERM set the same flag `crypto lock` triggers over the socket.
+/// SIGINT, SIGTERM and SIGHUP set the same flag `crypto lock` triggers over the socket.
 fn serve_in_foreground(
     ctx: &Ctx,
     vault: &VaultSettingsJson,
@@ -212,7 +212,11 @@ fn serve_in_foreground(
     request: Request,
     args: &UnlockArgs,
 ) -> Result<u8> {
-    let config = daemon::config(ctx, &vault.id, Some(files.log.clone()))?;
+    let mut config = daemon::config(ctx, &vault.id, Some(files.log.clone()))?;
+    // Unlike the detached daemon, this process has the terminal the signal came from -- so a
+    // stuck unmount's wait gets a line on its stderr instead of only the log file nobody is
+    // watching while it happens.
+    config.notice = Some(Box::new(|message: &str| eprintln!("{message}")));
     let shutdown = daemon::install_signal_flag()?;
     let flag = Arc::clone(&shutdown);
     let served = std::thread::Builder::new()
@@ -320,12 +324,22 @@ fn reveal(mountpoint: &str, mounter: Option<&str>) {
     let Some((program, args)) = argv.split_first() else {
         return;
     };
-    let _ = Command::new(program)
+    let child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+    if let Ok(child) = child {
+        // Detached this process exits right away and nothing collects the opener; under
+        // `--foreground` this process keeps running and, without a `wait`, so would the opener as
+        // a zombie. A detached thread that only waits on it is enough either way -- the exit
+        // status is not interesting, since a failed opener was already ignored above.
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    }
 }
 
 /// What [`reveal`] runs, mount point last, or [`None`] when there is nothing to open.

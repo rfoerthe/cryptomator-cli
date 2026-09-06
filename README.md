@@ -104,7 +104,8 @@ environment or a file. The daemon writes its socket, pid, run info and log into 
 ### Signals
 
 A daemon — detached or `--foreground` — stops on **SIGINT** (Ctrl-C), **SIGTERM** (plain `kill`) and
-**SIGHUP** (the terminal went away). All three do exactly what `crypto lock <VAULT>` does:
+**SIGHUP** (the terminal went away). All three run the same teardown, escalating the way
+`crypto lock --force` would:
 
 1. unmount the volume gracefully;
 2. if that fails because the volume is busy, wait `forceUnmountOnSignalAfterSecs` (`cli.json`,
