@@ -246,27 +246,47 @@ fn assert_name_fits(fs: &CryptoFs, path: &CleartextPath) -> FsResult<()> {
     let Some(name) = path.file_name() else {
         return Ok(());
     };
-    // Characters, not bytes -- the same measure `CryptoFs::assert_cleartext_name_length_allowed`
-    // uses, which mirrors Java's `String.length()` for BMP names.
-    if name.chars().count() > fs.max_cleartext_name_length() {
-        return Err(FsError::PathTooLong);
+    // Calls the vault's own policy (`CryptoFs::check_cleartext_name`) rather than
+    // re-implementing it, so the two cannot silently drift apart; its only failure is
+    // `InvalidInput`, which becomes the more specific 414 here.
+    match fs.check_cleartext_name(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Err(FsError::PathTooLong),
+        Err(e) => Err(fs_error(&e)),
     }
-    Ok(())
 }
 
+/// The largest gap [`CryptoDavFile::write_bytes`] will zero-fill before answering
+/// [`FsError::TooLarge`] instead of writing it.
+const MAX_SPARSE_GAP: u64 = 256 * 1024 * 1024;
+
 /// One open file. `dav-server` drives it with `seek`, `read_bytes`, `write_bytes`/`write_buf` and
-/// `flush`; the handle is shared with the blocking pool through an `Arc`, and the last `Arc` to go
-/// flushes and closes the file ([`FileHandle`]'s own `Drop`), so a client that disconnects without
-/// a final `flush` still does not lose what it wrote.
+/// `flush`; the handle is shared with the blocking pool through an `Arc`.
 ///
 /// The cursor lives here rather than in the core: [`FileHandle`] is a positional API, so every
 /// read and write names its own offset and no lock is ever held across an `.await`.
+///
+/// Dropping a [`FileHandle`] runs its own `Drop` -- a flush of every dirty chunk, then the
+/// registry-wide mutex `CryptoFs` serialises `open`/`rename`/`delete` on -- which is why the field
+/// is an `Option`: [`CryptoDavFile`]'s own `Drop` takes it out and moves it onto the blocking pool
+/// so a client that disconnects without a final `flush` neither loses what it wrote nor runs that
+/// work on the async reactor. See that `Drop` impl for why the option matters.
 #[derive(Debug)]
 pub struct CryptoDavFile {
     fs: Arc<CryptoFs>,
     path: CleartextPath,
-    handle: Arc<FileHandle>,
+    handle: Option<Arc<FileHandle>>,
     position: u64,
+}
+
+impl CryptoDavFile {
+    /// The handle, for any method that still has access to `self` -- i.e. everything before
+    /// `Drop` takes it. `None` here would mean a method ran after `Drop`, which cannot happen
+    /// through the trait; answering [`FsError::GeneralFailure`] rather than panicking keeps that
+    /// true even if a future refactor gets it wrong.
+    fn handle(&self) -> FsResult<Arc<FileHandle>> {
+        self.handle.clone().ok_or(FsError::GeneralFailure)
+    }
 }
 
 impl DavFile for CryptoDavFile {
@@ -291,27 +311,40 @@ impl DavFile for CryptoDavFile {
     }
 
     fn write_bytes(&mut self, buf: bytes::Bytes) -> FsFuture<'_, ()> {
-        let handle = Arc::clone(&self.handle);
+        let handle = self.handle();
         let position = self.position;
         let len = buf.len() as u64;
         Box::pin(async move {
-            // A position beyond EOF is not an error: the core zero-fills the gap, which is what a
-            // `Content-Range` PUT into a fresh file needs.
+            let handle = handle?;
+            // A position beyond EOF is not an error by itself: the core zero-fills the gap, which
+            // is what a `Content-Range` PUT into a fresh file needs. But the gap's size is a
+            // client-chosen `Content-Range`/`X-Update-Range` offset, and this server has no
+            // authentication (see `webdav::mod`), so an unbounded gap would let any local process
+            // make it encrypt and write terabytes of ciphertext from a handful of request bytes.
+            // Java and the FUSE adapter both zero-fill without a limit -- a syscall or a local API
+            // call already implies some trust in the caller -- but a WebDAV request does not carry
+            // the same assumption, so this is a deliberate deviation from parity with them rather
+            // than an oversight.
             blocking(move || {
+                let size = handle.size();
+                if position.saturating_sub(size) > MAX_SPARSE_GAP {
+                    return Err(FsError::TooLarge);
+                }
                 handle
                     .write_all_at(&buf, position)
                     .map_err(|e| fs_error(&e))
             })
             .await?;
-            self.position += len;
+            self.position = self.position.saturating_add(len);
             Ok(())
         })
     }
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, bytes::Bytes> {
-        let handle = Arc::clone(&self.handle);
+        let handle = self.handle();
         let position = self.position;
         Box::pin(async move {
+            let handle = handle?;
             let data = blocking(move || {
                 let mut buf = vec![0u8; count];
                 let mut filled = 0;
@@ -331,14 +364,15 @@ impl DavFile for CryptoDavFile {
             // `handle_gethead` streams a range with repeated `read_bytes` calls and no `seek` in
             // between, so the cursor has to advance here; at or past EOF it stays put and the
             // answer is an empty `Bytes`, never an error.
-            self.position += data.len() as u64;
+            self.position = self.position.saturating_add(data.len() as u64);
             Ok(bytes::Bytes::from(data))
         })
     }
 
     fn seek(&mut self, pos: io::SeekFrom) -> FsFuture<'_, u64> {
-        let handle = Arc::clone(&self.handle);
+        let handle = self.handle();
         Box::pin(async move {
+            let handle = handle?;
             let size = blocking(move || Ok(handle.size())).await?;
             // `i128` so that `size + offset` cannot wrap for any `u64`/`i64` pair.
             let target = match pos {
@@ -355,8 +389,32 @@ impl DavFile for CryptoDavFile {
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
-        let handle = Arc::clone(&self.handle);
-        Box::pin(async move { blocking(move || handle.flush().map_err(|e| fs_error(&e))).await })
+        let handle = self.handle();
+        Box::pin(async move {
+            let handle = handle?;
+            blocking(move || handle.flush().map_err(|e| fs_error(&e))).await
+        })
+    }
+}
+
+impl Drop for CryptoDavFile {
+    /// Releasing the last `Arc<FileHandle>` flushes every dirty chunk and then takes the
+    /// registry-wide mutex `CryptoFs` serialises `open`/`rename`/`delete` on ([`FileHandle`]'s own
+    /// `Drop`, via `release()`). Doing that inline here -- e.g. because a client disconnected
+    /// mid-PUT without a final `flush` -- would run disk I/O and lock contention on the async
+    /// runtime's own thread, stalling every other request. Moving it onto `tokio`'s blocking pool
+    /// keeps the reactor free; there is no pool to move it onto once the runtime has already shut
+    /// down, so then the drop just runs inline, on whatever thread is dropping this value.
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || drop(handle));
+            }
+            Err(_) => drop(handle),
+        }
     }
 }
 
@@ -373,7 +431,12 @@ impl DavFileSystem for CryptoDavFs {
         Box::pin(async move {
             let path = parsed?;
             let file = blocking(move || {
-                if options.write || options.create || options.create_new || options.truncate {
+                if options.write
+                    || options.append
+                    || options.create
+                    || options.create_new
+                    || options.truncate
+                {
                     assert_name_fits(&fs, &path)?;
                 }
                 // A symlink is invisible: opening one must not follow it out of the vault.
@@ -402,7 +465,7 @@ impl DavFileSystem for CryptoDavFs {
                 Ok(CryptoDavFile {
                     fs: Arc::clone(&fs),
                     path,
-                    handle: Arc::new(handle),
+                    handle: Some(Arc::new(handle)),
                     position,
                 })
             })
@@ -431,6 +494,12 @@ impl DavFileSystem for CryptoDavFs {
     /// recursively here would pull the children out from under it and lose the per-resource
     /// statuses of the `207` response. A directory that still has content answers
     /// [`FsError::Exists`], which `dir_status` renders as `409 Conflict`.
+    ///
+    /// A collection whose only remaining child is a symlink can never be deleted this way: a
+    /// vault's links are invisible to WebDAV (see the module docs), so `delete_items` never sees
+    /// one to remove, and this then answers `Exists` forever. That follows from the two rulings
+    /// above rather than from a defect here, but it is worth knowing before puzzling over a
+    /// directory that a client insists is empty.
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         let fs = Arc::clone(&self.fs);
         let parsed = cleartext_path(path);
@@ -619,7 +688,7 @@ fn suppresses_quota() -> bool {
 #[cfg(all(test, feature = "webdav"))]
 mod tests {
     use super::*;
-    use crate::testing::test_fs;
+    use crate::testing::{test_fs, test_fs_with};
     use dav_server::fs::ReadDirMeta;
     use futures_util::StreamExt;
 
@@ -957,6 +1026,35 @@ mod tests {
     }
 
     #[test]
+    fn dropping_without_flush_still_persists_after_the_runtime_shuts_down() {
+        let (_dir, fs) = test_fs();
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        let rt = runtime();
+        rt.block_on(async {
+            let mut file = dav
+                .open(&dav_path("/rt-drop.txt"), put_options())
+                .await
+                .expect("open");
+            file.write_bytes(bytes::Bytes::from_static(b"deferred"))
+                .await
+                .expect("write");
+            // No `flush()`: `CryptoDavFile::drop` must move the release onto `spawn_blocking`
+            // itself, while a runtime is still current here, rather than run it inline.
+            drop(file);
+        });
+        // The dropped file's release races the runtime shutdown below if it did not actually get
+        // spawned onto the blocking pool before `block_on` returned; `shutdown_timeout` waits for
+        // every outstanding blocking task, so this only passes if the spawn really happened.
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/rt-drop.txt"))
+                .expect("read"),
+            b"deferred",
+            "the deferred release must have flushed before the runtime finished shutting down"
+        );
+    }
+
+    #[test]
     fn a_seek_past_the_end_zero_fills_the_gap() {
         let (_dir, fs) = test_fs();
         let dav = CryptoDavFs::new(Arc::clone(&fs));
@@ -977,6 +1075,59 @@ mod tests {
                     .expect("read"),
                 b"\0\0\0\0tail"
             );
+        });
+    }
+
+    #[test]
+    fn write_bytes_bounds_the_zero_fill_gap() {
+        let (_dir, fs) = test_fs();
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        runtime().block_on(async {
+            let mut file = dav
+                .open(&dav_path("/bounded.bin"), put_options())
+                .await
+                .expect("open");
+            // The file is empty, so this is exactly `size + MAX_SPARSE_GAP + 1`: the write must
+            // be rejected before it touches the file, not after encrypting the gap.
+            let too_far = MAX_SPARSE_GAP + 1;
+            assert_eq!(
+                file.seek(io::SeekFrom::Start(too_far)).await.expect("seek"),
+                too_far
+            );
+            assert_eq!(
+                file.write_bytes(bytes::Bytes::from_static(b"x"))
+                    .await
+                    .expect_err("the gap is too large to zero-fill"),
+                FsError::TooLarge
+            );
+            file.flush().await.expect("flush");
+            drop(file);
+            assert_eq!(
+                fs.read_file(&CleartextPath::parse("/bounded.bin"))
+                    .expect("read"),
+                b"",
+                "the rejected write must leave the file exactly as it was"
+            );
+
+            // A gap comfortably inside the limit still zero-fills, same as before.
+            let mut file = dav
+                .open(&dav_path("/bounded.bin"), put_options())
+                .await
+                .expect("reopen");
+            assert_eq!(
+                file.seek(io::SeekFrom::Start(1024)).await.expect("seek"),
+                1024
+            );
+            file.write_bytes(bytes::Bytes::from_static(b"ok"))
+                .await
+                .expect("a gap well under the limit is still allowed");
+            file.flush().await.expect("flush");
+            drop(file);
+            let body = fs
+                .read_file(&CleartextPath::parse("/bounded.bin"))
+                .expect("read");
+            assert_eq!(body.len(), 1026);
+            assert_eq!(&body[1024..], b"ok");
         });
     }
 
@@ -1022,6 +1173,73 @@ mod tests {
                 .await
                 .expect_err("exists");
             assert_eq!(err, FsError::Exists);
+        });
+    }
+
+    #[test]
+    fn an_appending_open_starts_the_cursor_at_the_current_end() {
+        let (_dir, fs) = test_fs();
+        fs.write_file(&CleartextPath::parse("/append.txt"), b"existing-", false)
+            .expect("write");
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        runtime().block_on(async {
+            // Exactly what `handle_put` builds for an `X-Update-Range: append` PATCH: the core
+            // has no append mode of its own, so this is a writable handle whose cursor starts at
+            // the end (see `position` in `DavFileSystem::open`).
+            let options = OpenOptions {
+                write: true,
+                append: true,
+                create: true,
+                ..Default::default()
+            };
+            let mut file = dav
+                .open(&dav_path("/append.txt"), options)
+                .await
+                .expect("open");
+            file.write_bytes(bytes::Bytes::from_static(b"appended"))
+                .await
+                .expect("write");
+            file.flush().await.expect("flush");
+            drop(file);
+        });
+        assert_eq!(
+            fs.read_file(&CleartextPath::parse("/append.txt"))
+                .expect("read"),
+            b"existing-appended",
+            "the append must land after the existing body, not overwrite its start"
+        );
+    }
+
+    #[test]
+    fn create_dir_with_a_missing_parent_is_not_found() {
+        let (_dir, fs) = test_fs();
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        runtime().block_on(async {
+            assert_eq!(
+                dav.create_dir(&dav_path("/missing/child"))
+                    .await
+                    .expect_err("the parent does not exist"),
+                FsError::NotFound
+            );
+        });
+    }
+
+    #[test]
+    fn opening_a_directory_is_forbidden() {
+        let (_dir, fs) = test_fs();
+        fs.create_dir(&CleartextPath::parse("/dir")).expect("mkdir");
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        runtime().block_on(async {
+            let options = OpenOptions {
+                read: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                dav.open(&dav_path("/dir"), options)
+                    .await
+                    .expect_err("a directory cannot be opened as a file"),
+                FsError::Forbidden
+            );
         });
     }
 
@@ -1101,6 +1319,8 @@ mod tests {
     #[test]
     fn a_name_longer_than_the_vault_allows_is_414() {
         let (_dir, fs) = test_fs();
+        fs.write_file(&CleartextPath::parse("/src.txt"), b"x", false)
+            .expect("write");
         let dav = CryptoDavFs::new(Arc::clone(&fs));
         let long = "n".repeat(fs.max_cleartext_name_length() + 1);
         runtime().block_on(async {
@@ -1115,30 +1335,28 @@ mod tests {
                     .expect_err("too long"),
                 FsError::PathTooLong
             );
+            // `rename`/`copy` run the same `assert_name_fits` on their destination.
+            assert_eq!(
+                dav.rename(&dav_path("/src.txt"), &dav_path(&format!("/{long}")))
+                    .await
+                    .expect_err("too long"),
+                FsError::PathTooLong
+            );
+            assert_eq!(
+                dav.copy(&dav_path("/src.txt"), &dav_path(&format!("/{long}")))
+                    .await
+                    .expect_err("too long"),
+                FsError::PathTooLong
+            );
         });
     }
 
     #[test]
     fn a_read_only_vault_forbids_every_write() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let key = cryptomator_core::Masterkey::from_raw([0x42; 64]);
-        cryptomator_core::initialize(
-            dir.path(),
-            &key,
-            cryptomator_core::CipherCombo::SivGcm,
-            220,
-            cryptomator_core::constants::DEFAULT_KEY_ID,
-            &mut cryptomator_core::DetRng::default(),
-        )
-        .expect("initialize");
-        let opened = cryptomator_core::open_vault_with_key(dir.path(), key).expect("open");
-        let fs = Arc::new(CryptoFs::open(
-            opened,
-            cryptomator_core::fs::CryptoFsOptions {
-                read_only: true,
-                ..Default::default()
-            },
-        ));
+        let (_dir, fs) = test_fs_with(cryptomator_core::fs::CryptoFsOptions {
+            read_only: true,
+            ..Default::default()
+        });
         let dav = CryptoDavFs::new(fs);
         runtime().block_on(async {
             assert_eq!(
