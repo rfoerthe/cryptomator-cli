@@ -28,11 +28,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-/// How many entries one `READDIR` reply may carry at most.
+/// How many entries one `READDIR` reply may ask [`VaultOps::readdir`] for.
 ///
-/// [`VaultOps::readdir`] hands out the whole tail of the snapshot; the reply buffer would stop us
-/// anyway (`add` reports "full"), but only after formatting every one of them. A directory with a
-/// million entries would otherwise build a million `DirListing` clones per request.
+/// It is the budget of one reply, not a truncation: the kernel resumes at the offset of the last
+/// entry it took, so a directory of any size is served in batches of this many. The reply buffer
+/// would stop the loop as well (`add` reports "full"), but only after the entries had been cloned
+/// out of the snapshot -- which is why the bound is passed down rather than applied here.
 const READDIR_BATCH: usize = 64;
 
 /// `RENAME_NOREPLACE`, spelled out because `fuser::RenameFlags` only defines it on Linux while
@@ -381,9 +382,9 @@ impl Filesystem for CryptoFuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        match self.ops.readdir(fh.0, offset) {
+        match self.ops.readdir(fh.0, offset, READDIR_BATCH) {
             Ok(entries) => {
-                for (entry, next_offset) in entries.into_iter().take(READDIR_BATCH) {
+                for (entry, next_offset) in entries {
                     if reply.add(INodeNo(entry.ino), next_offset, entry.kind, &entry.name) {
                         break; // the reply buffer is full; the kernel asks again from `next_offset`
                     }

@@ -9,6 +9,7 @@ use cryptomator_core::fs::{CleartextPath, FileHandle};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// An open file behind a FUSE file handle.
 #[derive(Debug)]
@@ -22,6 +23,49 @@ pub struct OpenFileEntry {
     pub append: bool,
     /// Whether the handle was opened for writing.
     pub writable: bool,
+    /// The permission bits the node had when it was opened. They are what a `fstat` reports once
+    /// the file has lost its name and the vault has nothing left to be asked.
+    pub perm: u16,
+    /// `atime`/`mtime` a `setattr` recorded on this handle because the file had already lost its
+    /// name -- with the directory entry gone there is nowhere else to keep them, and `fstat` on
+    /// the descriptor still has to report what was just set.
+    times: Mutex<Option<(SystemTime, SystemTime)>>,
+}
+
+impl OpenFileEntry {
+    /// An entry for `handle`, which was opened at `path` on a node whose permission bits are
+    /// `perm`. No times are recorded yet: the file still has a name to keep them.
+    pub fn new(
+        handle: FileHandle,
+        path: CleartextPath,
+        append: bool,
+        writable: bool,
+        perm: u16,
+    ) -> Self {
+        Self {
+            handle,
+            path,
+            append,
+            writable,
+            perm,
+            times: Mutex::new(None),
+        }
+    }
+
+    /// The `atime`/`mtime` [`set_times`](Self::set_times) recorded, if it was ever called.
+    pub fn times(&self) -> Option<(SystemTime, SystemTime)> {
+        *lock(&self.times)
+    }
+
+    /// Records the times of a `setattr` that could not reach the vault. A time that was not set
+    /// keeps the value recorded before (or `now`, if this is the first call: that is what the
+    /// file's stamps would have been had anybody been able to read them).
+    pub fn set_times(&self, atime: Option<SystemTime>, mtime: Option<SystemTime>) {
+        let mut recorded = lock(&self.times);
+        let now = SystemTime::now();
+        let (before_atime, before_mtime) = recorded.unwrap_or((now, now));
+        *recorded = Some((atime.unwrap_or(before_atime), mtime.unwrap_or(before_mtime)));
+    }
 }
 
 /// One entry of a directory snapshot, including the `.` and `..` entries FUSE expects.

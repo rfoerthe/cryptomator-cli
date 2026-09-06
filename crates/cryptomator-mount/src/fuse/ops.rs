@@ -43,6 +43,9 @@ const MIN_STATFS_BLOCK_SIZE: u32 = 512;
 const UNKNOWN_INO: u64 = 0xffff_ffff;
 /// macOS resource-fork side car; swept with the `._*` files when `delete_apple_double` is set.
 const DS_STORE: &str = ".DS_Store";
+/// Permission bits reported for an open file whose own ones could not be read: the neutral mode
+/// of a private temporary file, which is all a file without a name still is.
+const PRIVATE_FILE_PERM: u16 = 0o600;
 
 /// What the adapter needs to know beyond the vault itself.
 #[derive(Debug, Clone)]
@@ -249,22 +252,26 @@ impl VaultOps {
     }
 
     /// Attributes synthesised for a file that lost its name while it was open. Everything the
-    /// vault stored went with the directory entry, so the size comes from the handle and the rest
-    /// is the neutral shape of a private temporary file. `nlink` stays 1 rather than the 0 a local
-    /// `fstat` reports: spike C found FUSE-T sensitive to `nlink`, and a 0 buys nothing here.
+    /// vault stored went with the directory entry, so the size and the permission bits come from
+    /// the handle -- as do the times, if a `setattr` set any after the name was gone: a `futimens`
+    /// followed by an `fstat` has to report what it just set, not the wall clock. `nlink` stays 1
+    /// rather than the 0 a local `fstat` reports: spike C found FUSE-T sensitive to `nlink`, and a
+    /// 0 buys nothing here.
     fn attr_of_open_file(&self, ino: u64, entry: &OpenFileEntry) -> Attr {
         let size = entry.handle.size();
         let now = SystemTime::now();
+        let (atime, mtime) = entry.times().unwrap_or((now, now));
         Attr {
             ino,
             size,
             blocks: size.div_ceil(STAT_BLOCK),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
+            atime,
+            mtime,
+            // The vault stores neither of the two; `attr_of` reports `mtime` for both as well.
+            ctime: mtime,
+            crtime: mtime,
             kind: FileType::RegularFile,
-            perm: 0o600,
+            perm: entry.perm,
             nlink: 1,
             uid: self.cfg.options.uid,
             gid: self.cfg.options.gid,
@@ -325,7 +332,8 @@ impl VaultOps {
 
     /// `utimensat` through the path. A file that was unlinked while it is open has no path left,
     /// so its modification time is kept on the handle instead -- which is what `futimens` on an
-    /// unlinked descriptor does.
+    /// unlinked descriptor does. Both times are recorded on the handle as well, so the `fstat`
+    /// that follows can report them ([`attr_of_open_file`](Self::attr_of_open_file)).
     fn set_times(
         &self,
         path: &CleartextPath,
@@ -341,9 +349,11 @@ impl VaultOps {
         };
         match fh.and_then(|fh| self.files.get(fh)) {
             Some(entry) if is_not_found(&e) => {
+                let mtime = mtime.map(resolve_time);
                 if let Some(mtime) = mtime {
-                    entry.handle.set_last_modified(resolve_time(mtime));
+                    entry.handle.set_last_modified(mtime);
                 }
+                entry.set_times(atime.map(resolve_time), mtime);
                 Ok(())
             }
             _ => Err(errno_for(&e)),
@@ -469,12 +479,20 @@ impl VaultOps {
             .open_file(&path, options)
             .map_err(|e| errno_for(&e))?;
         let writable = handle.is_writable();
-        Ok(self.files.insert(OpenFileEntry {
-            handle,
-            path,
-            append: is_set(flags, libc::O_APPEND),
-            writable,
-        }))
+        let append = is_set(flags, libc::O_APPEND);
+        let perm = self.perm_of(&path);
+        Ok(self
+            .files
+            .insert(OpenFileEntry::new(handle, path, append, writable, perm)))
+    }
+
+    /// The permission bits of a node that was just opened, kept for the day its name is gone.
+    /// A node that cannot be stat'ed (a race with a concurrent unlink) falls back to the neutral
+    /// mode of a private temporary file, which is all an unnamed file can claim to be.
+    fn perm_of(&self, path: &CleartextPath) -> u16 {
+        self.fs
+            .symlink_metadata(path)
+            .map_or(PRIVATE_FILE_PERM, |attrs| (attrs.mode & 0o7777) as u16)
     }
 
     /// Creates and opens in one step. `O_EXCL` makes it exclusive (`EEXIST` if the name is
@@ -497,12 +515,9 @@ impl VaultOps {
                 return Err(e);
             }
         };
-        let fh = self.files.insert(OpenFileEntry {
-            handle,
-            path,
-            append,
-            writable,
-        });
+        let fh = self.files.insert(OpenFileEntry::new(
+            handle, path, append, writable, attr.perm,
+        ));
         Ok(Created { attr, fh })
     }
 
@@ -628,8 +643,17 @@ impl VaultOps {
         Ok(self.dirs.insert(DirSnapshot { entries }))
     }
 
-    /// The entries of the snapshot from index `offset` on, each with the offset to resume at.
-    pub fn readdir(&self, fh: u64, offset: u64) -> Result<Vec<(DirListing, u64)>, Errno> {
+    /// At most `limit` entries of the snapshot from index `offset` on, each with the offset to
+    /// resume at.
+    ///
+    /// The limit is the caller's reply budget and is applied before the entries are cloned: a
+    /// directory with a million names must cost one batch per request, not a million clones.
+    pub fn readdir(
+        &self,
+        fh: u64,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<(DirListing, u64)>, Errno> {
         let snapshot = self.dirs.get(fh).ok_or(Errno::EBADF)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         Ok(snapshot
@@ -637,6 +661,7 @@ impl VaultOps {
             .iter()
             .enumerate()
             .skip(start)
+            .take(limit)
             .map(|(index, entry)| (entry.clone(), index as u64 + 1))
             .collect())
     }
@@ -748,6 +773,7 @@ mod tests {
         initialize, open_vault_with_key, CipherCombo, DetRng, Masterkey, VaultConfig,
     };
     use std::ffi::OsString;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const MAX_NAME_LENGTH: u32 = 10 * 1024;
@@ -837,13 +863,31 @@ mod tests {
         // directory listing with . and ..
         let dh = ops.opendir(d.ino).expect("opendir");
         let names: Vec<String> = ops
-            .readdir(dh, 0)
+            .readdir(dh, 0, usize::MAX)
             .expect("readdir")
             .into_iter()
             .map(|(e, _)| e.name.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec![".", "..", "a.txt"]);
-        assert!(ops.readdir(dh, 3).expect("readdir past the end").is_empty());
+        // The limit bounds the batch, and the offset it hands back resumes right after it.
+        let batch = ops.readdir(dh, 1, 1).expect("one entry from offset 1");
+        assert_eq!(
+            batch.len(),
+            1,
+            "the limit is applied, not the snapshot size"
+        );
+        assert_eq!(batch[0].0.name, OsString::from(".."));
+        assert_eq!(batch[0].1, 2, "the next request resumes after this entry");
+        assert!(ops
+            .readdir(dh, 3, usize::MAX)
+            .expect("readdir past the end")
+            .is_empty());
+        assert!(
+            ops.readdir(dh, 0, 0)
+                .expect("readdir with no budget")
+                .is_empty(),
+            "a zero limit asks for nothing"
+        );
         ops.releasedir(dh).expect("releasedir");
         // rename keeps inode, unlink/rmdir
         ops.rename(
@@ -908,7 +952,7 @@ mod tests {
         );
         let dh = ops.opendir(1).expect("opendir");
         let names: Vec<OsString> = ops
-            .readdir(dh, 0)
+            .readdir(dh, 0, usize::MAX)
             .expect("readdir")
             .into_iter()
             .map(|(e, _)| e.name)
@@ -944,13 +988,37 @@ mod tests {
         let attr = ops.getattr(c.attr.ino, Some(c.fh)).expect("fstat");
         assert_eq!((attr.size, attr.kind), (5, FileType::RegularFile));
         assert_eq!(attr.ino, c.attr.ino);
+        assert_eq!(
+            attr.perm, c.attr.perm,
+            "the permission bits the file had when it was opened, not a hard-coded mode"
+        );
         // ... while `stat` on the (forgotten) name does not.
         assert_eq!(ops.getattr(c.attr.ino, None).unwrap_err(), Errno::ENOENT);
-        // `ftruncate` goes through the handle as well, `futimens` is accepted.
+        // `ftruncate` goes through the handle as well, and `futimens` is not only accepted: the
+        // times it sets have to come back out of the handle, since nothing else holds them.
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let accessed = when + Duration::from_secs(60);
         let truncated = ops
-            .setattr(c.attr.ino, Some(c.fh), Some(2), None, Some(TimeOrNow::Now))
+            .setattr(
+                c.attr.ino,
+                Some(c.fh),
+                Some(2),
+                Some(TimeOrNow::SpecificTime(accessed)),
+                Some(TimeOrNow::SpecificTime(when)),
+            )
             .expect("ftruncate");
         assert_eq!(truncated.size, 2);
+        assert_eq!(
+            (truncated.mtime, truncated.atime),
+            (when, accessed),
+            "the reply echoes the times that were just set"
+        );
+        let after = ops.getattr(c.attr.ino, Some(c.fh)).expect("fstat");
+        assert_eq!(
+            (after.mtime, after.atime),
+            (when, accessed),
+            "and a later fstat still reports them"
+        );
         assert_eq!(ops.read(c.fh, 0, 10).expect("read"), b"he");
         ops.release(c.fh).expect("release");
         assert!(!ops.is_in_use());

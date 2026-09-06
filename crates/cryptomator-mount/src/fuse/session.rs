@@ -86,8 +86,9 @@ impl FuseSessionHandle {
     ) -> io::Result<Self> {
         // `Config` is `#[non_exhaustive]`, so it can only be built by assignment. `n_threads`
         // stays at the default of one: the event loop is the only thing serialising the vault.
+        // `config.acl` is not set: `from_fd` takes the ACL as its own argument and ignores the
+        // one in the config (which only `Session::new`, the mounting constructor, reads).
         let mut config = Config::default();
-        config.acl = SessionACL::Owner;
         config.abi = abi;
         let fs = CryptoFuse::new(Arc::clone(&ops));
         let session = Session::from_fd(fs, fd, SessionACL::Owner, config)?;
@@ -267,6 +268,10 @@ mod tests {
     // A socket is also what FUSE-T gives us instead of `/dev/fuse` (spike C), so this exercises
     // the transport the macOS back end will use, down to the EOF that ends the session.
 
+    /// How long a test waits for one reply from the session thread. Generous enough for a loaded
+    /// CI machine, short enough that a regression reports a failure instead of hanging the suite.
+    const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// `fuse_in_header`: len, opcode, unique, nodeid, uid, gid, pid, padding.
     const IN_HEADER: usize = 40;
     /// `fuse_out_header`: len, error, unique.
@@ -414,6 +419,10 @@ mod tests {
     ) -> (UnixStream, FuseSessionHandle) {
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
         let mut peer = theirs;
+        // A reply that never comes must fail the test rather than hang it forever: every read
+        // below goes through `read_exact` on this socket.
+        peer.set_read_timeout(Some(PEER_READ_TIMEOUT))
+            .expect("set read timeout");
         peer.write_all(&init_request()).expect("write init");
         let handle = FuseSessionHandle::spawn_from_fd(
             ops,
