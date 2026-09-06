@@ -556,8 +556,12 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
         loop {
-            // Read the next request from the given channel to kernel driver
-            // The kernel driver makes sure that we get exactly one request per read
+            // Read the next request from the given channel to kernel driver.
+            // Vendored-fork change (see ../README-VENDORED.md): `/dev/fuse` hands out exactly one
+            // whole request per read, but FUSE-T's channel is a stream socket with no message
+            // boundaries, so it is `Channel::receive_retrying` -- which completes a partial
+            // request and keeps whatever followed it in its spill buffer -- that guarantees the
+            // buffer holds exactly one request per call.
             match self.ch.receive_retrying(buf) {
                 // Vendored-fork addition (see ../README-VENDORED.md): a zero-length read is EOF
                 // and can never be a valid request. /dev/fuse never does this (it raises ENODEV

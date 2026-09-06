@@ -207,11 +207,13 @@ pub(crate) fn macos_mount_options(flags: &MountFlags, read_only: bool) -> Vec<St
 /// The adapter configuration both macOS back ends build from their parsed flags.
 ///
 /// macOS hands FUSE decomposed names, whatever the vault stores, hence [`FuseNormalization::Nfd`].
-/// `-onoappledouble` is what makes the adapter sweep `._*`/`.DS_Store` when a directory is
-/// removed, exactly as Cryptomator's `noappledouble` does: macFUSE's default flags carry the
-/// option, FUSE-T's do not, so the sweep follows the flags rather than the platform.
+/// The `._*`/`.DS_Store` sweep on `rmdir` is on for both macOS back ends, like Cryptomator's
+/// `deleteAppleDoubleFiles`, which is decided by the platform and not by a mount flag: Finder
+/// leaves those side cars behind on macOS whichever back end serves the volume, and a directory
+/// holding nothing but them cannot be removed otherwise. `-onoappledouble` is still parsed (it is
+/// part of macFUSE's default flags), it just does not gate the sweep.
 ///
-/// `refuse_apple_double` is the other half of that option and follows the back end instead, see
+/// `refuse_apple_double` follows the back end instead, see
 /// [`VaultOpsConfig::refuse_apple_double`]: macFUSE keeps the side cars away from userspace by
 /// itself, FUSE-T cannot and needs the adapter to say no.
 #[cfg(target_os = "macos")]
@@ -223,7 +225,7 @@ pub(crate) fn macos_ops_config(
 ) -> VaultOpsConfig {
     VaultOpsConfig {
         transcoder: NameTranscoder::new(FuseNormalization::Nfd),
-        delete_apple_double: flags.adapter.no_apple_double,
+        delete_apple_double: true,
         refuse_apple_double,
         options: flags.adapter,
         read_only,
@@ -234,21 +236,28 @@ pub(crate) fn macos_ops_config(
 /// Takes a macOS mount down: `umount -- <path>`, or `umount -f -- <path>` when forced.
 ///
 /// Both FUSE-T (whose mount is an NFS mount) and macFUSE are unmounted this way, as Cryptomator
-/// does it. A volume that is no longer mounted counts as success, and one that is merely still
-/// settling is retried, see [`UNMOUNT_BUSY_RETRY`].
+/// does it. A volume that is no longer mounted counts as success, and a *graceful* unmount of one
+/// that is merely still settling is retried, see [`UNMOUNT_BUSY_RETRY`]. A forced unmount is not:
+/// the caller has already decided not to wait, and `umount -f` is what one does *because* the
+/// volume is busy -- retrying would only add five seconds before reporting the same failure.
 ///
 /// # Errors
 /// See [`run_unmount_command`].
 #[cfg(target_os = "macos")]
 pub(crate) fn umount_macos(mountpoint: &Path, forced: bool) -> Result<(), UnmountError> {
-    retry_while_busy(UNMOUNT_BUSY_RETRY, || {
+    let attempt = || {
         let mut command = Command::new("umount");
         if forced {
             command.arg("-f");
         }
         command.arg("--").arg(mountpoint);
         run_unmount_command(command, &["not currently mounted", "not mounted"])
-    })
+    };
+    if forced {
+        attempt()
+    } else {
+        retry_while_busy(UNMOUNT_BUSY_RETRY, attempt)
+    }
 }
 
 /// Runs `attempt` until it stops reporting [`UnmountError::Busy`], giving up after `retry_for`.
@@ -418,11 +427,12 @@ mod tests {
         );
     }
 
-    /// `-onoappledouble` -- and nothing else -- switches the adapter's AppleDouble sweep on, for
-    /// both macOS back ends: FUSE-T's default flags leave it off, macFUSE's turn it on.
+    /// The AppleDouble sweep is on for both macOS back ends, whatever the flags say: it follows
+    /// the platform, like Cryptomator's `deleteAppleDoubleFiles`. `-onoappledouble` is still
+    /// parsed, it just does not gate the sweep.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_apple_double_sweep_follows_the_noappledouble_flag() {
+    fn the_apple_double_sweep_is_on_for_every_macos_back_end() {
         use crate::flags::parse_mount_flags;
 
         let parse = |flags: &str| {
@@ -432,14 +442,17 @@ mod tests {
             |flags: &str| macos_ops_config(parse(flags), false, 255, false).delete_apple_double;
 
         assert!(
-            !sweeps("-ononamedattr -orwsize=262144 -ouid=501 -ogid=20"),
-            "FUSE-T's default flags carry no -onoappledouble"
+            sweeps("-ononamedattr -orwsize=262144 -ouid=501 -ogid=20"),
+            "FUSE-T's default flags carry no -onoappledouble, the sweep is on regardless"
         );
         assert!(
             sweeps("-ouid=501 -ogid=20 -oatomic_o_trunc -oauto_xattr -oauto_cache -onoappledouble -odefault_permissions"),
-            "macFUSE's default flags do"
+            "and so do macFUSE's"
         );
-        assert!(sweeps("-onoappledouble"));
+        assert!(
+            parse("-onoappledouble").adapter.no_apple_double,
+            "the flag is still parsed"
+        );
 
         let config = macos_ops_config(parse("-onoappledouble -ouid=7 -ogid=9"), true, 146, true);
         assert!(config.refuse_apple_double, "the back end asked for it");

@@ -44,6 +44,21 @@ pub enum AppError {
     WrongState { expected: String, actual: String },
     #[error("invalid value for {key}: {message}")]
     InvalidValue { key: String, message: String },
+    /// Mounting the vault failed; the CLI reports exit code 6.
+    #[error("mount failed: {0}")]
+    MountFailed(String),
+    /// The mount point the user chose cannot be used; exit code 6 as well.
+    #[error("mount point {0}: {1}")]
+    MountPointInvalid(PathBuf, String),
+    /// Taking a mount down failed, e.g. because the volume is still in use; exit code 7.
+    #[error("unmount failed: {0}")]
+    UnmountFailed(String),
+    /// The vault daemon could not be reached; exit code 10.
+    #[error("cannot reach the vault daemon: {0}")]
+    DaemonUnreachable(String),
+    /// The daemon answered with an error; the CLI maps `code` to an exit code.
+    #[error("{message}")]
+    DaemonError { code: String, message: String },
     #[error("no home directory (set HOME or CRYPTO_SETTINGS_PATH)")]
     NoHomeDirectory,
 }

@@ -8,7 +8,10 @@ pub const USAGE: u8 = 2;
 pub const VAULT_NOT_FOUND: u8 = 3;
 pub const INVALID_PASSPHRASE: u8 = 4;
 pub const WRONG_STATE: u8 = 5;
+pub const MOUNT_FAILED: u8 = 6;
+pub const UNMOUNT_FAILED: u8 = 7;
 pub const HUB_VAULT: u8 = 9;
+pub const DAEMON_UNREACHABLE: u8 = 10;
 pub const NOT_A_VAULT: u8 = 12;
 
 // Exhaustive on purpose (no `_` arm): a new `CoreError` variant must be given an exit code here
@@ -39,6 +42,16 @@ fn app_code(err: &AppError) -> u8 {
         AppError::PasswordTooShort(_) | AppError::PasswordMismatch => INVALID_PASSPHRASE,
         AppError::WrongState { .. } | AppError::VaultAlreadyAdded(_) => WRONG_STATE,
         AppError::NoPasswordSource { .. } | AppError::InvalidValue { .. } => USAGE,
+        AppError::MountFailed(_) | AppError::MountPointInvalid(..) => MOUNT_FAILED,
+        AppError::UnmountFailed(_) => UNMOUNT_FAILED,
+        AppError::DaemonUnreachable(_) => DAEMON_UNREACHABLE,
+        // The daemon reports what went wrong on its side; its code decides ours.
+        AppError::DaemonError { code, .. } => match code.as_str() {
+            "MOUNT_FAILED" => MOUNT_FAILED,
+            "UNMOUNT_FAILED" => UNMOUNT_FAILED,
+            "ALREADY_UNLOCKED" | "NOT_UNLOCKED" => WRONG_STATE,
+            _ => GENERAL,
+        },
         AppError::Io(_)
         | AppError::SettingsCorrupt { .. }
         | AppError::SettingsUnreadable { .. }

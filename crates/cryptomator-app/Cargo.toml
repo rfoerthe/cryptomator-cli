@@ -9,8 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 cryptomator-core = { path = "../cryptomator-core" }
+cryptomator-mount = { path = "../cryptomator-mount" }
 clap.workspace = true
 data-encoding.workspace = true
+log.workspace = true
+nix = { workspace = true, features = ["process", "signal", "user"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

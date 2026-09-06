@@ -363,7 +363,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cryptomator-core",
+ "cryptomator-mount",
  "data-encoding",
+ "log",
+ "nix",
  "rpassword",
  "security-framework",
  "serde",
