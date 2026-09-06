@@ -43,10 +43,6 @@ repository = "https://github.com/cberner/fuser"
 
 [features]
 default = []
-experimental = [
-    "async-trait",
-    "tokio",
-]
 libfuse = []
 libfuse2 = ["libfuse"]
 libfuse3 = ["libfuse"]
@@ -57,10 +53,6 @@ serializable = ["serde"]
 [lib]
 name = "fuser"
 path = "src/lib.rs"
-
-[dependencies.async-trait]
-version = "0.1"
-optional = true
 
 [dependencies.bitflags]
 version = "2.9"
@@ -109,14 +101,6 @@ optional = true
 
 [dependencies.smallvec]
 version = "1.6.1"
-
-[dependencies.tokio]
-version = "1.48.0"
-features = [
-    "rt",
-    "rt-multi-thread",
-]
-optional = true
 
 [dependencies.zerocopy]
 version = "0.8"

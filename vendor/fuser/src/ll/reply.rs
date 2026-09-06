@@ -1041,22 +1041,37 @@ mod abi_test {
     /// `fuse_attr` as Linux declares it.
     const ATTR_LINUX: usize = 88;
 
+    // Every field carries a distinct, non-zero value so that a twin which silently mixed two
+    // fields up (or zeroed one) cannot pass by accident.
+    const ATIME: (u64, u32) = (1_000_001, 111_000_111);
+    const MTIME: (u64, u32) = (2_000_002, 222_000_222);
+    const CTIME: (u64, u32) = (3_000_003, 333_000_333);
+    const CRTIME: (u64, u32) = (4_000_004, 444_000_444);
+    const RDEV: u32 = 0x0102_0304;
+    /// Darwin `chflags(2)` bits. The Linux layout's `flags` field means `FUSE_ATTR_*` instead, so
+    /// the twin must NOT carry this value over — it is expected to read back as 0.
+    const DARWIN_FLAGS: u32 = 0xdead;
+
+    fn at(t: (u64, u32)) -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::new(t.0, t.1)
+    }
+
     fn attr() -> crate::FileAttr {
         crate::FileAttr {
             ino: INodeNo(1),
-            size: 0,
-            blocks: 1,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            size: 4242,
+            blocks: 9,
+            atime: at(ATIME),
+            mtime: at(MTIME),
+            ctime: at(CTIME),
+            crtime: at(CRTIME),
             kind: FileType::Directory,
             perm: 0o755,
-            nlink: 1,
+            nlink: 3,
             uid: 501,
             gid: 20,
-            rdev: 0,
-            flags: 0,
+            rdev: RDEV,
+            flags: DARWIN_FLAGS,
             blksize: 512,
         }
     }
@@ -1069,16 +1084,52 @@ mod abi_test {
         u32::from_ne_bytes(buf[off..off + 4].try_into().expect("4 bytes"))
     }
 
+    fn u64_at(buf: &[u8], off: usize) -> u64 {
+        u64::from_ne_bytes(buf[off..off + 8].try_into().expect("8 bytes"))
+    }
+
+    fn i64_at(buf: &[u8], off: usize) -> i64 {
+        i64::from_ne_bytes(buf[off..off + 8].try_into().expect("8 bytes"))
+    }
+
     /// Assert that `attr` (a `fuse_attr` starting at `buf[0]`) uses the Linux field order:
+    /// ino 0, size 8, blocks 16, atime 24, mtime 32, ctime 40 (all i64/u64, no Darwin `crtime`),
+    /// atimensec 48, mtimensec 52, ctimensec 56 (no Darwin `crtimensec`),
     /// mode 60, nlink 64, uid 68, gid 72, rdev 76, blksize 80, flags 84.
     fn assert_linux_attr_layout(attr: &[u8]) {
+        assert_eq!(u64_at(attr, 0), 1, "ino");
+        assert_eq!(u64_at(attr, 8), 4242, "size");
+        assert_eq!(u64_at(attr, 16), 9, "blocks");
+        assert_eq!(i64_at(attr, 24), ATIME.0 as i64, "atime");
+        assert_eq!(i64_at(attr, 32), MTIME.0 as i64, "mtime");
+        assert_eq!(i64_at(attr, 40), CTIME.0 as i64, "ctime");
+        assert_eq!(u32_at(attr, 48), ATIME.1, "atimensec");
+        assert_eq!(u32_at(attr, 52), MTIME.1, "mtimensec");
+        assert_eq!(u32_at(attr, 56), CTIME.1, "ctimensec");
         assert_eq!(u32_at(attr, 60), 0o040755, "mode");
-        assert_eq!(u32_at(attr, 64), 1, "nlink");
+        assert_eq!(u32_at(attr, 64), 3, "nlink");
         assert_eq!(u32_at(attr, 68), 501, "uid");
         assert_eq!(u32_at(attr, 72), 20, "gid");
-        assert_eq!(u32_at(attr, 76), 0, "rdev");
+        assert_eq!(u32_at(attr, 76), RDEV, "rdev");
         assert_eq!(u32_at(attr, 80), 512, "blksize");
+        // Darwin file flags are deliberately dropped: on Linux this field is `FUSE_ATTR_*`.
         assert_eq!(u32_at(attr, 84), 0, "flags");
+        // `crtime`/`crtimensec` have no Linux offset at all - the struct ends after `flags`.
+        assert_eq!(
+            attr.len().min(ATTR_LINUX),
+            ATTR_LINUX,
+            "fuse_attr too short"
+        );
+    }
+
+    /// The native (macFUSE) layout must be untouched by the patch: `crtime` at 48, `crtimensec`
+    /// at 68 and the Darwin `flags` at 92 - i.e. exactly the fields FUSE-T cannot read.
+    fn assert_native_attr_layout(attr: &[u8]) {
+        assert_eq!(u64_at(attr, 48), CRTIME.0, "crtime");
+        assert_eq!(u32_at(attr, 68), CRTIME.1, "crtimensec");
+        assert_eq!(u32_at(attr, 72), 0o040755, "mode");
+        assert_eq!(u32_at(attr, 88), RDEV, "rdev");
+        assert_eq!(u32_at(attr, 92), DARWIN_FLAGS, "flags");
     }
 
     #[test]
@@ -1098,6 +1149,7 @@ mod abi_test {
         // fuse_attr_out = attr_valid(8) + attr_valid_nsec(4) + dummy(4) + fuse_attr
         assert_eq!(native.len(), HEADER + 16 + ATTR_NATIVE);
         assert_eq!(linux.len(), HEADER + 16 + ATTR_LINUX);
+        assert_native_attr_layout(&native[HEADER + 16..]);
         assert_linux_attr_layout(&linux[HEADER + 16..]);
     }
 
@@ -1120,6 +1172,7 @@ mod abi_test {
         // fuse_entry_out has 40 bytes ahead of the embedded fuse_attr.
         assert_eq!(native.len(), HEADER + 40 + ATTR_NATIVE);
         assert_eq!(linux.len(), HEADER + 40 + ATTR_LINUX);
+        assert_native_attr_layout(&native[HEADER + 40..]);
         assert_linux_attr_layout(&linux[HEADER + 40..]);
     }
 
@@ -1143,6 +1196,7 @@ mod abi_test {
         // fuse_create_out = fuse_entry_out + fuse_open_out(16)
         assert_eq!(native.len(), HEADER + 40 + ATTR_NATIVE + 16);
         assert_eq!(linux.len(), HEADER + 40 + ATTR_LINUX + 16);
+        assert_native_attr_layout(&native[HEADER + 40..]);
         assert_linux_attr_layout(&linux[HEADER + 40..]);
     }
 
@@ -1171,6 +1225,7 @@ mod abi_test {
         // fuse_direntplus = fuse_entry_out + fuse_dirent(24); the name "a" is padded to 8 bytes.
         assert_eq!(native.len(), HEADER + 40 + ATTR_NATIVE + 24 + 8);
         assert_eq!(linux.len(), HEADER + 40 + ATTR_LINUX + 24 + 8);
+        assert_native_attr_layout(&native[HEADER + 40..]);
         assert_linux_attr_layout(&linux[HEADER + 40..]);
     }
 }

@@ -341,6 +341,14 @@ impl<FS: Filesystem> Session<FS> {
         loop {
             // Read the init request from the kernel
             let size = match self.ch.receive_retrying(buf) {
+                // Vendored-fork addition (see ../README-VENDORED.md): FUSE-T hands us a socket
+                // rather than /dev/fuse, so a closed peer shows up as EOF instead of ENODEV.
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "FUSE device disconnected during handshake",
+                    ));
+                }
                 Ok(size) => size,
                 Err(nix::errno::Errno::ENODEV) => {
                     return Err(io::Error::new(
@@ -551,6 +559,11 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive_retrying(buf) {
+                // Vendored-fork addition (see ../README-VENDORED.md): a zero-length read is EOF
+                // and can never be a valid request. /dev/fuse never does this (it raises ENODEV
+                // on unmount), but FUSE-T's channel is a socket that is simply closed when the
+                // volume is unmounted, so EOF means the same thing: the session is over.
+                Ok(0) => return Ok(()),
                 Ok(size) => {
                     match RequestWithSender::new(self.ch.sender(), &buf[..size], self.abi) {
                         // Dispatch request
@@ -613,5 +626,155 @@ impl BackgroundSession {
                     "filesystem background thread panicked",
                 )
             })?
+    }
+}
+
+/// End-to-end tests for `KernelAbi::Linux` over a socket pair (vendored patch, see
+/// ../README-VENDORED.md). macOS only, because that is the only target where `Native` and `Linux`
+/// differ. The socket also models FUSE-T's transport: unlike `/dev/fuse` it signals the end of the
+/// session with EOF rather than `ENODEV`.
+#[cfg(all(test, target_os = "macos"))]
+mod abi_session_test {
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    use std::time::UNIX_EPOCH;
+
+    use nix::sys::socket::AddressFamily;
+    use nix::sys::socket::SockFlag;
+    use nix::sys::socket::SockType;
+    use nix::sys::socket::socketpair;
+
+    use super::*;
+    use crate::FileAttr;
+    use crate::FileHandle;
+    use crate::FileType;
+    use crate::INodeNo;
+    use crate::ReplyAttr;
+
+    const IN_HEADER: usize = size_of::<abi::fuse_in_header>();
+    const OUT_HEADER: usize = 16;
+    /// `fuse_attr_out` = attr_valid(8) + attr_valid_nsec(4) + dummy(4) + `fuse_attr`.
+    const ATTR_OUT_PREFIX: usize = 16;
+    const ATTR_LINUX: usize = 88;
+
+    struct RootDirFs;
+
+    impl Filesystem for RootDirFs {
+        fn getattr(
+            &self,
+            _req: &Request,
+            _ino: INodeNo,
+            _fh: Option<FileHandle>,
+            reply: ReplyAttr,
+        ) {
+            reply.attr(
+                &Duration::from_secs(1),
+                &FileAttr {
+                    ino: INodeNo(1),
+                    size: 0,
+                    blocks: 0,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    crtime: UNIX_EPOCH,
+                    kind: FileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: 501,
+                    gid: 20,
+                    rdev: 0,
+                    flags: 0xdead,
+                    blksize: 512,
+                },
+            );
+        }
+    }
+
+    /// `fuse_in_header` for `opcode` on inode 1, followed by `arg`.
+    fn request(opcode: u32, unique: u64, arg: &[u8]) -> Vec<u8> {
+        let len = IN_HEADER + arg.len();
+        let mut buf = vec![0u8; len];
+        buf[0..4].copy_from_slice(&(len as u32).to_ne_bytes());
+        buf[4..8].copy_from_slice(&opcode.to_ne_bytes());
+        buf[8..16].copy_from_slice(&unique.to_ne_bytes());
+        buf[16..24].copy_from_slice(&1u64.to_ne_bytes());
+        buf[IN_HEADER..].copy_from_slice(arg);
+        buf
+    }
+
+    /// A truncated `fuse_init_in` (major, minor, max_readahead, flags), which is what the
+    /// 7.19-era peers - FUSE-T among them - send.
+    fn init_request() -> Vec<u8> {
+        let mut arg = Vec::with_capacity(16);
+        arg.extend_from_slice(&7u32.to_ne_bytes());
+        arg.extend_from_slice(&19u32.to_ne_bytes());
+        arg.extend_from_slice(&0u32.to_ne_bytes());
+        arg.extend_from_slice(&0u32.to_ne_bytes());
+        request(26, 1, &arg)
+    }
+
+    /// Read one reply: the 16-byte `fuse_out_header` says how long the whole message is.
+    fn read_reply(peer: &mut UnixStream) -> Vec<u8> {
+        let mut header = [0u8; OUT_HEADER];
+        peer.read_exact(&mut header).expect("reply header");
+        let len = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
+        let mut body = vec![0u8; len - OUT_HEADER];
+        peer.read_exact(&mut body).expect("reply body");
+        body
+    }
+
+    fn u32_at(buf: &[u8], off: usize) -> u32 {
+        u32::from_ne_bytes(buf[off..off + 4].try_into().expect("4 bytes"))
+    }
+
+    #[test]
+    fn linux_abi_session_answers_getattr_and_ends_cleanly_on_eof() {
+        let (ours, theirs) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair");
+        let mut peer = UnixStream::from(theirs);
+
+        let config = Config {
+            abi: KernelAbi::Linux,
+            ..Default::default()
+        };
+        let handle = thread::Builder::new()
+            .name("abi-session-test".to_string())
+            .spawn(move || {
+                Session::from_fd(RootDirFs, ours, SessionACL::All, config).and_then(|s| s.run())
+            })
+            .expect("spawn");
+
+        peer.write_all(&init_request()).expect("write init");
+        let init_reply = read_reply(&mut peer);
+        // fuse_init_out starts with major/minor.
+        assert_eq!(u32_at(&init_reply, 0), 7, "init major");
+
+        peer.write_all(&request(3, 2, &[0u8; 16]))
+            .expect("write getattr");
+        let attr_reply = read_reply(&mut peer);
+        assert_eq!(
+            attr_reply.len(),
+            ATTR_OUT_PREFIX + ATTR_LINUX,
+            "getattr reply must use the 88-byte Linux fuse_attr"
+        );
+        let attr = &attr_reply[ATTR_OUT_PREFIX..];
+        assert_eq!(u32_at(attr, 60), 0o040755, "mode");
+        assert_eq!(u32_at(attr, 64), 2, "nlink");
+        assert_eq!(u32_at(attr, 68), 501, "uid");
+        assert_eq!(u32_at(attr, 72), 20, "gid");
+        assert_eq!(u32_at(attr, 80), 512, "blksize");
+
+        // Closing the peer is what `umount` does to a FUSE-T session: the session must end with
+        // `Ok(())`, not with the "Invalid request" that a zero-length read used to produce.
+        drop(peer);
+        let result = handle.join().expect("join");
+        assert!(result.is_ok(), "session ended with {result:?}");
     }
 }

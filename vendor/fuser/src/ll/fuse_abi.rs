@@ -22,11 +22,6 @@
 
 #![warn(missing_debug_implementations)]
 #![allow(missing_docs)]
-// Vendored-fork addition (see ../../README-VENDORED.md): `cuse_init_in`, `cuse_init_out`,
-// `fuse_ioctl_iovec`, `fuse_notify_retrieve_in` and `fuse_notify_retrieve_out` describe parts of
-// the kernel ABI that fuser does not implement yet, so nothing constructs them. Our workspace gate
-// runs clippy with `-D warnings`, which upstream does not.
-#![allow(dead_code)]
 
 use num_enum::TryFromPrimitive;
 use zerocopy::FromBytes;
@@ -539,6 +534,9 @@ pub(crate) struct fuse_init_out {
     pub(crate) reserved: [u32; 6],
 }
 
+// Vendored-fork addition (see ../../README-VENDORED.md): part of the kernel ABI that fuser
+// does not implement yet, so nothing constructs it. Our gate runs clippy with `-D warnings`.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub(crate) struct cuse_init_in {
@@ -548,6 +546,9 @@ pub(crate) struct cuse_init_in {
     pub(crate) flags: u32,
 }
 
+// Vendored-fork addition (see ../../README-VENDORED.md): part of the kernel ABI that fuser
+// does not implement yet, so nothing constructs it. Our gate runs clippy with `-D warnings`.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, KnownLayout, Immutable)]
 pub(crate) struct cuse_init_out {
@@ -593,6 +594,9 @@ pub(crate) struct fuse_ioctl_in {
     pub(crate) out_size: u32,
 }
 
+// Vendored-fork addition (see ../../README-VENDORED.md): part of the kernel ABI that fuser
+// does not implement yet, so nothing constructs it. Our gate runs clippy with `-D warnings`.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, KnownLayout, Immutable)]
 pub(crate) struct fuse_ioctl_iovec {
@@ -714,6 +718,9 @@ pub(crate) struct fuse_notify_store_out {
     pub(crate) padding: u32,
 }
 
+// Vendored-fork addition (see ../../README-VENDORED.md): part of the kernel ABI that fuser
+// does not implement yet, so nothing constructs it. Our gate runs clippy with `-D warnings`.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, KnownLayout, Immutable)]
 pub(crate) struct fuse_notify_retrieve_out {
@@ -724,6 +731,9 @@ pub(crate) struct fuse_notify_retrieve_out {
     pub(crate) padding: u32,
 }
 
+// Vendored-fork addition (see ../../README-VENDORED.md): part of the kernel ABI that fuser
+// does not implement yet, so nothing constructs it. Our gate runs clippy with `-D warnings`.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub(crate) struct fuse_notify_retrieve_in {
