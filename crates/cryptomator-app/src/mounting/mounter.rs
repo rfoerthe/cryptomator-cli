@@ -17,6 +17,12 @@ use std::sync::Arc;
 /// The `fsname` every Cryptomator mount reports (`SettledMounter.prepare`).
 pub const FILE_SYSTEM_NAME: &str = "cryptoFs";
 
+/// What a forced unmount of a service that has none is refused with, after `<service class>: `.
+///
+/// Shared by [`MountHandle::unmount`] and the daemon's `lock --force`, which refuses before it
+/// takes the mount out of its state and would otherwise word the same refusal differently.
+pub const FORCED_UNMOUNT_UNSUPPORTED: &str = "this mounter does not support forced unmount";
+
 /// Everything the mounter needs about one vault: its settings, the two configuration files they
 /// are read together with, the user's home directory (for the default mount-point base) and what
 /// the command line overrides.
@@ -95,7 +101,7 @@ impl MountHandle {
         let result = if forced {
             if !self.supports_forced {
                 return Err(AppError::UnmountFailed(format!(
-                    "{} cannot force an unmount",
+                    "{}: {FORCED_UNMOUNT_UNSUPPORTED}",
                     self.service_class
                 )));
             }
@@ -1061,7 +1067,10 @@ mod tests {
         let mut handle = mount(&req, &services, fs).expect("mount");
         assert!(!handle.supports_forced);
         let err = handle.unmount(true).expect_err("no forced unmount");
-        assert!(err.to_string().contains("cannot force an unmount"), "{err}");
+        assert!(
+            err.to_string().contains(FORCED_UNMOUNT_UNSUPPORTED),
+            "{err}"
+        );
         handle.close().expect("close");
     }
 }

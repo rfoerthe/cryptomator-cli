@@ -463,6 +463,19 @@ impl CryptoFs {
 
     /// Flushes and closes every open file.
     pub fn close(self) -> io::Result<()> {
+        self.flush_all()
+    }
+
+    /// [`CryptoFs::close`] without consuming the file system: flushes every open file and forgets
+    /// it, while the `CryptoFs` itself stays usable.
+    ///
+    /// For a caller that cannot take ownership -- a shared `Arc<CryptoFs>` a mount session still
+    /// holds on to -- and therefore cannot call [`CryptoFs::close`]: the buffered cleartext is
+    /// what must not be lost, and this is what writes it out.
+    ///
+    /// # Errors
+    /// The first error any of the flushes reports; the remaining files are still flushed.
+    pub fn flush_all(&self) -> io::Result<()> {
         self.open_files.close_all()
     }
 }
@@ -1220,6 +1233,27 @@ mod tests {
             fs.read_file(&CleartextPath::parse("/moved")).unwrap(),
             b"Xontent"
         );
+    }
+
+    #[test]
+    fn flush_all_writes_out_open_files_without_consuming_the_fs() {
+        let (_dir, fs) = test_fs(220, false);
+        let path = CleartextPath::parse("/buffered");
+        let handle = fs.open_file(&path, OpenOptions::write_new()).unwrap();
+        handle.write_all_at(b"payload", 0).unwrap();
+        let ciphertext = fs.ciphertext_path(&path).unwrap();
+        // Only the header is on disk so far; the chunk sits in the write buffer.
+        let buffered = std::fs::metadata(&ciphertext).unwrap().len();
+
+        fs.flush_all().unwrap();
+        let flushed = std::fs::metadata(&ciphertext).unwrap().len();
+        assert!(
+            flushed > buffered,
+            "flush_all wrote the dirty chunk out ({buffered} -> {flushed} bytes)"
+        );
+        // Unlike `close`, this leaves the file system usable.
+        assert_eq!(fs.read_file(&path).unwrap(), b"payload");
+        fs.close().unwrap();
     }
 
     #[test]

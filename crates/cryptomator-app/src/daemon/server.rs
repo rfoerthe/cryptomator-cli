@@ -43,7 +43,9 @@ use crate::daemon::protocol::{
     StatusResult, StreamItem, PROTOCOL_VERSION,
 };
 use crate::error::{AppError, Result};
-use crate::mounting::{self, MountHandle, MountOverrides, MountRequest};
+use crate::mounting::{
+    self, MountHandle, MountOverrides, MountRequest, FORCED_UNMOUNT_UNSUPPORTED,
+};
 use crate::settings::SettingsStore;
 use crate::state_dir::{process_alive, RunInfo, StateDir, VaultStateFiles};
 use cryptomator_core::fs::{
@@ -140,7 +142,9 @@ impl std::fmt::Debug for DaemonConfig {
 /// # Errors
 /// [`AppError::MountFailed`] when the `unlock` failed (a wrong key included, message
 /// `vault key does not match`), [`AppError::Io`] with [`io::ErrorKind::TimedOut`] when no
-/// `unlock` arrived in time, and anything [`StateDir::ensure`] or writing the pid file reports.
+/// `unlock` arrived in time, [`AppError::DaemonError`] with [`ErrorBody::ALREADY_UNLOCKED`] when
+/// another daemon already serves this vault, and anything [`StateDir::ensure`] or writing the pid
+/// file reports.
 pub fn run_daemon(config: DaemonConfig, shutdown: Arc<AtomicBool>) -> Result<()> {
     run_daemon_with_hook(config, shutdown, |_| {})
 }
@@ -159,10 +163,20 @@ fn run_daemon_with_hook(
     let files = config.state_dir.files(&config.vault_id);
     let pid = std::process::id();
 
+    // Before the first byte is written: a daemon that answers on this socket owns these state
+    // files, and overwriting its pid file would leave it unreachable but mounted.
+    refuse_if_serving(&files.socket)?;
+
     // Order (see the module docs): pid, then socket, then -- after the mount -- the run info.
-    files.write_pid(pid)?;
+    if let Err(err) = files.write_pid(pid) {
+        let _ = files.remove_all();
+        return Err(err);
+    }
     let listener = match bind_socket(&files.socket) {
         Ok(listener) => listener,
+        // A daemon that won the race in the meantime owns the files now; removing them would be
+        // exactly the damage `refuse_if_serving` prevents. Anything else is ours to clean up.
+        Err(err) if is_already_serving(&err) => return Err(err),
         Err(err) => {
             let _ = files.remove_all();
             return Err(err);
@@ -201,15 +215,43 @@ fn run_daemon_with_hook(
     }
 }
 
+/// Refuses to start when a daemon is already listening on `path`.
+///
+/// The socket *file* says nothing -- a crashed daemon leaves one behind -- so the question is
+/// whether somebody accepts on it. The registry asks it too before it spawns a daemon, but that
+/// check is a TOCTOU: two `crypto unlock`s for the same vault would otherwise both get here, and
+/// the second would take the socket away from the first while its volume stays mounted.
+///
+/// The probe is a connect and an immediate hangup, which is what `crypto status` does anyway.
+///
+/// # Errors
+/// [`AppError::DaemonError`] with [`ErrorBody::ALREADY_UNLOCKED`] when somebody answered.
+fn refuse_if_serving(path: &Path) -> Result<()> {
+    if UnixStream::connect(path).is_ok() {
+        return Err(AppError::DaemonError {
+            code: ErrorBody::ALREADY_UNLOCKED.to_owned(),
+            message: "another daemon is already serving this vault".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `err` is what [`refuse_if_serving`] reports.
+fn is_already_serving(err: &AppError) -> bool {
+    matches!(err, AppError::DaemonError { code, .. } if code == ErrorBody::ALREADY_UNLOCKED)
+}
+
 /// Binds the control socket and narrows it to 0600.
 ///
 /// A socket file left behind by a crashed daemon is removed first -- `bind` would fail with
-/// `EADDRINUSE` on it, and the registry has already established that nobody is listening (it is
-/// what starts a new daemon).
+/// `EADDRINUSE` on it. Removing one somebody is listening on would unhook a running daemon, so
+/// [`refuse_if_serving`] guards the removal; `run_daemon` has asked the same question before it
+/// wrote anything, and this closes the window between the two.
 ///
 /// The listener is non-blocking: [`accept_loop`] polls it so that a shutdown request is noticed
 /// within [`POLL_INTERVAL`] instead of only when the next client connects.
 fn bind_socket(path: &Path) -> Result<UnixListener> {
+    refuse_if_serving(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => log::debug!("removed a leftover socket at {}", path.display()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -541,9 +583,20 @@ fn unlock(
         read_only,
     };
     if let Err(err) = shared.files.write_info(&info) {
-        // Nothing may stay mounted that the CLI cannot find again.
-        if let Err(unmount) = release_mount(handle, false, Duration::ZERO) {
-            log::error!("cannot unmount after a failed run info: {unmount}");
+        // Nothing may stay mounted that the CLI cannot find again, so this is the full escalation
+        // the teardown does -- graceful, then forced.
+        if let Some(failure) = release_mount(handle, true, shared.config.force_unmount_after) {
+            log::error!("cannot unmount after a failed run info: {}", failure.error);
+            if let Some(handle) = failure.handle {
+                // The volume is still there. It goes back into the state -- together with the file
+                // system it serves -- so `shutdown_sequence` tries again instead of walking away
+                // from a mounted volume with no daemon and no run info behind it.
+                let mut state = shared.lock_state();
+                state.mounter = handle.service_class.clone();
+                state.mount = Some(handle);
+                state.fs = Some(fs);
+                return Err(err);
+            }
         }
         close_fs(fs);
         return Err(err);
@@ -628,10 +681,9 @@ fn lock_now(shared: &Arc<Shared>, force: bool) -> std::result::Result<(), LockFa
             return Err(LockFailure::NotUnlocked);
         };
         if force && !handle.supports_forced {
-            let message = format!(
-                "{}: this mounter does not support forced unmount",
-                handle.service_class
-            );
+            // The same refusal `MountHandle::unmount(true)` would give, one step earlier: this way
+            // the mount never leaves the state and the phase never becomes `Locking`.
+            let message = format!("{}: {FORCED_UNMOUNT_UNSUPPORTED}", handle.service_class);
             state.mount = Some(handle);
             return Err(LockFailure::Unmount(message));
         }
@@ -684,8 +736,13 @@ fn shutdown_sequence(shared: &Arc<Shared>) {
     if let Some(handle) = handle {
         // The mount is out of the shared state, so the wait for a forced unmount blocks nothing
         // but this teardown.
-        if let Err(err) = release_mount(handle, true, shared.config.force_unmount_after) {
-            log::error!("cannot unmount {}: {err}", shared.config.vault_id);
+        if let Some(failure) = release_mount(handle, true, shared.config.force_unmount_after) {
+            // The daemon is on its way out; there is nobody left to hand the handle back to.
+            log::error!(
+                "cannot unmount {}: {}",
+                shared.config.vault_id,
+                failure.error
+            );
         }
     }
     let fs = shared.lock_state().fs.take();
@@ -698,38 +755,87 @@ fn shutdown_sequence(shared: &Arc<Shared>) {
     log::info!("daemon for vault {} stopped", shared.config.vault_id);
 }
 
+/// A volume that would not go down, and what to do with it.
+struct ReleaseFailure {
+    /// The handle of a volume that is still mounted, so the caller can put it back and retry it
+    /// later. `None` once the volume is gone and only the release itself failed -- there is
+    /// nothing left to retry then.
+    handle: Option<MountHandle>,
+    error: AppError,
+}
+
 /// Unmounts `handle` and releases it. With `retry_forced` a failed graceful unmount is retried
 /// forcefully after `force_after`, if the service has a forced unmount at all.
 ///
-/// # Errors
-/// [`AppError::UnmountFailed`] if the volume is still mounted afterwards.
-fn release_mount(mut handle: MountHandle, retry_forced: bool, force_after: Duration) -> Result<()> {
-    if let Err(err) = handle.unmount(false) {
+/// Returns [`None`] when the volume is down and released, and a [`ReleaseFailure`] carrying
+/// [`AppError::UnmountFailed`] otherwise -- with the handle while the volume is still mounted,
+/// without it once only the release itself failed. (A [`Result`] of the two would be the more
+/// obvious shape, but an error variant this large is one clippy refuses.)
+fn release_mount(
+    mut handle: MountHandle,
+    retry_forced: bool,
+    force_after: Duration,
+) -> Option<ReleaseFailure> {
+    if let Err(error) = handle.unmount(false) {
         if !retry_forced || !handle.supports_forced {
-            return Err(err);
+            return Some(ReleaseFailure {
+                handle: Some(handle),
+                error,
+            });
         }
-        log::warn!("graceful unmount failed ({err}); forcing it in {force_after:?}");
+        log::warn!("graceful unmount failed ({error}); forcing it in {force_after:?}");
         std::thread::sleep(force_after);
-        handle.unmount(true)?;
+        if let Err(error) = handle.unmount(true) {
+            return Some(ReleaseFailure {
+                handle: Some(handle),
+                error,
+            });
+        }
     }
-    handle.close()
+    handle.close().err().map(|error| ReleaseFailure {
+        handle: None,
+        error,
+    })
 }
 
 /// Flushes and closes the file system.
 ///
-/// A [`CryptoFs`] can only be closed by its last owner. A clone that is still alive means a mount
-/// session did not release it, which is worth a line in the log but not worth failing a shutdown
-/// over -- the daemon is about to exit and the kernel closes the files either way.
+/// [`CryptoFs::close`] consumes the file system, so only its last owner can call it. Every caller
+/// here *is* that owner: the mount is released first, and nothing else keeps an `Arc<CryptoFs>`
+/// outside [`DaemonState::fs`] (the sampler reads it under the state lock for exactly that
+/// reason). A clone that is still alive is therefore a bug -- and one that must not cost the user
+/// their buffered writes, so the flush ([`CryptoFs::flush_all`], what `close` does) runs anyway.
 fn close_fs(fs: Arc<CryptoFs>) {
-    match Arc::into_inner(fs) {
-        Some(fs) => {
+    // `try_unwrap` rather than `into_inner`: it hands the `Arc` back, and only with it in hand can
+    // the fallback flush run. It may also fail while another thread is dropping the last other
+    // clone, which is the same "somebody else still holds it" this reports.
+    match Arc::try_unwrap(fs) {
+        Ok(fs) => {
+            #[cfg(test)]
+            OWNED_CLOSES.fetch_add(1, Ordering::Relaxed);
             if let Err(err) = fs.close() {
                 log::warn!("closing the file system failed: {err}");
             }
         }
-        None => log::warn!("the file system is still in use; not closing it"),
+        Err(fs) => {
+            #[cfg(test)]
+            SHARED_CLOSES.fetch_add(1, Ordering::Relaxed);
+            log::error!("the file system is still in use; flushing it without releasing it");
+            if let Err(err) = fs.flush_all() {
+                log::warn!("flushing the file system failed: {err}");
+            }
+        }
     }
 }
+
+/// How often [`close_fs`] owned the file system it closed.
+#[cfg(test)]
+static OWNED_CLOSES: AtomicU64 = AtomicU64::new(0);
+
+/// How often [`close_fs`] found a clone of the file system still alive -- the bug it reports. The
+/// tests assert this stays 0.
+#[cfg(test)]
+static SHARED_CLOSES: AtomicU64 = AtomicU64::new(0);
 
 /// `events`: the buffered records, and with `follow` everything that arrives afterwards.
 ///
@@ -744,7 +850,10 @@ fn handle_events(
     follow: bool,
     writer: &mut UnixStream,
 ) -> bool {
-    if shared.lock_state().phase == Phase::Starting {
+    // Only a mounted vault has events to report: before the mount there are none, and once the
+    // daemon is locking, the file system that produces them is on its way out (see the phase table
+    // in the module docs).
+    if shared.lock_state().phase != Phase::Unlocked {
         return respond(writer, &not_unlocked(id));
     }
     if !follow {
@@ -779,12 +888,18 @@ fn handle_events(
 }
 
 /// Samples the file system counters once per [`DaemonConfig::stats_interval`].
+///
+/// Sample and fold happen in one critical section, and the `Arc<CryptoFs>` never leaves the state:
+/// a clone held across the sample would be the one that makes [`close_fs`] in a concurrent `lock`
+/// miss its flush. Taking a snapshot is a handful of atomic loads, no I/O, so holding the state
+/// lock for it costs a `status` nothing.
 fn stats_loop(shared: &Arc<Shared>) {
     while !shared.wait_for_stop(shared.config.stats_interval) {
-        let fs = shared.lock_state().fs.clone();
-        let Some(fs) = fs else { continue };
-        let snapshot = fs.stats().snapshot();
-        shared.lock_state().apply_sample(snapshot, now_secs());
+        let mut state = shared.lock_state();
+        let Some(snapshot) = state.fs.as_ref().map(|fs| fs.stats().snapshot()) else {
+            continue;
+        };
+        state.apply_sample(snapshot, now_secs());
     }
 }
 
@@ -911,8 +1026,14 @@ impl Phase {
 ///
 /// One mutex rather than several: the phase, the mount, the file system and the counters are read
 /// together by `status` and `stats` and changed together by `unlock` and `lock`, and a daemon has
-/// no contention worth splitting them for. The mutex is held across the mount (`unlock` is one
-/// critical section), so a `status` that arrives while the vault is being mounted waits for it.
+/// no contention worth splitting them for.
+///
+/// It is held for short, I/O-free stretches only. Mounting and unmounting run under
+/// [`Shared::operation`] instead and take this lock just to publish their result, so a `status`
+/// that arrives while the vault is being mounted is answered right away -- with `STARTING`, until
+/// the mount is up. The one thing that must happen under this lock is reading
+/// [`DaemonState::fs`]: an `Arc<CryptoFs>` cloned out of here and kept alive would stop
+/// [`close_fs`] from closing the file system.
 struct DaemonState {
     phase: Phase,
     /// Set as soon as an `unlock` starts, so the unlock deadline does not fire in the middle of a
@@ -1230,6 +1351,13 @@ impl Shared {
     fn inject_event(&self, event: &FilesystemEvent) {
         self.events.push(event);
     }
+
+    /// Forces the phase, so a test can look at a daemon in [`Phase::Locking`] without racing the
+    /// unmount that would otherwise be the only way there.
+    #[cfg(test)]
+    fn force_phase(&self, phase: Phase) {
+        self.lock_state().phase = phase;
+    }
 }
 
 /// The daemon's event log: a bounded ring of the most recent [`EVENT_BUFFER_CAPACITY`] events,
@@ -1391,11 +1519,21 @@ mod tests {
     }
 
     impl Daemon {
-        /// Starts a daemon over a freshly initialised vault. `busy` makes the null mounter refuse
-        /// a graceful unmount, `settings` gets to change the vault's entry before it is saved.
+        /// [`Daemon::start_sampling`] with a sampling interval no test has to think about.
         fn start(
             busy: bool,
             timeouts: (Duration, Duration),
+            settings: impl FnOnce(&mut VaultSettingsJson),
+        ) -> Self {
+            Self::start_sampling(busy, timeouts, Duration::from_millis(20), settings)
+        }
+
+        /// Starts a daemon over a freshly initialised vault. `busy` makes the null mounter refuse
+        /// a graceful unmount, `settings` gets to change the vault's entry before it is saved.
+        fn start_sampling(
+            busy: bool,
+            timeouts: (Duration, Duration),
+            stats_interval: Duration,
             settings: impl FnOnce(&mut VaultSettingsJson),
         ) -> Self {
             // `tempfile` builds below `std::env::temp_dir()`, which keeps the socket path inside
@@ -1438,7 +1576,7 @@ mod tests {
                 home: dir.path().to_path_buf(),
                 services: vec![Box::new(NullMountProvider::enabled(true, busy))],
                 unlock_timeout,
-                stats_interval: Duration::from_millis(20),
+                stats_interval,
                 autolock_tick,
                 force_unmount_after: Duration::from_millis(10),
                 // The `log` crate allows one logger per process and the test binary shares one,
@@ -1515,6 +1653,24 @@ mod tests {
         match err {
             AppError::DaemonError { code, .. } => code,
             other => panic!("expected a daemon error, got {other:?}"),
+        }
+    }
+
+    /// A configuration for a daemon that never gets as far as its vault: the tests using it make
+    /// publishing the state files fail. Only what a test puts below `dir` exists.
+    fn state_file_config(dir: &Path) -> DaemonConfig {
+        DaemonConfig {
+            vault_id: VAULT_ID.to_owned(),
+            state_dir: StateDir::at(dir.join("s")),
+            store: SettingsStore::at(dir.join("settings.json")),
+            cli: CliConfig::default(),
+            home: dir.to_path_buf(),
+            services: vec![Box::new(NullMountProvider::enabled(true, false))],
+            unlock_timeout: Duration::from_millis(200),
+            stats_interval: Duration::from_millis(20),
+            autolock_tick: Duration::from_secs(3600),
+            force_unmount_after: Duration::from_millis(10),
+            log_file: None,
         }
     }
 
@@ -1715,5 +1871,138 @@ mod tests {
             "nothing was mounted, so no mount directory was left behind"
         );
         drop(daemon.dir);
+    }
+
+    #[test]
+    fn a_lock_closes_the_file_system_the_sampler_is_reading() {
+        let owned_before = OWNED_CLOSES.load(Ordering::Relaxed);
+        // 1 ms between samples: the stats thread is inside the state almost continuously, which is
+        // where a clone of the `Arc<CryptoFs>` would escape from.
+        for _ in 0..3 {
+            let daemon = Daemon::start_sampling(
+                false,
+                (DEADLINE, Duration::from_secs(3600)),
+                Duration::from_millis(1),
+                |_| {},
+            );
+            let mut client = daemon.client();
+            client.call(unlock_request(&encoded(KEY))).expect("unlock");
+            client.lock(false).expect("lock");
+            assert!(daemon.wait().is_ok(), "a locked daemon exits cleanly");
+            drop(daemon.dir);
+        }
+        assert_eq!(
+            SHARED_CLOSES.load(Ordering::Relaxed),
+            0,
+            "the file system was owned every time it was closed, so every `close` flushed"
+        );
+        assert!(
+            OWNED_CLOSES.load(Ordering::Relaxed) > owned_before,
+            "and it really was closed"
+        );
+    }
+
+    #[test]
+    fn a_run_info_that_cannot_be_written_takes_the_volume_down_again() {
+        // Busy, so the graceful unmount fails: only the forced retry gets this volume down.
+        let daemon = Daemon::start(true, (DEADLINE, Duration::from_secs(3600)), |_| {});
+        let mut client = daemon.client();
+        // A directory where the run info goes; the rename that publishes it cannot succeed.
+        std::fs::create_dir(&daemon.files.info).expect("the blocked run info path");
+
+        let err = client
+            .call(unlock_request(&encoded(KEY)))
+            .expect_err("the run info cannot be published");
+        assert_eq!(error_code(&err), ErrorBody::MOUNT_FAILED);
+
+        let outcome = daemon.wait().expect_err("a failed unlock stops the daemon");
+        assert!(matches!(outcome, AppError::Io(_)), "{outcome:?}");
+        assert!(
+            !daemon.mount_dir.join(NULL_MOUNT_MARKER).exists(),
+            "a volume the CLI could not find again must not stay mounted"
+        );
+        assert!(
+            !daemon.mount_dir.exists(),
+            "and the mount directory goes with it"
+        );
+        drop(daemon.dir);
+    }
+
+    #[test]
+    fn a_locking_daemon_refuses_events_and_stats() {
+        let daemon = Daemon::start(false, (DEADLINE, Duration::from_secs(3600)), |_| {});
+        let mut client = daemon.client();
+        client.call(unlock_request(&encoded(KEY))).expect("unlock");
+        // The real `Locking` window is an unmount long; this is the same state, held still.
+        daemon.shared.force_phase(Phase::Locking);
+
+        let events = client.events(0).expect_err("events while locking");
+        assert_eq!(error_code(&events), ErrorBody::NOT_UNLOCKED);
+        let stats = client.stats().expect_err("stats while locking");
+        assert_eq!(error_code(&stats), ErrorBody::NOT_UNLOCKED);
+        assert_eq!(
+            client.status().expect("status").state,
+            "LOCKING",
+            "ping, status and shutdown are what a locking daemon still answers"
+        );
+        client.ping().expect("ping");
+
+        daemon.shutdown.store(true, Ordering::Relaxed);
+        assert!(daemon.wait().is_ok(), "the shutdown takes the volume down");
+        assert!(!daemon.mount_dir.join(NULL_MOUNT_MARKER).exists());
+        drop(daemon.dir);
+    }
+
+    #[test]
+    fn a_daemon_leaves_the_socket_another_one_answers_on_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = state_file_config(dir.path());
+        config.state_dir.ensure().expect("state dir");
+        let files = config.state_dir.files(VAULT_ID);
+        // Stand-in for the daemon that is already serving this vault.
+        let listener = UnixListener::bind(&files.socket).expect("the first daemon's socket");
+        files.write_pid(4242).expect("its pid file");
+
+        let err = run_daemon(config, Arc::new(AtomicBool::new(false)))
+            .expect_err("the vault is already served");
+        assert_eq!(error_code(&err), ErrorBody::ALREADY_UNLOCKED);
+        assert!(
+            files.socket.exists(),
+            "the running daemon keeps its socket -- it is still listening on it"
+        );
+        listener.set_nonblocking(true).expect("nonblocking");
+        assert!(
+            listener.accept().is_ok(),
+            "the probe connected -- that is how the second daemon noticed the first"
+        );
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "and it was the only connection"
+        );
+        assert_eq!(files.read_pid(), Some(4242), "its pid file is untouched");
+        drop(listener);
+        drop(dir);
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_write_its_pid_file_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = state_file_config(dir.path());
+        config.state_dir.ensure().expect("state dir");
+        let files = config.state_dir.files(VAULT_ID);
+        // A directory where the pid file goes; the rename that publishes it cannot succeed.
+        std::fs::create_dir(&files.pid).expect("the blocked pid path");
+        // What an earlier, crashed run of this vault left behind.
+        std::fs::write(&files.info, "{}").expect("a stale run info");
+
+        let err = run_daemon(config, Arc::new(AtomicBool::new(false)))
+            .expect_err("the pid file cannot be written");
+        assert!(matches!(err, AppError::Io(_)), "{err:?}");
+        assert!(
+            !files.info.exists(),
+            "a daemon that gives up while publishing its state files removes them"
+        );
+        assert!(!files.socket.exists(), "and never bound a socket");
+        drop(dir);
     }
 }
