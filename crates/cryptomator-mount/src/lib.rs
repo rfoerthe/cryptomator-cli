@@ -21,7 +21,8 @@ pub use api::{
 pub use flags::{current_uid_gid, parse_mount_flags, AdapterOptions, MountFlags};
 #[cfg(feature = "fuse")]
 pub use fuse::{
-    errno_for, DirHandles, DirListing, DirSnapshot, FileHandles, InodeTable, OpenFileEntry,
+    errno_for, Attr, Created, DirHandles, DirListing, DirSnapshot, FileHandles, InodeTable,
+    OpenFileEntry, Statfs, VaultOps, VaultOpsConfig,
 };
 pub use mounttab::{is_mountpoint, mounted_paths};
 pub use transcoder::{FuseNormalization, NameTranscoder};

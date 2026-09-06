@@ -72,6 +72,14 @@ impl InodeTable {
             .map(|entry| entry.path.clone())
     }
 
+    /// The inode already mapped to `path`, without allocating one and without counting a lookup.
+    ///
+    /// `readdir` needs this: the kernel takes no reference on the inodes a listing names, so
+    /// resolving them through [`lookup`](Self::lookup) would hand out inodes nobody ever forgets.
+    pub fn ino_of(&self, path: &CleartextPath) -> Option<u64> {
+        lock(&self.inner).by_path.get(path).copied()
+    }
+
     /// The inode of `path`, allocating one if the path is not mapped yet, and counting the
     /// lookup the kernel now holds. A path that was [`remove_path`](Self::remove_path)d gets a
     /// fresh inode -- the old one stays reachable by number until it is forgotten.
