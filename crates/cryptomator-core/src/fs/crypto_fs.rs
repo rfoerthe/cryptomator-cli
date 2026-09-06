@@ -144,6 +144,10 @@ impl CryptoFs {
     pub fn is_read_only(&self) -> bool {
         self.options.read_only
     }
+    /// The longest cleartext name this file system accepts; FUSE reports it as `statfs.namelen`.
+    pub fn max_cleartext_name_length(&self) -> usize {
+        self.options.max_cleartext_name_length
+    }
     pub fn stats(&self) -> &CryptoFsStats {
         &self.stats
     }

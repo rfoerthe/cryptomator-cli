@@ -188,6 +188,21 @@ pub trait MountService: Send + Sync {
     }
     /// Starts configuring a mount of `fs`.
     fn for_file_system(&self, fs: Arc<CryptoFs>) -> Box<dyn MountBuilder>;
+    /// Takes down a mount this service left behind, addressed by its mount point alone.
+    ///
+    /// Recovering from a crashed daemon is the reason this exists: the [`Mount`] that owned the
+    /// session is gone, but the volume is still in the mount table. Services that can unmount by
+    /// path (every FUSE back end -- they shell out to `umount`/`fusermount3`) override this; the
+    /// default reports that the caller has to take the mount down by hand.
+    ///
+    /// # Errors
+    /// The unmount command's error, or [`UnmountError::Failed`] if this service cannot unmount by
+    /// path.
+    fn unmount_path(&self, _mountpoint: &Path, _forced: bool) -> Result<(), UnmountError> {
+        Err(UnmountError::Failed(
+            "unmounting by path is not supported by this mount service".to_owned(),
+        ))
+    }
 }
 
 /// A [`MountService`] rendered for `--json` output.
@@ -327,6 +342,14 @@ mod tests {
         );
         assert_eq!(json["defaultMountFlags"], "-orwsize=262144");
         assert_eq!(json["displayName"], "FUSE-T");
+    }
+
+    #[test]
+    fn unmount_path_is_unsupported_by_default() {
+        let err = DummyService
+            .unmount_path(Path::new("/mnt/Vault"), false)
+            .expect_err("the default implementation refuses");
+        assert!(matches!(err, UnmountError::Failed(_)), "{err:?}");
     }
 
     #[test]

@@ -5,20 +5,37 @@
 //! table the protocol requires, and [`handles`] holds the open files and directory snapshots a
 //! `fh` refers to. [`ops`] implements the operations themselves, free of the fuser event loop.
 //! [`adapter`] is the thin `fuser::Filesystem` over them and [`session`] the handle on the running
-//! event loop; the platform back ends follow in later tasks.
+//! event loop. [`mount`] holds the [`FuseMount`] they all hand back; the platform back ends are
+//! [`linux`] (libfuse3), [`fuset`] and [`macfuse`] (both through [`macos_dl`]).
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub mod adapter;
 pub mod errno;
+#[cfg(target_os = "macos")]
+pub mod fuset;
 pub mod handles;
 pub mod inodes;
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macfuse;
+#[cfg(target_os = "macos")]
+pub mod macos_dl;
+pub mod mount;
 pub mod ops;
 pub mod session;
 
 pub use adapter::CryptoFuse;
 pub use errno::errno_for;
+#[cfg(target_os = "macos")]
+pub use fuset::{FuseTMountBuilder, FuseTMountProvider};
 pub use handles::{DirHandles, DirListing, DirSnapshot, FileHandles, OpenFileEntry};
 pub use inodes::InodeTable;
+pub use linux::{LinuxFuseMountBuilder, LinuxFuseMountProvider};
+#[cfg(target_os = "macos")]
+pub use macfuse::{MacFuseMountBuilder, MacFuseMountProvider};
+#[cfg(target_os = "macos")]
+pub use macos_dl::LibFuse;
+pub use mount::FuseMount;
 pub use ops::{Attr, Created, Statfs, VaultOps, VaultOpsConfig};
 pub use session::{FuseSessionHandle, Unmounter};
 
