@@ -3,25 +3,32 @@
 //! The numbers come from the daemon over its control socket, so the vault has to be unlocked --
 //! a locked one has nobody to ask, which is a state error (exit code 5), not an empty result.
 use crate::cli::StatsArgs;
-use crate::commands::{unlocked_vault, Ctx};
+use crate::commands::{install_interrupt, unlocked_vault, vault_label, Ctx};
 use crate::exit;
+use crate::output::{is_broken_pipe, write_line};
 use anyhow::Result;
 use cryptomator_app::{DaemonClient, StatsResult};
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How often `--follow` looks at the Ctrl-C flag while waiting out its interval.
 const POLL: Duration = Duration::from_millis(100);
 
 pub fn stats(ctx: &Ctx, args: StatsArgs) -> Result<u8> {
-    let (_, socket) = unlocked_vault(ctx, &args.vault)?;
+    let (info, socket) = unlocked_vault(ctx, &args.vault)?;
     let mut client = DaemonClient::connect(&socket)?;
     if !args.follow {
         let stats = client.stats()?;
-        ctx.out
-            .emit(serde_json::to_value(&stats)?, || render(&stats))?;
-        return Ok(exit::OK);
+        return match ctx
+            .out
+            .emit(serde_json::to_value(&stats)?, || render(&stats))
+        {
+            // A reader that closed the pipe is done with us, so we are done too.
+            Err(err) if is_broken_pipe(&err) => Ok(exit::OK),
+            Err(err) => Err(err),
+            Ok(()) => Ok(exit::OK),
+        };
     }
 
     // The handler is installed before the notice is printed, so anything that reacts to the
@@ -29,32 +36,29 @@ pub fn stats(ctx: &Ctx, args: StatsArgs) -> Result<u8> {
     let interrupted = install_interrupt()?;
     eprintln!(
         "following the statistics of {}; press Ctrl-C to stop",
-        args.vault
+        vault_label(&info)
     );
     let interval = Duration::from_secs(args.interval);
     while !interrupted.load(Ordering::Relaxed) {
         let stats = client.stats()?;
-        if ctx.out.json {
+        let line = if ctx.out.json {
             // One object per line, not the pretty-printed document a single `stats` prints: a
             // follow stream is read line by line.
-            println!("{}", serde_json::to_string(&stats)?);
+            serde_json::to_string(&stats)?
         } else {
-            println!("{}", render(&stats));
+            render(&stats)
+        };
+        if let Err(err) = write_line(&line) {
+            // `| head -1` is the canonical way to read a stream: a closed pipe ends the follow
+            // loop successfully instead of panicking out of `println!` with exit code 101.
+            if err.kind() == ErrorKind::BrokenPipe {
+                return Ok(exit::OK);
+            }
+            return Err(err.into());
         }
         wait(interval, &interrupted);
     }
     Ok(exit::OK)
-}
-
-/// Sets a flag on Ctrl-C instead of ending the process, so the loop can stop between samples and
-/// exit 0 like any other successful command.
-///
-/// # Errors
-/// Whatever `signal_hook` reports while installing the handler.
-fn install_interrupt() -> Result<Arc<AtomicBool>> {
-    let flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))?;
-    Ok(flag)
 }
 
 /// Waits `interval`, looking at `interrupted` every [`POLL`] so Ctrl-C is not sat out.
@@ -101,7 +105,9 @@ fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    // 1023.95 rather than 1024.0: anything above it rounds to `1024.0` at one decimal, and
+    // `1024.0 KiB` is not a unit anybody wants to read.
+    while value >= 1023.95 && unit + 1 < UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
@@ -141,6 +147,9 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(12_595), "12.3 KiB");
         assert_eq!(human_bytes(1_258_291), "1.2 MiB");
+        // Just below a boundary the value rounds up, so the unit steps up with it.
+        assert_eq!(human_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(human_bytes(1_048_576), "1.0 MiB");
         // The largest unit is not exceeded; the number grows instead.
         assert_eq!(human_bytes(u64::MAX), "16384.0 PiB");
     }

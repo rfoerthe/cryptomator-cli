@@ -4,12 +4,12 @@
 //! conflict it resolved. The daemon keeps the last thousand of them in memory, so the log starts
 //! over with every unlock and a locked vault has none (exit code 5, like `stats`).
 use crate::cli::EventsArgs;
-use crate::commands::{unlocked_vault, Ctx};
+use crate::commands::{install_interrupt, unlocked_vault, vault_label, Ctx};
 use crate::exit;
+use crate::output::{is_broken_pipe, write_line};
 use anyhow::Result;
 use cryptomator_app::{format_timestamp, DaemonClient, EventRecord, Request};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, UNIX_EPOCH};
 
 /// How long a `--follow` read waits before it looks at the Ctrl-C flag again. The daemon sends
@@ -17,14 +17,19 @@ use std::time::{Duration, UNIX_EPOCH};
 const FOLLOW_POLL: Duration = Duration::from_millis(500);
 
 pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
-    let (_, socket) = unlocked_vault(ctx, &args.vault)?;
+    let (info, socket) = unlocked_vault(ctx, &args.vault)?;
     let mut client = DaemonClient::connect(&socket)?;
     if !args.follow {
         let result = client.events(args.since)?;
-        ctx.out.emit(serde_json::to_value(&result.events)?, || {
+        let printed = ctx.out.emit(serde_json::to_value(&result.events)?, || {
             render(&result.events)
-        })?;
-        return Ok(exit::OK);
+        });
+        return match printed {
+            // A reader that closed the pipe is done with us, so we are done too.
+            Err(err) if is_broken_pipe(&err) => Ok(exit::OK),
+            Err(err) => Err(err),
+            Ok(()) => Ok(exit::OK),
+        };
     }
 
     // The handler is installed before the notice is printed, so anything that reacts to the
@@ -32,7 +37,7 @@ pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
     let interrupted = install_interrupt()?;
     eprintln!(
         "following the events of {}; press Ctrl-C to stop",
-        args.vault
+        vault_label(&info)
     );
     // A read timeout turns the daemon's silence into an idle callback instead of a blocked
     // process; a message that arrives split across one of those timeouts is not lost, see
@@ -53,13 +58,14 @@ pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
             } else {
                 Ok(line_of(&event))
             };
-            match line {
-                Ok(line) => {
-                    println!("{line}");
-                    !interrupted.load(Ordering::Relaxed)
-                }
+            match line.and_then(|line| write_line(&line).map_err(anyhow::Error::from)) {
+                Ok(()) => !interrupted.load(Ordering::Relaxed),
                 Err(err) => {
-                    failure = Some(err);
+                    // `| head -1` is the canonical way to read a stream: a closed pipe ends the
+                    // stream successfully instead of panicking out of `println!` with code 101.
+                    if !is_broken_pipe(&err) {
+                        failure = Some(err);
+                    }
                     false
                 }
             }
@@ -70,17 +76,6 @@ pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
         Some(err) => Err(err),
         None => Ok(exit::OK),
     }
-}
-
-/// Sets a flag on Ctrl-C instead of ending the process, so the stream can be closed properly and
-/// the command exits 0 like any other successful one.
-///
-/// # Errors
-/// Whatever `signal_hook` reports while installing the handler.
-fn install_interrupt() -> Result<Arc<AtomicBool>> {
-    let flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))?;
-    Ok(flag)
 }
 
 /// One line per event, or a note that there are none.

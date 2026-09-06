@@ -198,7 +198,7 @@ fn a_foreground_unlock_serves_until_it_is_locked() {
     assert!(!fx.mount_points_dir().join("f").join(MARKER).exists());
 }
 
-/// Waits [`DEADLINE`] for `child` and kills it rather than leaving it behind.
+/// Waits [`DEADLINE`] for `child` to exit and kills it rather than leaving it behind.
 fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline {
@@ -209,7 +209,7 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("the foreground unlock did not end within {DEADLINE:?}");
+    panic!("the child did not end within {DEADLINE:?}");
 }
 
 #[test]
@@ -478,12 +478,15 @@ fn a_mount_that_fails_reports_the_daemon_log() {
 
 /// Reads the first line of `stream` in a thread, so a test can give up instead of blocking on a
 /// child that never says anything.
-fn first_line(stream: impl std::io::Read + Send + 'static) -> String {
+/// The stream comes back with the line, still open: whoever wants the child to see a closed pipe
+/// drops it, and whoever does not keeps it alive.
+fn first_line<R: std::io::Read + Send + 'static>(stream: R) -> (String, R) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stream);
         let mut line = String::new();
-        let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line);
-        let _ = tx.send(line);
+        let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+        let _ = tx.send((line, reader.into_inner()));
     });
     rx.recv_timeout(DEADLINE)
         .expect("the child says something within the deadline")
@@ -588,9 +591,14 @@ fn stats_and_events_follow_until_they_are_interrupted() {
     let fx = Fixture::new("w");
     unlock(&fx);
 
-    for args in [
-        vec!["--json", "stats", "w", "--follow", "--interval", "1"],
-        vec!["--json", "events", "w", "--follow"],
+    // `stats --follow` samples right away, so its first line proves the follow loop prints what
+    // it promises; an idle `events --follow` has nothing to report and only its notice is checked.
+    for (args, samples) in [
+        (
+            vec!["--json", "stats", "w", "--follow", "--interval", "1"],
+            true,
+        ),
+        (vec!["--json", "events", "w", "--follow"], false),
     ] {
         let mut child = fx
             .crypto_daemon_cmd(&args)
@@ -601,12 +609,55 @@ fn stats_and_events_follow_until_they_are_interrupted() {
             .unwrap();
         // The notice is printed *after* the SIGINT handler is installed, so seeing it means the
         // interrupt below cannot arrive too early and kill the child instead.
-        let notice = first_line(child.stderr.take().unwrap());
+        let (notice, _stderr) = first_line(child.stderr.take().unwrap());
         assert!(notice.contains("Ctrl-C"), "{args:?}: {notice}");
+        // The pipe is held open the whole time, so the child stops because of the signal and not
+        // because its reader went away.
+        let mut stdout = child.stdout.take().unwrap();
+        if samples {
+            let (line, rest) = first_line(stdout);
+            stdout = rest;
+            let sample: Value = serde_json::from_str(line.trim())
+                .unwrap_or_else(|err| panic!("{args:?}: {line:?} is not one NDJSON object: {err}"));
+            assert!(
+                sample.get("bytesPerSecondRead").is_some(),
+                "{args:?}: {sample}"
+            );
+        }
         interrupt(child.id());
         let status = wait_for_exit(&mut child);
         assert_eq!(status.code(), Some(0), "{args:?} ends cleanly on Ctrl-C");
+        drop(stdout);
     }
+}
+
+#[test]
+fn a_follow_stream_ends_with_code_0_when_its_reader_closes_the_pipe() {
+    let fx = Fixture::new("h");
+    unlock(&fx);
+
+    // What `crypto stats h --follow --json | head -1` does: read one line, then close the pipe.
+    // `events --follow` takes the same path, but an idle vault gives it nothing to write.
+    let mut child = fx
+        .crypto_daemon_cmd(&["--json", "stats", "h", "--follow", "--interval", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (notice, _stderr) = first_line(child.stderr.take().unwrap());
+    assert!(notice.contains("Ctrl-C"), "{notice}");
+    let (line, stdout) = first_line(child.stdout.take().unwrap());
+    json(line.trim().as_bytes());
+    drop(stdout);
+
+    // The next sample hits the closed pipe: that is a normal end (0), not a panic (101).
+    let status = wait_for_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a closed stdout ends the follow loop cleanly"
+    );
 }
 
 #[test]

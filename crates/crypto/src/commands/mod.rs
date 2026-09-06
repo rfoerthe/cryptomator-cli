@@ -19,6 +19,8 @@ use cryptomator_app::settings::{resolve_vault_index, SettingsStore, VaultSetting
 use cryptomator_app::{AppError, RuntimeState, StateDir, VaultInfo, VaultRegistry};
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct Ctx {
@@ -59,6 +61,24 @@ pub fn unlocked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultInfo, PathBuf)
     }
     let socket = ctx.state_dir.files(&info.id).socket;
     Ok((info, socket))
+}
+
+/// How a vault is named in a message to the user: its display name, or its id when it has none.
+pub fn vault_label(info: &VaultInfo) -> &str {
+    info.display_name.as_deref().unwrap_or(&info.id)
+}
+
+/// Sets a flag on Ctrl-C instead of ending the process, so a `--follow` loop can stop between
+/// messages and exit 0 like any other successful command.
+///
+/// Shared by `crypto stats --follow` and `crypto events --follow`.
+///
+/// # Errors
+/// Whatever `signal_hook` reports while installing the handler.
+pub fn install_interrupt() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))?;
+    Ok(flag)
 }
 
 /// Resolves a vault reference to its settings entry and path, requiring the vault to be in state

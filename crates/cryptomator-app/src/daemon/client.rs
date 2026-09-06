@@ -4,8 +4,8 @@
 //! deliberately blocking and single-threaded -- a command sends one request and waits for its
 //! answer -- and it owns the connection, so dropping it closes the socket.
 use crate::daemon::protocol::{
-    read_line, read_line_into, write_line, EventRecord, EventsResult, Hello, LineStatus, Request,
-    Response, StatsResult, StatusResult, StreamItem, PROTOCOL_VERSION,
+    line_to_string, read_line, read_line_into, write_line, EventRecord, EventsResult, Hello,
+    LineStatus, Request, Response, StatsResult, StatusResult, StreamItem, PROTOCOL_VERSION,
 };
 use crate::error::{AppError, Result};
 use serde::de::DeserializeOwned;
@@ -30,8 +30,9 @@ pub struct DaemonClient {
     next_id: u64,
     /// The line being read, kept across calls: with a read timeout
     /// ([`set_read_timeout`](DaemonClient::set_read_timeout)) a message can arrive in pieces, and
-    /// the piece that came before the timeout must not be thrown away.
-    pending: String,
+    /// the piece that came before the timeout must not be thrown away. Bytes rather than text,
+    /// because a timeout can fall inside a multi-byte character.
+    pending: Vec<u8>,
     /// The greeting the daemon sent; it names the vault and the daemon's pid.
     pub hello: Hello,
 }
@@ -166,7 +167,7 @@ impl DaemonClient {
             reader,
             writer,
             next_id: 1,
-            pending: String::new(),
+            pending: Vec::new(),
             hello,
         })
     }
@@ -329,15 +330,15 @@ impl DaemonClient {
                 self.pending = pending;
                 return Ok(None);
             }
-            Ok(LineStatus::Eof) => {
-                return Err(AppError::DaemonUnreachable(
-                    "the daemon closed the connection".to_owned(),
-                ))
+            // The daemon ends every message with a newline, so a line without one means it went
+            // away half way through writing -- not that it sent us something malformed.
+            Ok(LineStatus::Eof) | Ok(LineStatus::Complete { terminated: false }) => {
+                return Err(closed())
             }
-            Ok(LineStatus::Complete) => {}
+            Ok(LineStatus::Complete { terminated: true }) => {}
             Err(err) => return Err(err),
         }
-        let line = pending;
+        let line = line_to_string(pending).map_err(|_| malformed())?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|_| malformed())?;
         if value.get("event").is_some() {
             serde_json::from_value(value)
@@ -380,6 +381,11 @@ fn transport(err: &io::Error) -> AppError {
 
 fn malformed() -> AppError {
     AppError::DaemonUnreachable("malformed message from the daemon".to_owned())
+}
+
+/// The daemon hung up: at end of input, or in the middle of a line it never finished.
+fn closed() -> AppError {
+    AppError::DaemonUnreachable("the daemon closed the connection".to_owned())
 }
 
 /// The greeting failed to parse, or its `hello` field is not [`Hello::MAGIC`].
@@ -792,6 +798,23 @@ mod tests {
                 assert!(message.contains("malformed"), "{message}");
             }
             other => panic!("expected a malformed-message error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_the_daemon_never_finished_reads_as_a_closed_connection() {
+        // The reply is written without its newline and the fake then hangs up: from the client's
+        // side that is a daemon that died mid-message, not a malformed one.
+        let fake = spawn_fake_with_reply(PROTOCOL_VERSION, |id| {
+            serde_json::to_string(&Response::ok(id, serde_json::Value::Null))
+                .expect("a response serialises")
+        });
+        let mut client = DaemonClient::connect(&fake.socket).expect("connects");
+        match client.ping() {
+            Err(AppError::DaemonUnreachable(message)) => {
+                assert!(message.contains("closed the connection"), "{message}");
+            }
+            other => panic!("expected a closed-connection error, got {other:?}"),
         }
     }
 

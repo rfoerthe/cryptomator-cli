@@ -334,7 +334,11 @@ pub fn write_line<W: Write>(w: &mut W, value: &impl Serialize) -> io::Result<()>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineStatus {
     /// The buffer holds one complete line, terminator already stripped.
-    Complete,
+    ///
+    /// `terminated` says whether a `\n` actually ended it. A line without one is the last thing a
+    /// peer wrote before closing: [`read_request`] still decodes it, but a caller that expects the
+    /// connection to stay open should read it as "the peer went away mid-message".
+    Complete { terminated: bool },
     /// End of input, and the buffer is empty.
     Eof,
     /// The read timed out before the line was complete. Whatever arrived is in the buffer and
@@ -350,18 +354,22 @@ pub enum LineStatus {
 /// for a signal in between cannot lose half a message. `buf` is only ever appended to; the caller
 /// clears it once it has taken the line.
 ///
+/// The buffer holds bytes, not text, precisely because of that resumption: a timeout can fall
+/// between the two bytes of a `ü`, and only the complete line is guaranteed to be valid UTF-8.
+/// Use [`line_to_string`] once the status is [`LineStatus::Complete`].
+///
 /// A line longer than [`MAX_LINE_LEN`] (the terminator does not count towards the limit, so
 /// `\r\n` gets its own byte of headroom) is an [`io::ErrorKind::InvalidData`] error rather than an
 /// unbounded allocation, and the reader is left just past the limit -- the connection is not
 /// usable afterwards.
-pub fn read_line_into<R: BufRead>(r: &mut R, buf: &mut String) -> io::Result<LineStatus> {
+pub fn read_line_into<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<LineStatus> {
     // Two bytes of headroom past MAX_LINE_LEN: one for `\n`, one more so a `\r\n` terminator on a
     // line at exactly the limit still fits before the length check below rejects it.
     let limit = (MAX_LINE_LEN + 2).saturating_sub(buf.len()) as u64;
-    let read = match r.take(limit).read_line(buf) {
+    let read = match r.take(limit).read_until(b'\n', buf) {
         Ok(read) => read,
-        // The bytes read before the timeout stay in `buf` (`read_line` appends as it goes), so
-        // this is a resumption point, not a loss.
+        // The bytes read before the timeout stay in `buf` (`read_until` appends as it goes and
+        // keeps what it appended), so this is a resumption point, not a loss.
         Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
             return Ok(LineStatus::Incomplete)
         }
@@ -370,10 +378,10 @@ pub fn read_line_into<R: BufRead>(r: &mut R, buf: &mut String) -> io::Result<Lin
     if read == 0 && buf.is_empty() {
         return Ok(LineStatus::Eof);
     }
-    // A last line without a terminator is accepted: peers that close right after writing are
-    // common enough, and the JSON either parses or it does not. `read_line` only returns without
-    // a `\n` at end of input or at the limit, so there is nothing more to wait for either way.
-    while buf.ends_with('\n') || buf.ends_with('\r') {
+    // `read_until` only returns without a `\n` at end of input or at the limit, so there is
+    // nothing more to wait for either way -- the caller decides what an unterminated line means.
+    let terminated = buf.last() == Some(&b'\n');
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
         buf.pop();
     }
     if buf.len() > MAX_LINE_LEN {
@@ -382,7 +390,23 @@ pub fn read_line_into<R: BufRead>(r: &mut R, buf: &mut String) -> io::Result<Lin
             format!("protocol line exceeds {MAX_LINE_LEN} bytes"),
         ));
     }
-    Ok(LineStatus::Complete)
+    Ok(LineStatus::Complete { terminated })
+}
+
+/// Turns a complete line into text, wiping the bytes if they turn out not to be UTF-8.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] for a line that is not valid UTF-8. The message never quotes the
+/// bytes: this is the one call that sees an [`Request::Unlock`] line.
+pub fn line_to_string(line: Vec<u8>) -> io::Result<String> {
+    String::from_utf8(line).map_err(|err| {
+        let mut bytes = err.into_bytes();
+        bytes.zeroize();
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "protocol line is not valid UTF-8",
+        )
+    })
 }
 
 /// Reads one line, without its terminator, from a blocking reader.
@@ -391,15 +415,22 @@ pub fn read_line_into<R: BufRead>(r: &mut R, buf: &mut String) -> io::Result<Lin
 /// a read timeout should use that function instead, because a timeout here is an error that
 /// throws the partial line away.
 pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
-    let mut line = String::with_capacity(LINE_BUFFER);
+    let mut line = Vec::with_capacity(LINE_BUFFER);
     match read_line_into(r, &mut line)? {
-        LineStatus::Complete => Ok(Some(line)),
+        // A last line without a terminator is accepted: peers that close right after writing are
+        // common enough, and the JSON either parses or it does not.
+        LineStatus::Complete { .. } => line_to_string(line).map(Some),
         LineStatus::Eof => Ok(None),
-        LineStatus::Incomplete => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "the read timed out before the line was complete",
-        )),
+        LineStatus::Incomplete => Err(timed_out()),
     }
+}
+
+/// The error a timeout becomes on a reader that cannot resume, see [`read_line`].
+fn timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "the read timed out before the line was complete",
+    )
 }
 
 /// Reads and decodes one [`Request`], wiping the raw line afterwards.
@@ -409,10 +440,17 @@ pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
 /// does not decode is an [`io::ErrorKind::InvalidData`] error whose message names the position
 /// only -- never the payload.
 pub fn read_request<R: BufRead>(r: &mut R) -> io::Result<Option<Request>> {
-    let Some(line) = read_line(r)? else {
-        return Ok(None);
-    };
-    let line = Zeroizing::new(line);
+    // The line is read here rather than through `read_line` so that both the bytes and the text
+    // they become are wiped: `line_to_string` reuses the allocation, and each `Zeroizing` clears
+    // whatever its own buffer still holds.
+    let mut raw = Zeroizing::new(Vec::with_capacity(LINE_BUFFER));
+    match read_line_into(r, &mut raw)? {
+        LineStatus::Eof => return Ok(None),
+        // An unterminated last line is still a request: a peer that writes and closes is normal.
+        LineStatus::Complete { .. } => {}
+        LineStatus::Incomplete => return Err(timed_out()),
+    }
+    let line = Zeroizing::new(line_to_string(std::mem::take(&mut *raw))?);
     let request = serde_json::from_str(&line).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -673,25 +711,29 @@ mod tests {
             chunks: [b"{\"a\":".as_slice(), b"1}\n{\"b\":2}\n".as_slice()].into(),
             timeout_next: false,
         });
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         // The first half arrives, then the read times out -- and the half is still there.
         assert_eq!(
             read_line_into(&mut input, &mut buf).expect("first half"),
             LineStatus::Incomplete
         );
-        assert_eq!(buf, "{\"a\":");
+        assert_eq!(buf.as_slice(), b"{\"a\":".as_slice());
         assert_eq!(
             read_line_into(&mut input, &mut buf).expect("second half"),
-            LineStatus::Complete
+            LineStatus::Complete { terminated: true }
         );
-        assert_eq!(buf, "{\"a\":1}", "nothing was lost across the timeout");
+        assert_eq!(
+            buf.as_slice(),
+            b"{\"a\":1}".as_slice(),
+            "nothing was lost across the timeout"
+        );
 
         buf.clear();
         assert_eq!(
             read_line_into(&mut input, &mut buf).expect("the buffered second line"),
-            LineStatus::Complete
+            LineStatus::Complete { terminated: true }
         );
-        assert_eq!(buf, "{\"b\":2}");
+        assert_eq!(buf.as_slice(), b"{\"b\":2}".as_slice());
         buf.clear();
         assert_eq!(
             read_line_into(&mut input, &mut buf).expect("a timeout with nothing pending"),
@@ -701,6 +743,76 @@ mod tests {
             read_line_into(&mut input, &mut buf).expect("end of input"),
             LineStatus::Eof
         );
+    }
+
+    #[test]
+    fn read_line_into_keeps_a_character_split_by_a_timeout() {
+        // `{"m":"Ü"}` cut between the two bytes of the `Ü`: the buffer holds bytes precisely so
+        // that this half character survives instead of being dropped as invalid UTF-8.
+        let mut input = io::BufReader::new(Stuttering {
+            chunks: [b"{\"m\":\"\xc3".as_slice(), b"\x9c\"}\n".as_slice()].into(),
+            timeout_next: false,
+        });
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("first half"),
+            LineStatus::Incomplete
+        );
+        assert_eq!(
+            buf.as_slice(),
+            b"{\"m\":\"\xc3".as_slice(),
+            "the lead byte of the character is still there"
+        );
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("second half"),
+            LineStatus::Complete { terminated: true }
+        );
+        assert_eq!(
+            line_to_string(buf).expect("the complete line is valid UTF-8"),
+            "{\"m\":\"Ü\"}"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_terminator_is_complete_but_marked() {
+        let mut input = Cursor::new(b"{\"a\":1}\ntail".to_vec());
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("the terminated line"),
+            LineStatus::Complete { terminated: true }
+        );
+        buf.clear();
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("the last line"),
+            LineStatus::Complete { terminated: false },
+            "a peer that closed mid-line is distinguishable"
+        );
+        assert_eq!(buf.as_slice(), b"tail".as_slice());
+        buf.clear();
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("end of input"),
+            LineStatus::Eof
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_rejected_without_quoting_it() {
+        let err = line_to_string(b"{\"key\":\"s3cr3t\xff\"}".to_vec()).expect_err("not UTF-8");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let rendered = err.to_string();
+        assert!(!rendered.contains("s3cr3t"), "{rendered}");
+        assert!(rendered.contains("UTF-8"), "{rendered}");
+    }
+
+    #[test]
+    fn read_request_accepts_an_unterminated_last_line() {
+        let mut input = Cursor::new(b"{\"op\":\"ping\",\"id\":8}".to_vec());
+        let request = read_request(&mut input)
+            .expect("decodes")
+            .expect("one request");
+        assert_eq!(request.op(), "ping");
+        assert_eq!(request.id(), 8);
+        assert!(read_request(&mut input).expect("eof").is_none());
     }
 
     #[test]
