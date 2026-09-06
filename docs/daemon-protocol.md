@@ -79,7 +79,11 @@ request before the first `unlock` is answered with `NOT_UNLOCKED`.
   probes it (and persists it in `settings.json`) before it spawns the daemon, so the daemon never
   writes into a vault to find out.
 
-The response arrives when the mount call has returned:
+The response arrives once the volume is really usable -- the mount call has returned **and** the
+mount point has appeared in the system mount table (checked every 50 ms, for at most 10 s). FUSE-T
+mounts asynchronously, so answering earlier would let a caller write into the bare directory
+underneath the mount point. A volume that never becomes visible is `MOUNT_FAILED` like any other
+mount failure, with the mount released before the answer:
 
 ```json
 {"id":1,"ok":true,"result":{"mountpoint":"/Users/me/mnt/secret"}}

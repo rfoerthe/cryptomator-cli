@@ -73,6 +73,10 @@ pub struct MountHandle {
     pub cleanup: Option<PathBuf>,
     /// The Java class name of the mount service that produced this mount.
     pub service_class: String,
+    /// [`MountService::appears_in_mount_table`] of the service that produced this mount: whether
+    /// waiting for the volume in the system mount table can ever succeed. `false` only for the
+    /// null mounter.
+    pub appears_in_mount_table: bool,
 }
 
 impl std::fmt::Debug for MountHandle {
@@ -82,6 +86,7 @@ impl std::fmt::Debug for MountHandle {
             .field("supports_forced", &self.supports_forced)
             .field("cleanup", &self.cleanup)
             .field("service_class", &self.service_class)
+            .field("appears_in_mount_table", &self.appears_in_mount_table)
             .finish()
     }
 }
@@ -248,6 +253,7 @@ pub fn mount(
         supports_forced: service.has_capability(MountCapability::UnmountForced),
         cleanup,
         service_class: service.java_class_name().to_owned(),
+        appears_in_mount_table: service.appears_in_mount_table(),
     })
 }
 
@@ -796,6 +802,10 @@ mod tests {
         );
         assert!(handle.supports_forced);
         assert_eq!(handle.service_class, "org.example.Fake");
+        assert!(
+            handle.appears_in_mount_table,
+            "a service that does not opt out is waited for in the mount table"
+        );
         handle.close().expect("close");
     }
 
@@ -911,6 +921,10 @@ mod tests {
         assert_eq!(handle.cleanup.as_deref(), Some(expected.as_path()));
         assert_eq!(handle.mountpoint(), Mountpoint::Path(expected.clone()));
         assert_eq!(handle.service_class, NULL_MOUNTER_CLASS);
+        assert!(
+            !handle.appears_in_mount_table,
+            "a null mount never reaches the mount table, so nothing may wait for it there"
+        );
         let marker = expected.join(NULL_MOUNT_MARKER);
         assert_eq!(
             std::fs::read_to_string(&marker).expect("marker"),

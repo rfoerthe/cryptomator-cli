@@ -176,6 +176,12 @@ impl MountService for NullMountProvider {
         NULL_CAPABILITIES
     }
 
+    /// A null mount is a marker file, not a volume: it never reaches the mount table, and a
+    /// caller waiting for it there would wait forever.
+    fn appears_in_mount_table(&self) -> bool {
+        false
+    }
+
     fn default_mount_flags(&self) -> String {
         let (uid, gid) = current_uid_gid();
         format!("-ouid={uid} -ogid={gid}")

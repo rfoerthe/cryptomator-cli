@@ -6,6 +6,7 @@
 mod common;
 
 use common::Sandbox;
+use cryptomator_mount::mounttab::is_mountpoint;
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -959,4 +960,97 @@ fn a_follow_stream_ends_with_code_0_when_the_vault_is_locked() {
         "a follow stream whose vault is locked ends cleanly"
     );
     drop(stdout);
+}
+
+/// Set to `1` to allow the ignored test below to mount a real file system on this machine.
+const E2E_ENV: &str = "CRYPTO_E2E_MOUNT";
+/// What the test writes through the mount, and reads back out of the vault afterwards.
+const E2E_CONTENT: &str = "written the instant unlock returned\n";
+
+/// The alias of the first mount service that really mounts and works on this machine.
+///
+/// `crypto mounters` without `--all` lists exactly the supported ones and leaves the null mounter
+/// out, so the first entry is the FUSE back end this platform has (FUSE-T or macFUSE on macOS,
+/// `fuse` on Linux) -- or none, and the test skips.
+fn supported_real_mounter(fixture: &Fixture) -> Option<String> {
+    let out = fixture
+        .crypto(&["--json", "mounters"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let services = json(&out);
+    services
+        .as_array()?
+        .iter()
+        .find_map(|service| service["alias"].as_str().map(str::to_owned))
+}
+
+/// The bug this guards: `crypto unlock` used to answer as soon as the mount call had returned,
+/// while FUSE-T's volume was not in the mount table yet. Everything written in that window landed
+/// in the bare directory *underneath* the mount point -- beside the vault, with no error and no
+/// trace. So this test writes **immediately** after the unlock returns, with no wait of its own,
+/// and proves the bytes are inside the vault afterwards.
+///
+/// It mounts for real and is therefore ignored twice over: `cargo test` skips it, and even
+/// `--ignored` only runs it when `CRYPTO_E2E_MOUNT=1` says this machine may be mounted on.
+///
+/// ```text
+/// CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored
+/// ```
+///
+/// Every exit path locks: the happy one explicitly, a panicking one through [`Fixture::drop`],
+/// which runs `crypto lock --all --force`.
+#[test]
+#[ignore = "mounts a real file system; needs CRYPTO_E2E_MOUNT=1 and a FUSE back end"]
+fn a_file_written_the_moment_unlock_returns_is_in_the_vault() {
+    if std::env::var(E2E_ENV).as_deref() != Ok("1") {
+        println!("skipped: {E2E_ENV} is not set to 1");
+        return;
+    }
+    let fx = Fixture::new("e");
+    let Some(mounter) = supported_real_mounter(&fx) else {
+        println!("skipped: no FUSE service supported");
+        return;
+    };
+    println!("mounter: {mounter}");
+    // The FUSE back ends want an existing empty directory (MOUNT_TO_EXISTING_DIR).
+    let mountpoint = fx.path("mp");
+    std::fs::create_dir(&mountpoint).expect("the mount point");
+
+    let result = json(
+        &fx.crypto_daemon(&[
+            "--json",
+            "unlock",
+            "e",
+            "--mounter",
+            &mounter,
+            "--mount-point",
+            mountpoint.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone(),
+    );
+    assert_eq!(mountpoint_of(&result), mountpoint);
+
+    // No sleep and no poll in between: the unlock answered, so the volume is up.
+    assert!(
+        is_mountpoint(&mountpoint),
+        "the unlock answered before the volume was in the mount table"
+    );
+    std::fs::write(mountpoint.join("visible.txt"), E2E_CONTENT).expect("write through the mount");
+
+    fx.crypto_daemon(&["lock", "e"]).assert().success();
+    assert!(
+        !is_mountpoint(&mountpoint),
+        "the volume is gone after the lock"
+    );
+    fx.crypto_daemon(&["fs", "cat", "e", "/visible.txt"])
+        .assert()
+        .success()
+        .stdout(E2E_CONTENT);
 }

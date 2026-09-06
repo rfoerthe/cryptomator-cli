@@ -73,6 +73,19 @@ use zeroize::Zeroizing;
 /// signal; this is the resulting reaction time, and the cap on every wait in this module.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long an `unlock` waits for the mounted volume to appear in the system mount table.
+///
+/// FUSE-T mounts asynchronously: its helper drives the `mount -t nfs` only *after* the mount call
+/// has returned, so for a moment the mount point is still the bare directory underneath. Answering
+/// the `unlock` in that window loses data -- everything a script writes there lands beside the
+/// vault, with no error. Linux's `fusermount3` mounts before the call returns, so there the wait
+/// is over on the first look.
+const MOUNT_VISIBLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often [`MOUNT_VISIBLE_TIMEOUT`] is checked. Shorter than [`POLL_INTERVAL`] because this is
+/// latency a user waits through on every unlock, and the check is a mount-table read.
+const MOUNT_VISIBLE_POLL: Duration = Duration::from_millis(50);
+
 /// How many events the daemon keeps for `crypto events`.
 const EVENT_BUFFER_CAPACITY: usize = 1000;
 
@@ -601,6 +614,31 @@ fn unlock(
         Mountpoint::Uri(uri) => uri,
     };
 
+    // Nobody may be told the vault is unlocked while the mount point is still the bare directory
+    // underneath the volume; a write in that window would silently miss the vault. Only a local
+    // path can be looked up in the mount table, and only a service whose volumes appear there at
+    // all is worth waiting for (the null mounter's never do).
+    if let (true, Mountpoint::Path(path)) = (handle.appears_in_mount_table, handle.mountpoint()) {
+        if !wait_until_visible(
+            || cryptomator_mount::mounttab::is_mountpoint(&path),
+            MOUNT_VISIBLE_TIMEOUT,
+            MOUNT_VISIBLE_POLL,
+        ) {
+            let message = format!(
+                "the volume did not become visible at {mountpoint} within {} s",
+                MOUNT_VISIBLE_TIMEOUT.as_secs()
+            );
+            log::error!("{message}");
+            return Err(abort_mount(
+                shared,
+                handle,
+                fs,
+                "an invisible volume",
+                AppError::MountFailed(message),
+            ));
+        }
+    }
+
     // The run info is what `crypto status` reads and what stale-mount detection needs the real
     // mount point for, so it is written here -- after the mount, before the answer.
     let info = RunInfo {
@@ -613,23 +651,7 @@ fn unlock(
         read_only,
     };
     if let Err(err) = shared.files.write_info(&info) {
-        // Nothing may stay mounted that the CLI cannot find again, so this is the full escalation
-        // the teardown does -- graceful, then forced.
-        if let Some(failure) = release_mount(handle, true, shared) {
-            log::error!("cannot unmount after a failed run info: {}", failure.error);
-            if let Some(handle) = failure.handle {
-                // The volume is still there. It goes back into the state -- together with the file
-                // system it serves -- so `shutdown_sequence` tries again instead of walking away
-                // from a mounted volume with no daemon and no run info behind it.
-                let mut state = shared.lock_state();
-                state.mounter = handle.service_class.clone();
-                state.mount = Some(handle);
-                state.fs = Some(fs);
-                return Err(err);
-            }
-        }
-        close_fs(fs);
-        return Err(err);
+        return Err(abort_mount(shared, handle, fs, "a failed run info", err));
     }
 
     let mut state = shared.lock_state();
@@ -642,6 +664,53 @@ fn unlock(
     state.read_only = read_only;
     state.last_activity = now_secs();
     Ok(mountpoint)
+}
+
+/// Polls `check` every `poll` until it holds; `false` if it still does not after `timeout`.
+///
+/// A pure helper so the wait itself is testable without a mount table: the daemon passes
+/// [`cryptomator_mount::mounttab::is_mountpoint`]. `check` is called once before the first sleep,
+/// so a volume that is already up costs no delay at all.
+fn wait_until_visible(mut check: impl FnMut() -> bool, timeout: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if check() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(poll));
+    }
+}
+
+/// Takes a mount back down that must not stay up, and hands `err` back for the caller to fail
+/// with. `what` names the reason, for the log line of an unmount that fails on top of it.
+///
+/// Nothing may stay mounted that the CLI cannot find again, so this is the full escalation the
+/// teardown does -- graceful, then forced. A volume that survives both goes back into the state --
+/// together with the file system it serves -- so `shutdown_sequence` tries again instead of
+/// walking away from a mounted volume with no daemon and no run info behind it.
+fn abort_mount(
+    shared: &Arc<Shared>,
+    handle: MountHandle,
+    fs: Arc<CryptoFs>,
+    what: &str,
+    err: AppError,
+) -> AppError {
+    if let Some(failure) = release_mount(handle, true, shared) {
+        log::error!("cannot unmount after {what}: {}", failure.error);
+        if let Some(handle) = failure.handle {
+            let mut state = shared.lock_state();
+            state.mounter = handle.service_class.clone();
+            state.mount = Some(handle);
+            state.fs = Some(fs);
+            return err;
+        }
+    }
+    close_fs(fs);
+    err
 }
 
 /// The mount services the *other* running daemons use, for the mounter's conflict check.
@@ -2067,6 +2136,69 @@ mod tests {
     }
 
     #[test]
+    fn the_visibility_wait_polls_until_the_volume_is_there() {
+        let mut looks = 0;
+        let visible = wait_until_visible(
+            || {
+                looks += 1;
+                looks == 3
+            },
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        );
+        assert!(visible, "the third look finds the volume");
+        assert_eq!(looks, 3, "and nothing is checked after that");
+    }
+
+    #[test]
+    fn the_visibility_wait_gives_up_after_its_timeout() {
+        let timeout = Duration::from_millis(120);
+        let mut looks = 0;
+        let started = Instant::now();
+        let visible = wait_until_visible(
+            || {
+                looks += 1;
+                false
+            },
+            timeout,
+            Duration::from_millis(20),
+        );
+        let elapsed = started.elapsed();
+        assert!(!visible, "a volume that never appears is a failure");
+        assert!(
+            elapsed >= timeout,
+            "the full timeout is waited out: {elapsed:?}"
+        );
+        assert!(
+            looks > 1,
+            "and it is polled, not slept through: {looks} looks"
+        );
+    }
+
+    #[test]
+    fn a_null_mount_is_not_waited_for_in_the_mount_table() {
+        // A null mount never enters the mount table, so `MountHandle::appears_in_mount_table` is
+        // false for it and the unlock must not wait at all -- waiting would cost
+        // `MOUNT_VISIBLE_TIMEOUT` and then fail the unlock.
+        let daemon = Daemon::start(false, (DEADLINE, Duration::from_secs(3600)), |_| {});
+        let mut client = daemon.client();
+        let started = Instant::now();
+        client.call(unlock_request(&encoded(KEY))).expect("unlock");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the unlock answered after {elapsed:?}, so it waited for the mount table"
+        );
+        assert!(
+            daemon.mount_dir.join(NULL_MOUNT_MARKER).is_file(),
+            "and it really mounted"
+        );
+        client.lock(false).expect("lock");
+        assert!(daemon.wait().is_ok(), "a locked daemon exits cleanly");
+        drop(daemon.dir);
+    }
+
+    #[test]
     fn a_locking_daemon_refuses_events_and_stats() {
         let daemon = Daemon::start(false, (DEADLINE, Duration::from_secs(3600)), |_| {});
         let mut client = daemon.client();
@@ -2175,6 +2307,11 @@ mod tests {
         }
         fn capabilities(&self) -> &'static [MountCapability] {
             STUCK_CAPABILITIES
+        }
+        /// A test double like the null mounter: nothing it does reaches the kernel, so its mount
+        /// point never turns up in the mount table and the unlock must not wait for it.
+        fn appears_in_mount_table(&self) -> bool {
+            false
         }
         fn default_mount_flags(&self) -> String {
             String::new()

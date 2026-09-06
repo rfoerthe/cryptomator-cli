@@ -188,11 +188,13 @@ environment or a file. The protocol between the two is documented in
 - **`--foreground`** serves the vault in this process instead of detaching; Ctrl-C locks it again.
   The same daemon, the same protocol, the same teardown — only the process is yours, and the wait
   before a forced unmount is announced on your standard error instead of only in the log.
-- **A FUSE-T volume needs a moment to appear.** `crypto unlock` returns as soon as the mount call
-  has, but FUSE-T mounts asynchronously: for a few hundred milliseconds afterwards the mount point
-  is still the empty directory underneath, and anything written there lands beside the vault instead
-  of in it. Wait for the volume before you write to it, e.g.
-  `until mount | grep -q "on $MP "; do sleep 0.1; done`.
+- **The unlock returns only once the volume is really there.** FUSE-T mounts asynchronously: its
+  helper drives the actual mount *after* the mount call has returned, and for a few hundred
+  milliseconds the mount point is still the empty directory underneath. So the daemon waits for the
+  volume to turn up in the system mount table (up to 10 seconds, checked every 50 ms) before it
+  answers — `crypto unlock V && cp file $MP/` is safe, no `until mount | grep …` needed. A volume
+  that never appears fails the unlock with `MOUNT_FAILED` (exit `6`), unmounted and with the daemon
+  gone.
 - **`--reveal`** (or the vault's `actionAfterUnlock=REVEAL`) opens the mount point in the file
   manager afterwards — `open` on macOS, `xdg-open` on Linux. `$CRYPTO_REVEAL_CMD` replaces that
   command (split on whitespace, the mount point is appended); failures are ignored either way,

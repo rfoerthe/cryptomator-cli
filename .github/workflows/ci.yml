@@ -50,6 +50,8 @@ jobs:
       # `fusermount3` is what the Linux provider probes for and what fuser calls to mount.
       - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored
+      # The same proof one level up: `crypto unlock` must not answer before the volume is visible.
+      - run: CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored
 
   # macOS has no FUSE back end out of the box. FUSE-T is installed from its cask; it needs no kext
   # and no system-extension approval, but the cask ships a system daemon whose installation can
@@ -64,3 +66,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: brew install --cask macos-fuse-t/homebrew-cask/fuse-t
       - run: CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored
+      # The same proof one level up, and the one that matters most on FUSE-T: `crypto unlock` must
+      # not answer before the volume is visible.
+      - run: CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored

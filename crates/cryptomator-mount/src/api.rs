@@ -180,6 +180,16 @@ pub trait MountService: Send + Sync {
     fn has_capability(&self, c: MountCapability) -> bool {
         self.capabilities().contains(&c)
     }
+    /// Whether a volume of this service shows up in the system mount table.
+    ///
+    /// The daemon waits for [`crate::mounttab::is_mountpoint`] before it answers an `unlock`, so
+    /// that no caller writes into the bare directory underneath a mount that is not up yet. Every
+    /// real back end mounts a volume the kernel knows about; only the
+    /// [null mounter](crate::registry::NullMountProvider) does not and overrides this with
+    /// `false`, so that the daemon skips a wait that could never end.
+    fn appears_in_mount_table(&self) -> bool {
+        true
+    }
     /// The mount flags used when the user does not supply any.
     fn default_mount_flags(&self) -> String;
     /// The port used when the user does not supply one (network mounts only).

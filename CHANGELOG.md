@@ -230,6 +230,17 @@
   is amortised (a scan only when the map has roughly doubled or a whole TTL has passed since the
   last one), so a cache miss during a hot `find`, backup run or Spotlight index no longer pays for
   an O(n) scan that finds nothing to remove.
+- **Fixed: `crypto unlock` answered before the volume was there.** FUSE-T mounts asynchronously --
+  its helper drives the `mount -t nfs` only after the mount call has returned -- so for roughly
+  200 ms the mount point was still the bare directory underneath, and everything a script wrote
+  there landed beside the vault, with no error and no trace. The daemon now waits for the mount
+  point to appear in the system mount table (`mounttab::is_mountpoint`, every 50 ms for at most
+  10 s) before it writes the run info and answers; a volume that never appears fails the unlock
+  with `MOUNT_FAILED` after the mount has been released, exactly like any other mount failure. The
+  wait is skipped for services whose volumes never reach the mount table
+  (`MountService::appears_in_mount_table`, `false` only for the null mounter). `crypto unlock V &&
+  cp file $MP/` is safe now; `crypto unlock --mounter`'s help no longer advertises the `webdav`
+  alias, which has no back end before M5, and names `null` instead.
 - Documentation: `docs/daemon-protocol.md` describes the wire protocol (handshake, every request and
   its fields, the error codes and the exit codes they map to, follow streams and `nextSeq`, the
   state files and the order they are written in, stale detection, and how the key travels), and the
@@ -302,10 +313,6 @@
 - **macFUSE is unverified.** It has never been installed on a machine this port was tested on, so
   that provider has never mounted anything. FUSE-T 1.2.7 and Linux `fuse3` are covered by the
   end-to-end test.
-- **A FUSE-T volume is not visible the moment `crypto unlock` returns.** FUSE-T mounts
-  asynchronously; for a few hundred milliseconds the mount point is still the empty directory
-  underneath it, and a script that writes there immediately writes beside the vault instead of into
-  it, without an error. Wait for the volume to appear in the mount table before writing to it.
 - **A Finder copy of a file carrying extended attributes or a resource fork onto a FUSE-T mount has
   not been tried.** That is the case where refusing the AppleDouble side cars could surface as a
   failed copy; if it does, the refusal has to become a mount flag instead of a default.

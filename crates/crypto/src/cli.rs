@@ -84,7 +84,7 @@ pub struct UnlockArgs {
     // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
     #[arg(allow_hyphen_values = true)]
     pub vault: String,
-    /// Mounter alias (fuse-t, macfuse, fuse, webdav) or Java class name
+    /// Mounter alias (fuse-t, macfuse, fuse, null) or Java class name
     #[arg(long, value_name = "MOUNTER")]
     pub mounter: Option<String>,
     /// Where to mount (default: the vault's mountPoint, else <mountPointsDir>/<name>)
@@ -247,7 +247,7 @@ pub struct SetArgs {
     /// Use the mounter's default flags
     #[arg(long)]
     pub default_mount_flags: bool,
-    /// Mounter alias (fuse-t, macfuse, fuse, webdav), Java class name, or "default"
+    /// Mounter alias (fuse-t, macfuse, fuse, null, webdav), Java class name, or "default"
     #[arg(long, value_name = "MOUNTER")]
     pub mounter: Option<String>,
     /// TCP port for loopback mounters (WebDAV)
