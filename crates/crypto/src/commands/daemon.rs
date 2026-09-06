@@ -59,15 +59,33 @@ fn autolock_tick_secs() -> u64 {
         .unwrap_or(DEFAULT_AUTOLOCK_TICK_SECS)
 }
 
-/// Installs the flag both signals set. The daemon notices it within its poll interval and takes
-/// the volume down gracefully.
+/// The signals that stop a daemon: Ctrl-C in the foreground, `kill` and a shell that logs out.
+///
+/// `SIGHUP` is in the list even though the detached daemon is its own session leader (`setsid`,
+/// see `commands::unlock::spawn_daemon`) and therefore never gets one by accident: it is the
+/// conventional "your terminal is gone" signal, and a foreground `crypto unlock` really does get
+/// it when the terminal closes. Taking the volume down for it is the only sensible answer -- the
+/// default action would kill the process outright and leave the volume mounted.
+const SHUTDOWN_SIGNALS: [libc::c_int; 3] = [
+    signal_hook::consts::SIGINT,
+    signal_hook::consts::SIGTERM,
+    signal_hook::consts::SIGHUP,
+];
+
+/// Installs the flag [`SHUTDOWN_SIGNALS`] set. The daemon notices it within its poll interval and
+/// takes the volume down -- gracefully first, forcefully after
+/// `cli.forceUnmountOnSignalAfterSecs`.
+///
+/// A signal handler may do nothing but set this flag, so the whole shutdown runs on the daemon's
+/// own threads; nothing here is called from the handler itself.
 ///
 /// # Errors
 /// Whatever `signal_hook` reports while installing the handlers.
 pub fn install_signal_flag() -> std::io::Result<Arc<AtomicBool>> {
     let shutdown = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    for signal in SHUTDOWN_SIGNALS {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
+    }
     Ok(shutdown)
 }
 

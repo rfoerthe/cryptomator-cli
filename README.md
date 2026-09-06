@@ -87,13 +87,35 @@ environment or a file. The daemon writes its socket, pid, run info and log into 
   `--volume-name` do what they say. An unknown mounter name is a usage error (exit `2`).
 - **`--foreground`** serves the vault in this process instead of detaching; Ctrl-C locks it again.
 - **`--reveal`** (or the vault's `actionAfterUnlock=REVEAL`) opens the mount point in the file
-  manager afterwards.
+  manager afterwards — `open` on macOS, `xdg-open` on Linux. `$CRYPTO_REVEAL_CMD` replaces that
+  command (split on whitespace, the mount point is appended); failures are ignored either way,
+  since a headless session is not a failed unlock.
+- **Auto-lock** is the daemon's, not the shell's: a vault whose `autoLockWhenIdle` is on
+  (`crypto vault set <VAULT> --auto-lock-idle <SECONDS>`) unmounts itself once nothing has touched
+  it for that long, detached and in the foreground alike. The daemon then ends with exit `0`.
 - **Exit codes:** `5` for a vault that is already unlocked or not unlocked, `6` when the mount fails
-  (the last lines of the daemon's log are printed), `7` when an unmount fails — a busy volume needs
-  `crypto lock … --force` — and `10` when the daemon cannot be reached.
+  (the last lines of the daemon's log are printed) or when the daemon stops answering while it
+  mounts, `7` when an unmount fails — a busy volume needs `crypto lock … --force` — and `10` when
+  the daemon cannot be reached.
 - **A crashed daemon** leaves its volume mounted (`STALE_MOUNT`); `crypto lock <VAULT> --force` takes
   it down by mount point and removes the leftover state files. If nothing is mounted any more, the
   leftovers are cleaned up on their own the next time a command looks at the vault.
+
+### Signals
+
+A daemon — detached or `--foreground` — stops on **SIGINT** (Ctrl-C), **SIGTERM** (plain `kill`) and
+**SIGHUP** (the terminal went away). All three do exactly what `crypto lock <VAULT>` does:
+
+1. unmount the volume gracefully;
+2. if that fails because the volume is busy, wait `forceUnmountOnSignalAfterSecs` (`cli.json`,
+   `10` by default) and unmount it forcefully;
+3. remove socket, pid file and run info, and exit `0`.
+
+`crypto lock` is still the better way to stop one: it reports the failure to *you* instead of to the
+daemon's log. A volume that survives even the forced unmount (or a mounter without a forced unmount
+at all) makes the daemon exit `7` and **keep its run info**, so `crypto status` reports
+`STALE_MOUNT` and `crypto lock <VAULT> --force` can address the volume it left behind. `SIGKILL`
+skips all of this by definition and leaves exactly that stale mount behind.
 
 ## Watching an unlocked vault
 
@@ -120,7 +142,11 @@ The per-second numbers are the deltas of the daemon's last sampling interval (on
 totals are read at request time. The event log lives in the daemon, so it starts empty with every
 unlock and holds the last thousand entries; `--since <SEQ>` continues after the `seq` of the last
 event you saw. Both `--follow` modes print a notice on standard error, keep going until **Ctrl-C**
-and then exit `0`; with `--json` they print one object per line (NDJSON), not one document.
+and then exit `0`; with `--json` they print one object per line (NDJSON), not one document. They
+also end with `0` when the vault is locked underneath them (by `crypto lock`, an auto-lock or a
+signal) after they have printed at least one line, and when their reader closes the pipe — so
+`crypto stats Secret --follow | head -3` is a normal end, not an error. A daemon that is already
+gone before the first line is still exit `10`.
 
 `crypto mounters` lists the mount services of this build — the `ALIAS` column is what `--mounter`
 and `defaultMounter` accept, and `CLASS` is the Java class name stored in `settings.json`. Without
@@ -205,7 +231,7 @@ is written 0600. `crypto config get|set` reads and writes both files in one flat
 | `mountPointsDir` | Where mount directories are created when neither the vault nor `--mount-point` names one | `~/Library/Application Support/Cryptomator/mnt` (macOS), `~/.local/share/Cryptomator/mnt` (Linux) |
 | `defaultMounter` | Mount service for vaults that name none; an alias is stored as the Java class name, `default` clears it | unset (the best available service) |
 | `logLevel` | Verbosity of the daemon log: `error`, `warn`, `info`, `debug`, `trace` | `info` |
-| `forceUnmountOnSignalAfterSecs` | How long a daemon tries a graceful unmount on shutdown before forcing it | `10` |
+| `forceUnmountOnSignalAfterSecs` | How long a daemon waits after a failed graceful unmount, on `lock`/shutdown/signal, before forcing it | `10` |
 
     crypto config set mountPointsDir ~/mnt     # relative paths resolve against the shell's cwd
     crypto config set defaultMounter fuse-t

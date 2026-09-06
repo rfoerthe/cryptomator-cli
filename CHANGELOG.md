@@ -165,3 +165,22 @@
 - `DaemonClient::set_read_timeout` and `stream_until` make a follow stream interruptible: a read
   that times out becomes an idle callback instead of a blocked process, and `protocol::read_line_into`
   keeps a message that arrives split across such a timeout from being lost.
+- A daemon stops on SIGINT, SIGTERM **and SIGHUP** — detached as well as in `--foreground` — and runs
+  the same teardown a `crypto lock` runs: graceful unmount, then, after
+  `forceUnmountOnSignalAfterSecs`, a forced one, then exit `0` with the state files removed. A volume
+  that survives even that (or a mounter without a forced unmount) makes the daemon exit `7` and keep
+  its run info, so `crypto status` reports `STALE_MOUNT` and `crypto lock --force` can address the
+  volume it left behind.
+- Idle auto-lock (`crypto vault set <VAULT> --auto-lock-idle <SECONDS>`) works the same way in the
+  foreground as it does detached: the daemon unmounts itself and ends with exit `0`.
+- `--reveal` and `actionAfterUnlock=REVEAL` now really open the mount point (`open` / `xdg-open`),
+  detached and best effort; `$CRYPTO_REVEAL_CMD` replaces the command, which is also how the hook is
+  tested without a file manager appearing.
+- `crypto unlock` no longer waits forever for a daemon whose mount hangs: the `unlock` call has a
+  70 second deadline, after which the daemon is asked to stop (SIGTERM before SIGKILL, so its own
+  unmount still runs) and the command fails with exit `6` pointing at the daemon's log.
+- `crypto stats --follow` and `crypto events --follow` end with exit `0` when the vault is locked
+  underneath them after at least one line was printed; a daemon that is unreachable from the start
+  is still exit `10`.
+- A closed pipe is a successful end for every command, not just for the follow streams:
+  `crypto vault list | head -3` exits `0` and prints nothing about it.

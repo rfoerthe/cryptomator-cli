@@ -33,10 +33,15 @@ fn main() -> ExitCode {
     };
     match run(cli) {
         Ok(code) => ExitCode::from(code),
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            ExitCode::from(exit::code_for(&err))
-        }
+        // `None`: the reader closed the pipe (`crypto vault list | head -3`). Nothing is printed
+        // and the exit code stays 0 -- that reader got what it asked for.
+        Err(err) => match exit::failure_report(&err) {
+            None => ExitCode::from(exit::OK),
+            Some(code) => {
+                eprintln!("error: {err:#}");
+                ExitCode::from(code)
+            }
+        },
     }
 }
 

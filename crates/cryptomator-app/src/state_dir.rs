@@ -278,8 +278,27 @@ impl VaultStateFiles {
     /// # Errors
     /// The first I/O error other than "not found"; the remaining files are still attempted.
     pub fn remove_all(&self) -> Result<()> {
+        self.remove(&[&self.socket, &self.pid, &self.info])
+    }
+
+    /// Removes socket and pid but **keeps the run info**, for a daemon that is giving up with its
+    /// volume still mounted.
+    ///
+    /// That is exactly the leftover [`crate::registry::VaultRegistry::runtime_state`] reports as
+    /// [`crate::registry::RuntimeState::StaleMount`]: nobody listens on the socket any more and
+    /// the pid is gone, but `<id>.json` still names a mount point that is still mounted -- so
+    /// `crypto status` says so and `crypto lock --force` has something to work with. Removing the
+    /// run info too would leave a mounted volume nothing knows about.
+    ///
+    /// # Errors
+    /// The first I/O error other than "not found"; the remaining file is still attempted.
+    pub fn remove_for_stale(&self) -> Result<()> {
+        self.remove(&[&self.socket, &self.pid])
+    }
+
+    fn remove(&self, paths: &[&PathBuf]) -> Result<()> {
         let mut first_error = None;
-        for path in [&self.socket, &self.pid, &self.info] {
+        for path in paths {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

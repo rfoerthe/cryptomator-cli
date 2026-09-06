@@ -130,11 +130,12 @@ impl std::fmt::Debug for DaemonConfig {
     }
 }
 
-/// Serves one vault until it is locked, shut down or auto-locked.
+/// Serves one vault until it is locked, shut down, auto-locked or signalled.
 ///
-/// Returns once the mount is down, the file system is closed and the state files are gone.
-/// `shutdown` is the flag a signal handler sets; the daemon notices it within
-/// [`POLL_INTERVAL`].
+/// Returns `Ok(())` once the mount is down -- gracefully or, after
+/// [`DaemonConfig::force_unmount_after`], forcefully -- the file system is closed and the state
+/// files are gone. `shutdown` is the flag a signal handler sets; the daemon notices it within
+/// [`POLL_INTERVAL`] and then runs exactly the teardown a `lock` request runs.
 ///
 /// This function never calls `std::process::exit` -- the CLI (`crypto unlock --foreground`, the
 /// detached daemon's `main`) turns the returned error into an exit code.
@@ -143,8 +144,9 @@ impl std::fmt::Debug for DaemonConfig {
 /// [`AppError::MountFailed`] when the `unlock` failed (a wrong key included, message
 /// `vault key does not match`), [`AppError::Io`] with [`io::ErrorKind::TimedOut`] when no
 /// `unlock` arrived in time, [`AppError::DaemonError`] with [`ErrorBody::ALREADY_UNLOCKED`] when
-/// another daemon already serves this vault, and anything [`StateDir::ensure`] or writing the pid
-/// file reports.
+/// another daemon already serves this vault, [`AppError::UnmountFailed`] when the volume survived
+/// both the graceful and the forced unmount (the run info then stays behind on purpose, see
+/// [`shutdown_sequence`]), and anything [`StateDir::ensure`] or writing the pid file reports.
 pub fn run_daemon(config: DaemonConfig, shutdown: Arc<AtomicBool>) -> Result<()> {
     run_daemon_with_hook(config, shutdown, |_| {})
 }
@@ -203,15 +205,18 @@ fn run_daemon_with_hook(
     for worker in workers.into_iter().flatten() {
         let _ = worker.join();
     }
-    shutdown_sequence(&shared);
+    let stuck = shutdown_sequence(&shared);
     // A connection thread may still be blocked reading; closing its socket ends it.
     shared.close_connections();
 
-    match (outcome, shared.take_fatal()) {
+    match (outcome, shared.take_fatal(), stuck) {
         // A failed unlock answers the client first and only then stops the daemon, so the accept
         // loop ends without an error of its own; the failure is in `fatal`.
-        (_, Some(fatal)) => Err(fatal),
-        (outcome, None) => outcome,
+        (_, Some(fatal), _) => Err(fatal),
+        // Nothing else went wrong, but a volume is still mounted: that is what the caller has to
+        // hear about (exit code 7), and the run info the teardown kept is what points at it.
+        (_, None, Some(stuck)) => Err(stuck),
+        (outcome, None, None) => outcome,
     }
 }
 
@@ -721,7 +726,13 @@ fn lock_now(shared: &Arc<Shared>, force: bool) -> std::result::Result<(), LockFa
 /// or because the unlock deadline passed. A graceful unmount comes first; only if that fails does
 /// the daemon wait [`DaemonConfig::force_unmount_after`] and force it, and only if the service can
 /// (`umount -f` exists, `fusermount3 -u` does not).
-fn shutdown_sequence(shared: &Arc<Shared>) {
+///
+/// Returns [`None`] once nothing is mounted any more -- the state files are gone then and the
+/// daemon ends successfully. A volume that survived even the forced unmount (or a service that
+/// has no forced unmount at all) comes back as [`AppError::UnmountFailed`], and the run info
+/// **stays**: it is the only record of the volume nobody unmounted, and it is what makes
+/// `crypto status` report `STALE_MOUNT` instead of a vault that looks locked while it is not.
+fn shutdown_sequence(shared: &Arc<Shared>) -> Option<AppError> {
     // Waits out an `unlock` that is still mounting or a `lock` that is still unmounting: both run
     // without the state lock (they may take seconds), and tearing down around them would leave a
     // mounted volume with no daemon behind it.
@@ -733,6 +744,7 @@ fn shutdown_sequence(shared: &Arc<Shared>) {
         }
         state.mount.take()
     };
+    let mut stuck = None;
     if let Some(handle) = handle {
         // The mount is out of the shared state, so the wait for a forced unmount blocks nothing
         // but this teardown.
@@ -743,16 +755,39 @@ fn shutdown_sequence(shared: &Arc<Shared>) {
                 shared.config.vault_id,
                 failure.error
             );
+            // With the handle: the volume is still mounted and outlives this process. Without it
+            // the volume is down and only releasing it failed -- nothing is left behind, so that
+            // stays a warning in the log.
+            if failure.handle.is_some() {
+                stuck = Some(failure.error);
+            }
         }
     }
     let fs = shared.lock_state().fs.take();
     if let Some(fs) = fs {
         close_fs(fs);
     }
-    if let Err(err) = shared.files.remove_all() {
+    let removed = match &stuck {
+        Some(_) => shared.files.remove_for_stale(),
+        None => shared.files.remove_all(),
+    };
+    if let Err(err) = removed {
         log::warn!("cannot remove the state files: {err}");
     }
-    log::info!("daemon for vault {} stopped", shared.config.vault_id);
+    match stuck {
+        Some(error) => {
+            log::error!(
+                "daemon for vault {} stopped with its volume still mounted; \
+                 `crypto lock --force` is the way out",
+                shared.config.vault_id
+            );
+            Some(error)
+        }
+        None => {
+            log::info!("daemon for vault {} stopped", shared.config.vault_id);
+            None
+        }
+    }
 }
 
 /// A volume that would not go down, and what to do with it.
@@ -1493,6 +1528,7 @@ mod tests {
     use crate::settings::{SettingsJson, VaultSettingsJson};
     use cryptomator_core::constants::DEFAULT_KEY_ID;
     use cryptomator_core::{initialize, CipherCombo, OsRng};
+    use cryptomator_mount::api::{Mount, MountBuilder, MountCapability, MountError, UnmountError};
     use cryptomator_mount::registry::{NullMountProvider, NULL_MOUNTER_CLASS, NULL_MOUNT_MARKER};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
     use tempfile::TempDir;
@@ -1528,10 +1564,25 @@ mod tests {
             Self::start_sampling(busy, timeouts, Duration::from_millis(20), settings)
         }
 
-        /// Starts a daemon over a freshly initialised vault. `busy` makes the null mounter refuse
-        /// a graceful unmount, `settings` gets to change the vault's entry before it is saved.
+        /// [`Daemon::start_with`] on the null mounter; `busy` makes its graceful unmount refuse.
         fn start_sampling(
             busy: bool,
+            timeouts: (Duration, Duration),
+            stats_interval: Duration,
+            settings: impl FnOnce(&mut VaultSettingsJson),
+        ) -> Self {
+            Self::start_with(
+                vec![Box::new(NullMountProvider::enabled(true, busy))],
+                timeouts,
+                stats_interval,
+                settings,
+            )
+        }
+
+        /// Starts a daemon over a freshly initialised vault, picking from `services`;
+        /// `settings` gets to change the vault's entry before it is saved.
+        fn start_with(
+            services: Vec<Box<dyn MountService>>,
             timeouts: (Duration, Duration),
             stats_interval: Duration,
             settings: impl FnOnce(&mut VaultSettingsJson),
@@ -1574,7 +1625,7 @@ mod tests {
                 store,
                 cli,
                 home: dir.path().to_path_buf(),
-                services: vec![Box::new(NullMountProvider::enabled(true, busy))],
+                services,
                 unlock_timeout,
                 stats_interval,
                 autolock_tick,
@@ -1627,14 +1678,19 @@ mod tests {
         }
     }
 
-    /// An `unlock` request carrying `key` -- base64 of the 64 raw bytes, as the wire format has
-    /// it. `Request` has a `Drop` impl and therefore no functional-update syntax, so the whole
-    /// variant is written out here and the encoded key passed in.
+    /// [`unlock_request_for`] on the null mounter.
     fn unlock_request(key: &str) -> Request {
+        unlock_request_for(NULL_MOUNTER_CLASS, key)
+    }
+
+    /// An `unlock` request for `mounter`, carrying `key` -- base64 of the 64 raw bytes, as the
+    /// wire format has it. `Request` has a `Drop` impl and therefore no functional-update syntax,
+    /// so the whole variant is written out here and the encoded key passed in.
+    fn unlock_request_for(mounter: &str, key: &str) -> Request {
         Request::Unlock {
             id: 0,
             key: key.to_owned(),
-            mounter: Some(NULL_MOUNTER_CLASS.to_owned()),
+            mounter: Some(mounter.to_owned()),
             mount_point: None,
             mount_options: Vec::new(),
             read_only: None,
@@ -2004,5 +2060,128 @@ mod tests {
         );
         assert!(!files.socket.exists(), "and never bound a socket");
         drop(dir);
+    }
+
+    /// The class name of [`StuckMountProvider`]; no Java counterpart, like the null mounter's.
+    const STUCK_MOUNTER_CLASS: &str = "org.cryptomator.cli.StuckMountProvider";
+
+    /// It advertises `UNMOUNT_FORCED`, so the teardown really runs the whole escalation instead
+    /// of skipping the forced attempt.
+    const STUCK_CAPABILITIES: &[MountCapability] = &[
+        MountCapability::MountToExistingDir,
+        MountCapability::UnmountForced,
+    ];
+
+    /// A mount service whose volume never goes down -- what a wedged FUSE mount looks like from
+    /// here: the graceful unmount says the volume is busy, the forced one fails too, and so does
+    /// the release.
+    #[derive(Debug, Clone, Copy)]
+    struct StuckMountProvider;
+
+    impl MountService for StuckMountProvider {
+        fn java_class_name(&self) -> &'static str {
+            STUCK_MOUNTER_CLASS
+        }
+        fn display_name(&self) -> &'static str {
+            "Stuck mounter (testing)"
+        }
+        fn priority(&self) -> u32 {
+            0
+        }
+        fn is_supported(&self) -> bool {
+            true
+        }
+        fn capabilities(&self) -> &'static [MountCapability] {
+            STUCK_CAPABILITIES
+        }
+        fn default_mount_flags(&self) -> String {
+            String::new()
+        }
+        fn for_file_system(&self, fs: Arc<CryptoFs>) -> Box<dyn MountBuilder> {
+            Box::new(StuckMountBuilder {
+                _fs: fs,
+                mountpoint: None,
+            })
+        }
+    }
+
+    struct StuckMountBuilder {
+        /// Held like a real mount holds it, so the file system is only released with the mount.
+        _fs: Arc<CryptoFs>,
+        mountpoint: Option<PathBuf>,
+    }
+
+    impl MountBuilder for StuckMountBuilder {
+        fn set_mountpoint(&mut self, path: &Path) -> std::result::Result<(), MountError> {
+            self.mountpoint = Some(path.to_path_buf());
+            Ok(())
+        }
+        fn mount(self: Box<Self>) -> std::result::Result<Box<dyn Mount>, MountError> {
+            let mountpoint = self
+                .mountpoint
+                .clone()
+                .ok_or_else(|| MountError::Failed("no mount point".to_owned()))?;
+            Ok(Box::new(StuckMount {
+                _fs: self._fs,
+                mountpoint,
+            }))
+        }
+    }
+
+    struct StuckMount {
+        _fs: Arc<CryptoFs>,
+        mountpoint: PathBuf,
+    }
+
+    impl Mount for StuckMount {
+        fn mountpoint(&self) -> Mountpoint {
+            Mountpoint::Path(self.mountpoint.clone())
+        }
+        fn unmount(&mut self) -> std::result::Result<(), UnmountError> {
+            Err(UnmountError::Busy)
+        }
+        fn unmount_forced(&mut self) -> std::result::Result<(), UnmountError> {
+            Err(UnmountError::Failed("the volume is wedged".to_owned()))
+        }
+        fn close(self: Box<Self>) -> std::result::Result<(), UnmountError> {
+            Err(UnmountError::Failed("the volume is wedged".to_owned()))
+        }
+    }
+
+    #[test]
+    fn a_volume_that_survives_the_forced_unmount_keeps_its_run_info() {
+        let daemon = Daemon::start_with(
+            vec![Box::new(StuckMountProvider)],
+            (DEADLINE, Duration::from_secs(3600)),
+            Duration::from_millis(20),
+            |_| {},
+        );
+        let mut client = daemon.client();
+        client
+            .call(unlock_request_for(STUCK_MOUNTER_CLASS, &encoded(KEY)))
+            .expect("unlock");
+        assert!(daemon.files.info.is_file(), "the run info is published");
+
+        // Exactly what a signal does: set the flag, and nothing else.
+        daemon.shutdown.store(true, Ordering::SeqCst);
+        let outcome = daemon.wait();
+        assert!(
+            matches!(outcome, Err(AppError::UnmountFailed(_))),
+            "a volume that would not go down is an error, not a clean stop: {outcome:?}"
+        );
+        // Nobody answers on the socket and no pid is alive any more, but the run info stays: it
+        // is what makes `crypto status` say STALE_MOUNT instead of LOCKED, and what
+        // `crypto lock --force` addresses the leftover volume by.
+        assert!(!daemon.files.socket.exists(), "the socket is removed");
+        assert!(!daemon.files.pid.exists(), "the pid file is removed");
+        let info = daemon.files.read_info().expect("the run info survives");
+        assert_eq!(
+            info.mountpoint.map(PathBuf::from),
+            Some(daemon.mount_dir.clone())
+        );
+        assert!(
+            daemon.mount_dir.is_dir(),
+            "the mount directory of a volume that is still mounted stays too"
+        );
     }
 }

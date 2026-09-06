@@ -7,6 +7,7 @@ mod common;
 
 use common::Sandbox;
 use serde_json::Value;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -64,15 +65,20 @@ fn json(out: &[u8]) -> Value {
 }
 
 /// Polls `condition` until it holds, and fails the test if it does not within [`DEADLINE`].
-fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + DEADLINE;
+fn wait_until(what: &str, condition: impl FnMut() -> bool) {
+    wait_for(DEADLINE, what, condition);
+}
+
+/// [`wait_until`] with an explicit limit, for a wait whose own duration is part of the assertion.
+fn wait_for(limit: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
         if condition() {
             return;
         }
         std::thread::sleep(POLL);
     }
-    panic!("timed out after {DEADLINE:?} waiting for {what}");
+    panic!("timed out after {limit:?} waiting for {what}");
 }
 
 /// Whether a process still exists, asked the way a shell would.
@@ -506,10 +512,31 @@ fn json_out(fx: &Fixture, args: &[&str]) -> Value {
 
 /// Ctrl-C, the way a shell sends it.
 fn interrupt(pid: u32) {
-    std::process::Command::new("kill")
-        .args(["-INT", &pid.to_string()])
+    signal(pid, "-INT");
+}
+
+/// Sends `signal` (`-TERM`, `-HUP`, …) to `pid`, the way a shell would.
+fn signal(pid: u32, signal: &str) {
+    let status = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
         .status()
         .unwrap();
+    assert!(status.success(), "kill {signal} {pid} failed");
+}
+
+/// Spawns `args` in the sandbox with its three standard streams out of the way.
+fn spawn(fx: &Fixture, args: &[&str]) -> Child {
+    fx.crypto_daemon_cmd(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// The null mount's marker inside the fixture's mount point.
+fn marker_of(fx: &Fixture) -> PathBuf {
+    fx.mount_points_dir().join(fx.name).join(MARKER)
 }
 
 #[test]
@@ -671,4 +698,230 @@ fn the_mount_points_dir_from_cli_json_decides_where_a_vault_is_mounted() {
     let result = unlock(&fx);
     assert_eq!(mountpoint_of(&result), elsewhere.join("m"));
     assert!(elsewhere.join("m").join(MARKER).is_file());
+}
+
+#[test]
+fn a_foreground_unlock_takes_the_volume_down_on_sigterm() {
+    let fx = Fixture::new("t");
+    let mut child = spawn(&fx, &["unlock", "t", "--mounter", "null", "--foreground"]);
+    wait_until("the foreground daemon to mount", || {
+        fx.state_file(".json").exists()
+    });
+    let marker = marker_of(&fx);
+    assert!(marker.is_file());
+
+    // No `crypto lock` here: the signal alone has to run the whole teardown.
+    signal(child.id(), "-TERM");
+    let status = wait_for_exit(&mut child);
+    assert_eq!(status.code(), Some(0), "SIGTERM is a clean stop");
+    assert!(!marker.exists(), "the volume was unmounted");
+    assert!(!fx.state_file(".sock").exists());
+    assert!(!fx.state_file(".json").exists());
+    assert!(!fx.state_file(".pid").exists());
+}
+
+#[test]
+fn a_busy_volume_is_forced_down_after_the_configured_delay() {
+    let fx = Fixture::new("u");
+    fx.crypto_daemon(&["config", "set", "forceUnmountOnSignalAfterSecs", "1"])
+        .assert()
+        .success();
+    let mut child = fx
+        .crypto_daemon_cmd(&["unlock", "u", "--mounter", "null", "--foreground"])
+        // The graceful unmount of this volume fails; only the forced one gets through.
+        .env("CRYPTO_NULL_MOUNT_BUSY", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the foreground daemon to mount", || {
+        fx.state_file(".json").exists()
+    });
+    let marker = marker_of(&fx);
+    assert!(marker.is_file());
+
+    let signalled = Instant::now();
+    signal(child.id(), "-TERM");
+    let status = wait_for_exit(&mut child);
+    let took = signalled.elapsed();
+    assert_eq!(status.code(), Some(0), "the forced unmount got the volume");
+    assert!(!marker.exists(), "the volume is gone after the escalation");
+    assert!(
+        took >= Duration::from_secs(1),
+        "the forced unmount waits out forceUnmountOnSignalAfterSecs first, took {took:?}"
+    );
+    assert!(
+        !fx.state_file(".json").exists(),
+        "an unmounted volume leaves nothing behind"
+    );
+}
+
+#[test]
+fn a_detached_daemon_takes_the_volume_down_on_sighup() {
+    let fx = Fixture::new("g");
+    let result = unlock(&fx);
+    let pid = result["pid"].as_u64().expect("the daemon's pid");
+    let mountpoint = mountpoint_of(&result);
+    assert!(mountpoint.join(MARKER).is_file());
+
+    // SIGHUP is what a closing terminal sends; the daemon treats it like SIGTERM.
+    signal(u32::try_from(pid).unwrap(), "-HUP");
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists()
+            && !fx.state_file(".json").exists()
+            && !fx.state_file(".pid").exists()
+    });
+    wait_until("the daemon to exit", || !alive(pid));
+    assert!(
+        !mountpoint.join(MARKER).exists(),
+        "the volume was unmounted"
+    );
+    assert_eq!(json_out(&fx, &["--json", "status", "g"])["state"], "LOCKED");
+}
+
+#[test]
+fn an_idle_vault_locks_itself() {
+    let fx = Fixture::new("i");
+    // One second idle, and `CRYPTO_AUTOLOCK_TICK_SECS=1` (set for every daemon in these tests)
+    // makes the daemon look that often instead of once a minute.
+    fx.crypto(&["vault", "set", "i", "--auto-lock-idle", "1"])
+        .assert()
+        .success();
+    let result = unlock(&fx);
+    let pid = result["pid"].as_u64().expect("the daemon's pid");
+    let mountpoint = mountpoint_of(&result);
+
+    // Nothing touches the vault, so the very first tick past the idle time locks it.
+    wait_for(
+        Duration::from_secs(5),
+        "the idle vault to lock itself",
+        || !fx.state_file(".json").exists(),
+    );
+    wait_until("the auto-locked daemon to exit", || !alive(pid));
+    assert!(
+        !mountpoint.join(MARKER).exists(),
+        "the volume was unmounted"
+    );
+    assert_eq!(json_out(&fx, &["--json", "status", "i"])["state"], "LOCKED");
+}
+
+#[test]
+fn a_foreground_unlock_auto_locks_the_same_way() {
+    let fx = Fixture::new("j");
+    fx.crypto(&["vault", "set", "j", "--auto-lock-idle", "1"])
+        .assert()
+        .success();
+    // The auto-lock thread is the daemon's, and `--foreground` runs the same daemon in this
+    // process: it ends on its own, without anything locking it from outside.
+    let mut child = spawn(&fx, &["unlock", "j", "--mounter", "null", "--foreground"]);
+    let status = wait_for_exit(&mut child);
+    assert_eq!(status.code(), Some(0), "an auto-lock is a clean stop");
+    assert!(!marker_of(&fx).exists(), "the volume was unmounted");
+    assert_eq!(json_out(&fx, &["--json", "status", "j"])["state"], "LOCKED");
+}
+
+#[test]
+fn reveal_runs_the_command_from_the_environment() {
+    let fx = Fixture::new("r");
+    let revealed = fx.path("revealed.txt");
+    let script = fx.path("reveal.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"{}\"\n",
+            revealed.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let lines = |path: &Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    // `--reveal` on the command line. `$CRYPTO_REVEAL_CMD` replaces `open`/`xdg-open`, which is
+    // also the only reason this is testable: nothing may pop up a file manager in a test run.
+    let out = fx
+        .crypto_daemon(&["--json", "unlock", "r", "--mounter", "null", "--reveal"])
+        .env("CRYPTO_REVEAL_CMD", &script)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let mountpoint = mountpoint_of(&json(&out));
+    wait_until("the reveal command to run", || {
+        lines(&revealed) == vec![mountpoint.display().to_string()]
+    });
+    fx.crypto_daemon(&["lock", "r"]).assert().success();
+
+    // The vault's own `actionAfterUnlock` does it without the flag.
+    fx.crypto(&["vault", "set", "r", "--action-after-unlock", "REVEAL"])
+        .assert()
+        .success();
+    fx.crypto_daemon(&["unlock", "r", "--mounter", "null"])
+        .env("CRYPTO_REVEAL_CMD", &script)
+        .assert()
+        .success();
+    wait_until("the second reveal", || lines(&revealed).len() == 2);
+    assert_eq!(lines(&revealed)[1], mountpoint.display().to_string());
+}
+
+#[test]
+fn an_unlock_without_reveal_opens_nothing() {
+    let fx = Fixture::new("n");
+    let revealed = fx.path("revealed.txt");
+    let script = fx.path("reveal.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"{}\"\n",
+            revealed.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    fx.crypto_daemon(&["unlock", "n", "--mounter", "null"])
+        .env("CRYPTO_REVEAL_CMD", &script)
+        .assert()
+        .success();
+    fx.crypto_daemon(&["lock", "n"]).assert().success();
+    assert!(
+        !revealed.exists(),
+        "neither --reveal nor actionAfterUnlock asked for anything to be opened"
+    );
+}
+
+#[test]
+fn a_follow_stream_ends_with_code_0_when_the_vault_is_locked() {
+    let fx = Fixture::new("q");
+    unlock(&fx);
+    let mut child = fx
+        .crypto_daemon_cmd(&["--json", "stats", "q", "--follow", "--interval", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (notice, _stderr) = first_line(child.stderr.take().unwrap());
+    assert!(notice.contains("Ctrl-C"), "{notice}");
+    // One sample has been delivered, so the daemon going away afterwards is the end of the
+    // stream and not a failure. The pipe stays open the whole time -- a closed reader would end
+    // the child with 0 as well and prove nothing.
+    let (line, stdout) = first_line(child.stdout.take().unwrap());
+    json(line.trim().as_bytes());
+
+    fx.crypto_daemon(&["lock", "q"]).assert().success();
+    let status = wait_for_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a follow stream whose vault is locked ends cleanly"
+    );
+    drop(stdout);
 }

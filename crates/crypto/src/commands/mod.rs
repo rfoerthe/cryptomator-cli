@@ -63,6 +63,15 @@ pub fn unlocked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultInfo, PathBuf)
     Ok((info, socket))
 }
 
+/// Whether `err` means the daemon is not there any more.
+///
+/// For a `--follow` stream that is the end of the story rather than a failure: the vault was
+/// locked (or auto-locked, or signalled) while it was being watched, and the watcher saw
+/// everything there was to see. It stays an error for a command that never got an answer at all.
+pub fn daemon_gone(err: &AppError) -> bool {
+    matches!(err, AppError::DaemonUnreachable(_))
+}
+
 /// How a vault is named in a message to the user: its display name, or its id when it has none.
 pub fn vault_label(info: &VaultInfo) -> &str {
     info.display_name.as_deref().unwrap_or(&info.id)

@@ -9,7 +9,7 @@ use crate::exit;
 use anyhow::{anyhow, Context, Result};
 use cryptomator_app::settings::{VaultSettingsJson, WhenUnlocked};
 use cryptomator_app::{
-    read_passphrase, resolve_mounter, DaemonClient, Request, SystemIo, VaultStateFiles,
+    read_passphrase, resolve_mounter, AppError, DaemonClient, Request, SystemIo, VaultStateFiles,
 };
 use cryptomator_core::fs::{
     determine_supported_cleartext_file_name_length, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
@@ -31,6 +31,12 @@ use zeroize::Zeroizing;
 
 /// How long the parent waits for the daemon's socket to appear.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the parent waits for the answer to its `unlock` request, i.e. for the mount itself.
+///
+/// The daemon gives up on an `unlock` that never arrives after 60 seconds
+/// (`commands::daemon::UNLOCK_TIMEOUT`); this is that plus a margin, so a daemon that is merely
+/// slow always gets to answer -- with its own error, which says more than a timeout here can.
+const UNLOCK_CALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// How long the parent waits for a daemon that failed its unlock to exit before killing it.
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the parent looks whether that daemon is gone.
@@ -39,6 +45,15 @@ const CHILD_POLL: Duration = Duration::from_millis(20);
 const LOG_TAIL_LINES: usize = 20;
 /// The mode of the log file; it names the vault path and the mount point.
 const LOG_MODE: u32 = 0o600;
+/// Replaces the file manager `--reveal` opens, for a desktop whose opener is neither of the two
+/// below -- and for the tests, which point it at a script instead of a file manager.
+const REVEAL_CMD_ENV: &str = "CRYPTO_REVEAL_CMD";
+/// The platform's "open this in the file manager" command.
+const DEFAULT_OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
 
 pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     // Before the password: an unusable mounter name is a usage error, not a failed unlock.
@@ -176,9 +191,11 @@ fn spawn_daemon(
     let mut child = command
         .spawn()
         .with_context(|| format!("cannot start the vault daemon for {}", vault.id))?;
-    match handshake(&files.socket, request) {
+    match handshake(&files.socket, request, &files.log) {
         Ok(mountpoint) => report(ctx, vault, files, &mountpoint, args),
         Err(err) => {
+            // The timeout above lands here too: the daemon gets a SIGTERM and with it its own
+            // graceful unmount, so a mount that came up late is still taken down again.
             reap(&mut child);
             Err(with_log_tail(&files.log, err))
         }
@@ -202,7 +219,7 @@ fn serve_in_foreground(
         .name("crypto-daemon".to_owned())
         .spawn(move || cryptomator_app::run_daemon(config, flag))
         .context("cannot start the vault daemon thread")?;
-    let handshake = match handshake(&files.socket, request) {
+    let handshake = match handshake(&files.socket, request, &files.log) {
         Ok(mountpoint) => report(ctx, vault, files, &mountpoint, args),
         Err(err) => {
             // Nobody else is going to lock this daemon: it either never came up or refused the
@@ -223,17 +240,46 @@ fn serve_in_foreground(
 
 /// Connects to the daemon and sends the one `unlock` request it accepts; returns the mount point.
 ///
+/// The connect deadline only covers the socket showing up; mounting happens afterwards and used
+/// to have no deadline at all, so a mount service that hung left `crypto unlock` waiting forever.
+/// [`UNLOCK_CALL_TIMEOUT`] bounds that wait -- generously, since a slow FUSE mount is not a
+/// failed one.
+///
 /// # Errors
-/// [`AppError::DaemonUnreachable`] when no daemon answers within [`CONNECT_TIMEOUT`], and the
-/// daemon's own [`AppError::DaemonError`] when the unlock failed.
-fn handshake(socket: &Path, request: Request) -> Result<String> {
+/// [`AppError::DaemonUnreachable`] when no daemon answers within [`CONNECT_TIMEOUT`] or when the
+/// connection breaks, [`AppError::MountFailed`] when the daemon stops answering while mounting,
+/// and the daemon's own [`AppError::DaemonError`] when the unlock failed.
+fn handshake(socket: &Path, request: Request, log: &Path) -> Result<String> {
     let mut client = DaemonClient::connect_with_retry(socket, CONNECT_TIMEOUT)?;
-    let result = client.call(request)?;
+    client.set_read_timeout(Some(UNLOCK_CALL_TIMEOUT))?;
+    let started = Instant::now();
+    let result = client
+        .call(request)
+        .map_err(|err| unlock_failure(err, started.elapsed(), log))?;
     Ok(result
         .get("mountpoint")
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_owned())
+}
+
+/// What a failed `unlock` call means to the user.
+///
+/// A daemon that says nothing for [`UNLOCK_CALL_TIMEOUT`] is one whose mount is stuck: the client
+/// reports the silence as a transport failure ([`AppError::DaemonUnreachable`], exit code 10),
+/// which is the wrong story -- the daemon is there, its mount is not. Only a silence that lasted
+/// the whole timeout is turned into [`AppError::MountFailed`] (exit code 6) and pointed at the
+/// log; a connection that broke early stays what it is.
+fn unlock_failure(err: AppError, waited: Duration, log: &Path) -> anyhow::Error {
+    if waited >= UNLOCK_CALL_TIMEOUT && matches!(err, AppError::DaemonUnreachable(_)) {
+        return AppError::MountFailed(format!(
+            "the daemon did not finish mounting within {}s; see {}",
+            UNLOCK_CALL_TIMEOUT.as_secs(),
+            log.display()
+        ))
+        .into();
+    }
+    err.into()
 }
 
 /// Prints where the vault was mounted and opens the mount point if asked to.
@@ -264,25 +310,48 @@ fn report(
 }
 
 /// Opens the mount point in the desktop's file manager, best effort: a missing `open`/`xdg-open`
-/// or a headless session is not a failed unlock.
-///
-/// The null mounter mounts nothing, so revealing its directory would pop up a file manager in the
-/// middle of a test run for no reason.
+/// or a headless session is not a failed unlock, so nothing here is reported and nothing is
+/// waited for -- the opener outlives this process.
 fn reveal(mountpoint: &str, mounter: Option<&str>) {
-    if mountpoint.is_empty() || mounter == Some(NULL_MOUNTER_CLASS) {
+    let overridden = std::env::var(REVEAL_CMD_ENV).ok();
+    let Some(argv) = reveal_command(mountpoint, mounter, overridden.as_deref()) else {
         return;
-    }
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
+    };
+    let Some((program, args)) = argv.split_first() else {
+        return;
     };
     let _ = Command::new(program)
-        .arg(mountpoint)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// What [`reveal`] runs, mount point last, or [`None`] when there is nothing to open.
+///
+/// `$CRYPTO_REVEAL_CMD` replaces the platform's opener; it is split on whitespace, so a program
+/// with arguments (`"xdg-open -w"`) works and a path containing spaces does not -- the same trade
+/// every `$EDITOR`-style variable makes.
+///
+/// Without the override a null mount is skipped: it mounts nothing, and popping up a file manager
+/// on its marker directory in the middle of a test run helps nobody. That is exactly why the
+/// override exists -- it is how the reveal hook itself is tested.
+fn reveal_command(
+    mountpoint: &str,
+    mounter: Option<&str>,
+    overridden: Option<&str>,
+) -> Option<Vec<String>> {
+    if mountpoint.is_empty() {
+        return None;
+    }
+    let mut argv: Vec<String> = match overridden.map(str::trim).filter(|cmd| !cmd.is_empty()) {
+        Some(cmd) => cmd.split_whitespace().map(str::to_owned).collect(),
+        None if mounter == Some(NULL_MOUNTER_CLASS) => return None,
+        None => vec![DEFAULT_OPENER.to_owned()],
+    };
+    argv.push(mountpoint.to_owned());
+    Some(argv)
 }
 
 /// Waits for a daemon that failed its unlock (it stops itself) and kills one that does not go.
@@ -359,4 +428,84 @@ fn open_log(path: &Path) -> Result<File> {
         .mode(LOG_MODE)
         .open(path)
         .with_context(|| format!("cannot open the daemon log {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reveal_command_ends_with_the_mount_point() {
+        assert_eq!(
+            reveal_command("/mnt/v", Some("org.example.Fuse"), None),
+            Some(vec![DEFAULT_OPENER.to_owned(), "/mnt/v".to_owned()])
+        );
+        // The override wins over the platform's opener and may carry arguments.
+        assert_eq!(
+            reveal_command("/mnt/v", Some("org.example.Fuse"), Some(" /bin/echo -n ")),
+            Some(vec![
+                "/bin/echo".to_owned(),
+                "-n".to_owned(),
+                "/mnt/v".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn nothing_is_opened_without_a_mount_point_or_for_a_null_mount() {
+        assert_eq!(reveal_command("", Some("org.example.Fuse"), None), None);
+        assert_eq!(reveal_command("", None, Some("/bin/echo")), None);
+        // A null mount has nothing to show -- unless a test asked for a specific command.
+        assert_eq!(
+            reveal_command("/mnt/v", Some(NULL_MOUNTER_CLASS), None),
+            None
+        );
+        // An empty or blank override is "not set", not "run nothing".
+        assert_eq!(
+            reveal_command("/mnt/v", Some(NULL_MOUNTER_CLASS), Some("  ")),
+            None
+        );
+        assert_eq!(
+            reveal_command("/mnt/v", Some(NULL_MOUNTER_CLASS), Some("/bin/echo")),
+            Some(vec!["/bin/echo".to_owned(), "/mnt/v".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_stops_answering_while_mounting_is_a_failed_mount() {
+        let log = Path::new("/tmp/x.log");
+        let silent = unlock_failure(
+            AppError::DaemonUnreachable("the daemon did not answer in time".to_owned()),
+            UNLOCK_CALL_TIMEOUT,
+            log,
+        );
+        assert_eq!(crate::exit::code_for(&silent), crate::exit::MOUNT_FAILED);
+        let message = format!("{silent:#}");
+        assert!(
+            message.contains("did not finish mounting within 70s"),
+            "{message}"
+        );
+        assert!(message.contains("/tmp/x.log"), "{message}");
+
+        // A connection that broke early is a transport failure, not a stuck mount.
+        let broke = unlock_failure(
+            AppError::DaemonUnreachable("the daemon closed the connection".to_owned()),
+            Duration::from_secs(1),
+            log,
+        );
+        assert_eq!(
+            crate::exit::code_for(&broke),
+            crate::exit::DAEMON_UNREACHABLE
+        );
+        // And a refusal the daemon actually sent keeps its own code.
+        let refused = unlock_failure(
+            AppError::DaemonError {
+                code: "ALREADY_UNLOCKED".to_owned(),
+                message: "another daemon is already serving this vault".to_owned(),
+            },
+            UNLOCK_CALL_TIMEOUT,
+            log,
+        );
+        assert_eq!(crate::exit::code_for(&refused), crate::exit::WRONG_STATE);
+    }
 }

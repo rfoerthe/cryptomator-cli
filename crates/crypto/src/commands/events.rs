@@ -4,7 +4,7 @@
 //! conflict it resolved. The daemon keeps the last thousand of them in memory, so the log starts
 //! over with every unlock and a locked vault has none (exit code 5, like `stats`).
 use crate::cli::EventsArgs;
-use crate::commands::{install_interrupt, unlocked_vault, vault_label, Ctx};
+use crate::commands::{daemon_gone, install_interrupt, unlocked_vault, vault_label, Ctx};
 use crate::exit;
 use crate::output::{is_broken_pipe, write_line};
 use anyhow::Result;
@@ -45,7 +45,8 @@ pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
     client.set_read_timeout(Some(FOLLOW_POLL))?;
     let json = ctx.out.json;
     let mut failure = None;
-    client.stream_until(
+    let mut printed = 0u64;
+    let streamed = client.stream_until(
         Request::Events {
             id: 0,
             follow: true,
@@ -59,7 +60,10 @@ pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
                 Ok(line_of(&event))
             };
             match line.and_then(|line| write_line(&line).map_err(anyhow::Error::from)) {
-                Ok(()) => !interrupted.load(Ordering::Relaxed),
+                Ok(()) => {
+                    printed += 1;
+                    !interrupted.load(Ordering::Relaxed)
+                }
                 Err(err) => {
                     // `| head -1` is the canonical way to read a stream: a closed pipe ends the
                     // stream successfully instead of panicking out of `println!` with code 101.
@@ -71,10 +75,15 @@ pub fn events(ctx: &Ctx, args: EventsArgs) -> Result<u8> {
             }
         },
         || !interrupted.load(Ordering::Relaxed),
-    )?;
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(exit::OK),
+    );
+    match (failure, streamed) {
+        (Some(err), _) => Err(err),
+        // A daemon that shuts down cleanly ends the stream with a response and lands in `Ok`;
+        // one that is gone before it can leaves the read hanging in mid-air. After at least one
+        // event that is still the end of the stream and not a failure of this command.
+        (None, Err(err)) if printed > 0 && daemon_gone(&err) => Ok(exit::OK),
+        (None, Err(err)) => Err(err.into()),
+        (None, Ok(())) => Ok(exit::OK),
     }
 }
 
