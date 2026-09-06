@@ -12,7 +12,8 @@ cryptomator-core = { path = "../cryptomator-core" }
 cryptomator-mount = { path = "../cryptomator-mount" }
 clap.workspace = true
 data-encoding.workspace = true
-log.workspace = true
+# `std` for `log::set_boxed_logger`, which the daemon installs (see `daemon::logging`).
+log = { workspace = true, features = ["std"] }
 nix = { workspace = true, features = ["process", "signal", "user"] }
 serde.workspace = true
 serde_json.workspace = true

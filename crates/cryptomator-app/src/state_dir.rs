@@ -251,9 +251,11 @@ impl VaultStateFiles {
 
     /// Writes the run info.
     ///
-    /// Must not run before [`VaultStateFiles::write_pid`]: a run info without a live pid and
-    /// without a socket looks exactly like the leftover of a crashed daemon, and a concurrent
-    /// `crypto status` removes it. See [`RunInfo`] for the whole order.
+    /// The **last** of the three files, written once the vault is mounted: it names the mount
+    /// point, which only exists then. It must not run before [`VaultStateFiles::write_pid`] --
+    /// a run info without a live pid and without a socket looks exactly like the leftover of a
+    /// crashed daemon, and a concurrent `crypto status` removes it. See [`RunInfo`] for the whole
+    /// order.
     ///
     /// # Errors
     /// Any I/O error while writing.
@@ -298,13 +300,16 @@ impl VaultStateFiles {
 /// A daemon publishes its state files in exactly this order:
 ///
 /// 1. `<id>.pid` ([`VaultStateFiles::write_pid`]), as early as possible;
-/// 2. `<id>.json` (this type, [`VaultStateFiles::write_info`]), once the mount point is known;
-/// 3. `<id>.sock`, when the control socket is bound.
+/// 2. `<id>.sock`, as soon as the control socket is bound -- the daemon has to be reachable
+///    before it can be handed the vault key;
+/// 3. `<id>.json` (this type, [`VaultStateFiles::write_info`]), right after the mount succeeded,
+///    with [`RunInfo::mountpoint`] set to where the volume actually landed.
 ///
 /// The reason is [`crate::registry::VaultRegistry::runtime_state`]: it recognises a starting
 /// daemon by its live pid, and everything it finds without a live pid and without a listening
 /// socket is a leftover it removes. Writing the run info first opens a window in which a
-/// concurrent `crypto status` deletes the state of a perfectly healthy daemon.
+/// concurrent `crypto status` deletes the state of a perfectly healthy daemon; writing it before
+/// the mount would leave stale-mount detection without the mount point it needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunInfo {

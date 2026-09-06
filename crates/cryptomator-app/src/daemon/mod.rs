@@ -14,13 +14,18 @@
 //! | daemon → client  | [`StreamItem`], zero or more, only while a follow stream is running  |
 //! | daemon → client  | [`Response`], exactly one per request, echoing its `id`               |
 //!
-//! [`protocol`] holds the message types and the two line primitives; [`client`] holds the
-//! synchronous client the CLI commands use.
+//! [`protocol`] holds the message types and the two line primitives, [`client`] the synchronous
+//! client the CLI commands use, [`server`] the daemon that serves one vault and [`logging`] the
+//! log file it writes.
 pub mod client;
+pub mod logging;
 pub mod protocol;
+pub mod server;
 
 pub use client::DaemonClient;
+pub use logging::{init_file_logger, level_filter};
 pub use protocol::{
     read_line, read_request, write_line, ErrorBody, EventRecord, EventsResult, Hello, Request,
     Response, StatsResult, StatusResult, StreamItem, MAX_LINE_LEN, PROTOCOL_VERSION,
 };
+pub use server::{run_daemon, DaemonConfig};

@@ -133,8 +133,9 @@ impl VaultRegistry {
     /// pid file is absent or names a dead process **and** the socket does not accept a connection
     /// **and** the run info's mount point is no longer mounted. A *live* pid is a daemon that is
     /// still starting up and never reaches this branch (step 2 above reports it as
-    /// [`RuntimeState::Unlocked`]), which is why a daemon must write `<id>.pid` before it writes
-    /// `<id>.json` and bind `<id>.sock` -- see [`RunInfo`]'s write order.
+    /// [`RuntimeState::Unlocked`]), which is why a daemon writes `<id>.pid` first, then binds
+    /// `<id>.sock`, and only writes `<id>.json` once the vault is mounted -- see [`RunInfo`]'s
+    /// write order.
     ///
     /// # Errors
     /// Anything [`SettingsStore::load`] reports.
