@@ -127,6 +127,38 @@
 
 ### M4 – FUSE mount and the vault daemon
 
+- A vault can be mounted. `cryptomator-mount` carries the whole mount layer: the service API
+  (`api.rs`), the registry with the Java class names and the CLI aliases (`registry.rs`), the
+  mount-flag parser of `AbstractMountBuilder.setMountFlags` (`flags.rs`), the macOS NFD ↔ vault NFC
+  name transcoder (`transcoder.rs`), the mount-table reader (`mounttab.rs`) and, under `fuse/`, the
+  file system itself: `ops.rs` (the vault operations, inode and handle tables, errno mapping,
+  AppleDouble handling), `adapter.rs` (`impl fuser::Filesystem` on top of them), `session.rs` (the
+  session on a thread of its own, unmount and join) and the four providers.
+- Three real back ends and one for tests: **Linux FUSE** (`fusermount3`, `-oauto_unmount -ouid
+  -ogid -oattr_timeout=5`), **macFUSE** and **FUSE-T** (both `dlopen`ed through
+  `fuse_mount_compat25`, the fd handed to `fuser::Session::from_fd`), and a **null mounter** that
+  mounts nothing and only exists when `$CRYPTO_ENABLE_NULL_MOUNTER=1` is set, so the daemon, the
+  signals and the auto-lock can be tested without a driver.
+- `vendor/fuser` is fuser 0.18 with a patch this port needs: the kernel ABI became a **runtime**
+  choice (`Config::abi`, `KernelAbi::{Native, Linux}`) instead of a `#[cfg(target_os)]` decision, so
+  one binary can write the Linux struct layouts FUSE-T expects and the macFUSE layouts macFUSE
+  expects. Spike A had found that layout to be the reason FUSE-T never mounted with stock fuser;
+  Spike C proved the switch end to end. Two transport fixes came with the end-to-end test: requests
+  that FUSE-T coalesces into one read are split instead of being dropped, and a zero-length read on
+  a socket is an end of stream rather than an error.
+- FUSE-T serves an NFS mount, which brings its own rules: no extended attributes (`-ononamedattr`
+  is always appended), no `-obackend=smb` (1.2.7 ships only the NFS helper), and the `._<name>`
+  AppleDouble side cars macOS' NFS client writes next to every node are refused with `EPERM` —
+  otherwise a vault fills up with one encrypted `._x` per file, directory and symlink. macFUSE keeps
+  those away from userspace itself. Both macOS back ends sweep `._*` and `.DS_Store` out of a
+  directory before removing it, like the desktop app's `deleteAppleDoubleFiles`.
+- A graceful unmount retries for five seconds while the volume is merely settling, a forced one does
+  not, and an unmount that hangs is left to a reaping thread instead of blocking the daemon.
+- The mount end-to-end test (`crates/cryptomator-mount/tests/mount_e2e.rs`, `CRYPTO_E2E_MOUNT=1
+  cargo test -p cryptomator-mount --test mount_e2e -- --ignored`) writes 100 KB across chunk
+  boundaries, appends, renames, symlinks, an NFD name and a read-only mount through a real driver
+  and checks the result in the vault afterwards. It runs in CI on `ubuntu-22.04` with `fuse3`, and
+  advisory (`continue-on-error`) on `macos-15` with the FUSE-T cask.
 - CLI: `crypto unlock <VAULT>` mounts a vault in a detached per-vault daemon and `crypto lock`
   takes it down again. The password is read, normalised and turned into the vault key in the
   `crypto unlock` process; the key reaches the daemon as the first message on its 0600 control
@@ -198,3 +230,103 @@
   is amortised (a scan only when the map has roughly doubled or a whole TTL has passed since the
   last one), so a cache miss during a hot `find`, backup run or Spotlight index no longer pays for
   an O(n) scan that finds nothing to remove.
+- Documentation: `docs/daemon-protocol.md` describes the wire protocol (handshake, every request and
+  its fields, the error codes and the exit codes they map to, follow streams and `nextSeq`, the
+  state files and the order they are written in, stale detection, and how the key travels), and the
+  README gained a "Mounting" chapter with the prerequisites per platform, the FUSE-T limits, the
+  state directory and an exit-code table.
+
+#### Decisions taken along the way
+
+*Mounting*
+
+- The kernel ABI is a **runtime** switch in the vendored fuser fork, not a compile-time feature: one
+  binary serves macFUSE and FUSE-T, at the price of a larger patch than a `cfg` flag would be.
+- FUSE-T runs on its NFS backend; `-obackend=smb` is not passed on. A read-only mount on a service
+  without a `READ_ONLY` capability gets `-oro` appended rather than having `--read-only` silently
+  dropped, which is what the desktop app does.
+- Refusing AppleDouble side cars is decided by the back end (on for FUSE-T, off for macFUSE), while
+  the `._*`/`.DS_Store` sweep before `rmdir` is decided by the platform — both macOS back ends do
+  it, whatever the mount flags say, because Finder leaves those files behind either way.
+- `chmod` is a successful no-op: a vault stores no permission bits, and failing the call would break
+  ordinary copies.
+- The null mounter is test-only and hidden behind an environment variable, so a normal build cannot
+  be talked into "mounting" nothing.
+
+*Daemon and protocol*
+
+- The daemon is plain `std`: threads, a `UnixListener` and condition variables. tokio arrives with
+  WebDAV in M5, where hyper needs one; until then it would be a dependency without a job.
+- The vault key travels over the `0600` control socket as the first message, not over an inherited
+  file descriptor. The trust boundary is the same (both need the same uid) and it keeps the key out
+  of `argv`, the environment and any file.
+- The daemon publishes its state files as pid → socket → run info. A bound socket answers before
+  `accept` runs, so the detection cannot see a live daemon as a crashed one; the run info comes last
+  because only then is there a mount point to name.
+- `nextSeq` in an `events` answer is the newest event's own `seq`, and `since` is exclusive
+  (`seq > since`), so a client passes the value straight back to continue where it stopped.
+- `inUse` in a `status` answer means the access counters grew during the last sampling interval, and
+  one operation lock serialises mount and unmount against the shutdown sequence.
+
+*Command line*
+
+- `crypto fs …` and `crypto name …` refuse a vault that is `UNLOCKED` or `STALE_MOUNT` with exit
+  `5`, reading included: the mount may hold changes that are not on disk yet, and two writers on one
+  vault directory would corrupt each other's ciphertext.
+- `crypto status <VAULT> --json` prints that vault's object, without an argument an array. A
+  `--follow` stream ends with exit `0` once it has printed at least one line — a lock underneath it
+  or a closed pipe is a normal end — while a daemon that was already gone is exit `10`.
+- `crypto lock` takes its vaults as ordinary positionals, so a vault id starting with `-` needs the
+  usual `--` separator.
+
+*Core*
+
+- The two directory caches share one `ExpiringMap` with amortised pruning and no fixed size cap:
+  expiry plus pruning on a miss bounds them, and a cap would only add a second eviction rule to
+  reason about.
+- An event sink must not re-enter the file system it belongs to; the daemon's sink only appends to
+  its ring buffer.
+
+#### Follow-ups from earlier milestones
+
+- **Resolved:** the directory caches now expire (M3 deviation 3), and `fs`/`name` now really detect
+  a running mount instead of the README explaining that they cannot (M3).
+- **Still open:** `.c9u`/`FileIsInUseEvent` creation stays unimplemented — those markers exist only
+  with a Hub owner and are ignored on listing, by design. The `flock` on `settings.json.lock` and the
+  warning about a running desktop app that M2 deferred to "the milestone with the daemon" did **not**
+  ship with M4; the atomic tmp + rename write is still all there is, so close the desktop app before
+  `crypto vault add/remove/set` and `crypto config set`.
+
+#### Known limitations and follow-ups
+
+- **macFUSE is unverified.** It has never been installed on a machine this port was tested on, so
+  that provider has never mounted anything. FUSE-T 1.2.7 and Linux `fuse3` are covered by the
+  end-to-end test.
+- **A FUSE-T volume is not visible the moment `crypto unlock` returns.** FUSE-T mounts
+  asynchronously; for a few hundred milliseconds the mount point is still the empty directory
+  underneath it, and a script that writes there immediately writes beside the vault instead of into
+  it, without an error. Wait for the volume to appear in the mount table before writing to it.
+- **A Finder copy of a file carrying extended attributes or a resource fork onto a FUSE-T mount has
+  not been tried.** That is the case where refusing the AppleDouble side cars could surface as a
+  failed copy; if it does, the refusal has to become a mount flag instead of a default.
+- **Coexistence with the Cryptomator desktop app** — unlocking in one and looking at the vault in the
+  other — is a manual check nobody has run.
+- `crypto name …` and `crypto password change` still accept an *unlocked* vault. Neither corrupts
+  ciphertext, but both should refuse like the `fs` commands do; deferred to M5.
+- The daemon reads its socket through a `BufReader`, whose internal buffer keeps the base64 vault key
+  of the `unlock` line until later traffic overwrites it. Every decoded copy is wiped; the buffer is
+  an M5 follow-up.
+- `crypto status` does not distinguish the daemon's `STARTING` phase: for the few milliseconds
+  between the pid file and the run info a vault shows as `UNLOCKED` with a null mount point.
+- The state files are named after a sanitised vault id, so two *hand-written* ids in `settings.json`
+  that differ only in characters outside `[A-Za-z0-9_-]` would share them. Generated ids are
+  base64url and never collide.
+- `CryptoFs::open` still does its I/O while holding the open-file registry lock, so one slow `open`
+  delays the others. Pre-existing since M3, unchanged here.
+- The branch that puts a mount back into the daemon's state when a forced unmount is asked of a
+  service that has none is not covered by a test — no mount service in this build lacks a forced
+  unmount.
+- `crypto unlock --port` (WebDAV) and `--store-password` (keychain) do not exist yet; they arrive
+  with M5 and M6.
+- The unlock timeouts are compiled in: 60 seconds for the daemon to receive an `unlock`, 70 for the
+  whole call. A mount slower than that needs a rebuild, not a setting.

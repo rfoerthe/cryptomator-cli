@@ -1,5 +1,12 @@
 # Spike A: FUSE-T / macFUSE über dlopen + fuser::Session::from_fd
 
+> **Nachtrag (M4):** Option 1 der Konsequenz unten wurde umgesetzt und bewiesen —
+> `docs/superpowers/spikes/2026-09-06-spike-c-fuse-t-linux-abi.md` (**Spike C**) mountet FUSE-T
+> erfolgreich mit `KernelAbi::Linux` aus dem Fork `vendor/fuser`. Der Schalter ist eine
+> Laufzeit-Entscheidung (`Config::abi`) statt eines Features, damit ein Binary macFUSE und FUSE-T
+> bedient. macFUSE bleibt unverifiziert (nach wie vor nicht installiert). Das
+> Ergebnis „NO-GO“ unten gilt also für **unverändertes** fuser 0.18 und ist mit dem Fork überholt.
+
 Frage: Liefert `fuse_mount_compat25` aus `libfuse-t.dylib` einen fd, über den fuser 0.18 das Kernel-FUSE-Protokoll sprechen kann?
 
 Setup: `cargo run -p cryptomator-mount --example spike_macos_dlopen -- <fuse-t|macfuse> /tmp/spike-mnt`

@@ -3,7 +3,10 @@
 `crypto` is a Rust command line client for [Cryptomator](https://cryptomator.org) vaults (vault format 8)
 for macOS and Linux. It shares the desktop app's `settings.json` and keychain entries.
 
-Status: early development. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`.
+Status: early development. Vault format 8 read and write, mount-less access, and FUSE mounting with
+a per-vault daemon work; WebDAV, the keychain, `crypto health`, restore and migration do not exist
+yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the design and
+`docs/daemon-protocol.md` for the daemon's wire protocol.
 
 ## Build
 
@@ -69,13 +72,109 @@ The key is read from standard input (it never appears in the process list or the
 It prints `valid` and exits `0`, or prints `invalid` and exits `4`. Error messages never quote the
 input.
 
-## Unlocking and locking
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | success — including a reader that closed the pipe (`crypto vault list \| head -3`) and a `--follow` stream stopped with Ctrl-C |
+| `1` | anything else that failed |
+| `2` | usage: an unknown flag or mounter, no password source, a value the setting does not take |
+| `3` | the vault reference names no registered vault, or more than one |
+| `4` | wrong password, invalid recovery key, a new password below the minimum length |
+| `5` | wrong vault state: already unlocked, not unlocked, needs migration, read-only, or an `fs`/`name` command on a vault that is not `LOCKED` |
+| `6` | the mount failed — a mount point that cannot be used, a mounter that refused, a conflicting mount service, or a daemon that stopped answering while it mounted |
+| `7` | the unmount failed; a volume still in use needs `crypto lock … --force` |
+| `9` | a Hub vault, which this build cannot open |
+| `10` | the vault's daemon cannot be reached |
+| `12` | the path is not a vault directory |
+
+`8` (keychain unavailable) and `11` (health findings) are reserved for M6 and M7 and are never
+returned today.
+
+## Mounting
+
+A mounted vault looks like an ordinary directory: `crypto unlock` hands the vault to a FUSE back
+end, and everything below the mount point is encrypted on the way in and decrypted on the way out.
+`crypto mounters` says what this build can use and what works on this machine.
+
+### Prerequisites
+
+`crypto` does not ship a file system driver; one has to be installed:
+
+| Platform | Back end | Install | `--mounter` |
+|---|---|---|---|
+| macOS | **FUSE-T** (no kernel extension) | `brew install --cask macos-fuse-t/homebrew-cask/fuse-t` | `fuse-t` |
+| macOS | macFUSE (system extension, needs approval and a reboot) | `brew install --cask macfuse` | `macfuse` |
+| Linux | libfuse 3 | `apt install fuse3` (or your distribution's equivalent) | `fuse` |
+
+A back end is detected, not configured: FUSE-T by `/usr/local/lib/libfuse-t.dylib`, macFUSE by
+`/usr/local/lib/libfuse.2.dylib` or `libosxfuse.2.dylib`, Linux FUSE by a working `fusermount3 -V`.
+`crypto mounters` lists what answered, `crypto mounters --all` also the ones that did not:
+
+    $ crypto mounters
+    ALIAS   CLASS                                                   SUPPORTED  CAPABILITIES
+    fuse-t  org.cryptomator.frontend.fuse.mount.FuseTMountProvider  yes        MOUNT_FLAGS,UNMOUNT_FORCED,READ_ONLY,MOUNT_TO_EXISTING_DIR,VOLUME_NAME
+
+Without `--mounter` and without a `mountService` on the vault, the service with the highest
+priority that works here is chosen (macOS: macFUSE before FUSE-T; Linux: FUSE); `crypto config set
+defaultMounter <ALIAS>` fixes one for every vault, `crypto vault set <VAULT> --mounter <ALIAS>` for
+one of them. macFUSE and FUSE-T cannot be in use side by side: unlocking through one of them while
+another vault is already mounted through the other is refused (exit `6`), as in the desktop app.
+
+**macFUSE is not verified.** It was never installed on a machine this port was built or tested on,
+so the macFUSE code path has never mounted anything. FUSE-T (1.2.7) and Linux `fuse3` are covered
+by the mount end-to-end test.
+
+### What FUSE-T can and cannot do
+
+FUSE-T serves its volume as a **local NFS mount** — it shows up in `mount` as
+`fuse-t:/<volume-name> on <mount point> (nfs, …)`, not as a `fuse` file system. That has
+consequences a macFUSE or Linux mount does not have:
+
+- **No extended attributes.** `xattr` calls answer `ENOTSUP`, and `-ononamedattr` is always
+  appended to the mount flags. Finder tags, quarantine flags and resource forks are lost on the way
+  into the vault.
+- **AppleDouble side cars are refused.** macOS' NFS client writes a `._<name>` file next to *every*
+  node it creates, to carry exactly those attributes. Left alone, a vault mounted through FUSE-T
+  would fill up with one encrypted `._x` per file, directory and symlink, so the adapter answers
+  their creation with `EPERM` — the errno macFUSE's kernel extension returns for the same thing.
+  The user's own operation is untouched by that, but **copying a file that carries extended
+  attributes or a resource fork in Finder may fail**; that case is on the list below.
+- **No `-obackend=smb`.** FUSE-T 1.2.7 ships only the NFS helper (`go-nfsv4`); its own mount call
+  fails with the SMB backend. The NFS default is used and the option is not passed on.
+- Default flags: `-ononamedattr -orwsize=262144 -ouid=<uid> -ogid=<gid>`.
+
+macFUSE is mounted with `-ouid=<uid> -ogid=<gid> -oatomic_o_trunc -oauto_xattr -oauto_cache
+-onoappledouble -odefault_permissions` and keeps the side cars away from userspace itself;
+`-obackend=fskit` is refused. On Linux the defaults are `-oauto_unmount -ouid=<uid> -ogid=<gid>
+-oattr_timeout=5`. Both macOS back ends sweep `._*` and `.DS_Store` out of a directory before they
+remove it, like the desktop app's `deleteAppleDoubleFiles` — otherwise a directory that looks empty
+in Finder could never be deleted.
+
+`--mount-option=-o…` adds flags (repeatable, and the `=` form is required so a forgotten value
+cannot swallow the next flag); `crypto vault set <VAULT> --mount-flags="…"` stores them.
+
+### Still to verify by hand
+
+Three things the automated tests cannot reach. Until someone has run them, the README does not
+claim they work:
+
+1. **macFUSE**, at all — install it, `crypto unlock <VAULT> --mounter macfuse`, and run the same
+   round trip the end-to-end test runs on FUSE-T.
+2. **A Finder copy of a file carrying extended attributes or a resource fork onto a FUSE-T mount**,
+   which is where the refused AppleDouble side cars could surface as a failed copy. If it does, the
+   refusal has to become a flag rather than a default.
+3. **Coexistence with the Cryptomator desktop app**: the app and `crypto` share `settings.json`, and
+   the app rewrites the whole file from memory when it exits. Unlocking a vault in one and looking
+   at it in the other, in both orders, is not covered by any test.
+
+### Unlocking and locking
 
 `crypto unlock <VAULT>` reads the password, derives the vault key and hands it to a **background
 daemon** that owns the mount from then on. The password stays in the `crypto unlock` process and the
 key is sent over the daemon's private control socket — it never appears in the process list, the
-environment or a file. The daemon writes its socket, pid, run info and log into the state directory
-(`--state-dir`, `$CRYPTO_STATE_DIR`, otherwise a per-user run-time directory).
+environment or a file. The protocol between the two is documented in
+[`docs/daemon-protocol.md`](docs/daemon-protocol.md).
 
     crypto unlock Secret                       # mounts and returns; the daemon keeps running
     crypto unlock Secret --json                # {"id":…,"mountpoint":…,"mounter":…,"pid":…}
@@ -84,8 +183,16 @@ environment or a file. The daemon writes its socket, pid, run info and log into 
 
 - **`--mounter <ALIAS|CLASS>`** picks the mount service (`fuse-t`, `macfuse`, `fuse`), `--mount-point`
   where to mount, `--mount-option=-o…` (repeatable) adds mount flags, `--read-only` and
-  `--volume-name` do what they say. An unknown mounter name is a usage error (exit `2`).
+  `--volume-name` do what they say. An unknown mounter name is a usage error (exit `2`). Relative
+  paths are resolved before the daemon is spawned — it runs with its working directory at `/`.
 - **`--foreground`** serves the vault in this process instead of detaching; Ctrl-C locks it again.
+  The same daemon, the same protocol, the same teardown — only the process is yours, and the wait
+  before a forced unmount is announced on your standard error instead of only in the log.
+- **A FUSE-T volume needs a moment to appear.** `crypto unlock` returns as soon as the mount call
+  has, but FUSE-T mounts asynchronously: for a few hundred milliseconds afterwards the mount point
+  is still the empty directory underneath, and anything written there lands beside the vault instead
+  of in it. Wait for the volume before you write to it, e.g.
+  `until mount | grep -q "on $MP "; do sleep 0.1; done`.
 - **`--reveal`** (or the vault's `actionAfterUnlock=REVEAL`) opens the mount point in the file
   manager afterwards — `open` on macOS, `xdg-open` on Linux. `$CRYPTO_REVEAL_CMD` replaces that
   command (split on whitespace, the mount point is appended); failures are ignored either way,
@@ -96,10 +203,34 @@ environment or a file. The daemon writes its socket, pid, run info and log into 
 - **Exit codes:** `5` for a vault that is already unlocked or not unlocked, `6` when the mount fails
   (the last lines of the daemon's log are printed) or when the daemon stops answering while it
   mounts, `7` when an unmount fails — a busy volume needs `crypto lock … --force` — and `10` when
-  the daemon cannot be reached.
+  the daemon cannot be reached. See [the table](#exit-codes).
 - **A crashed daemon** leaves its volume mounted (`STALE_MOUNT`); `crypto lock <VAULT> --force` takes
   it down by mount point and removes the leftover state files. If nothing is mounted any more, the
   leftovers are cleaned up on their own the next time a command looks at the vault.
+- **`--mounter null`** mounts nothing at all. It exists for the test suite — it is only offered when
+  `$CRYPTO_ENABLE_NULL_MOUNTER=1` is set, and "mounting" means writing a marker file into the mount
+  point — so that the daemon, `lock`, `status`, `stats`, `events`, the signals and the auto-lock can
+  be tested without a FUSE driver. Nothing in normal use needs it.
+
+`crypto unlock` gives the mount 60 seconds and then gives up on the daemon (70 seconds for the whole
+call, so a daemon that has stopped answering is not waited for either); the daemon is asked to stop
+— SIGTERM before SIGKILL, so its own unmount still runs — and the command fails with exit `6`
+pointing at the log. Both values are compiled in.
+
+### The state directory
+
+The daemon writes four files per vault: `<id>.sock` (its control socket, `0600`), `<id>.pid`,
+`<id>.json` (the run info: mount point, mounter, pid, start time, read-only) and `<id>.log`. The log
+survives a lock, the other three are removed with the daemon.
+
+    --state-dir <PATH>                         # for one command
+    $CRYPTO_STATE_DIR                          # for the environment
+
+Without either, the default is `~/Library/Application Support/Cryptomator/cli-run` on macOS and
+`$XDG_RUNTIME_DIR/crypto` on Linux, falling back to `/tmp/crypto-<uid>` where the session has no
+run-time directory. The directory is created `0700` and has to be a real directory belonging to you
+— a symbolic link or someone else's directory is refused rather than used, because whoever owns that
+path would own the socket the vault key travels over.
 
 ### Signals
 
