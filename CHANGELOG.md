@@ -188,8 +188,13 @@
   `crypto vault list | head -3` exits `0` and prints nothing about it.
 - Three core changes a mount that runs for days needs: the directory mapping and directory id
   caches expire 20 s after a load (cryptofs' `CiphertextDirCache.MAX_CACHE_AGE`, so foreign changes
-  to `dir.c9r` are picked up; the M3 deviation "no dir-cache expiry" is resolved), dropping a
-  `CryptoFs` without calling `close` flushes its open files instead of losing the buffered
-  cleartext, and closing a file handle flushes it with only that file locked, so one slow `close`
-  no longer blocks every other `open`, `rename` or `delete`. A directory id is also loaded under
-  the cache lock now, so two threads racing on a missing `dir.c9r` cannot invent two different ids.
+  to `dir.c9r` are picked up within 40 s at the latest -- the two caches expire independently, and a
+  mapping re-cached from a still-fresh id can carry it 20 s further -- and the M3 deviation "no
+  dir-cache expiry" is resolved), dropping a `CryptoFs` without calling `close` flushes its open
+  files instead of losing the buffered cleartext, and closing a file handle flushes it with only
+  that file locked, so one slow `close` no longer blocks every other `open`, `rename` or `delete`.
+  A directory id is also loaded under the cache lock now, so two threads racing on a missing
+  `dir.c9r` cannot invent two different ids. Both caches now share one `ExpiringMap` whose pruning
+  is amortised (a scan only when the map has roughly doubled or a whole TTL has passed since the
+  last one), so a cache miss during a hot `find`, backup run or Spotlight index no longer pays for
+  an O(n) scan that finds nothing to remove.

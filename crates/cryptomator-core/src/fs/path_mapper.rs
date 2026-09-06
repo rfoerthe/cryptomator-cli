@@ -2,11 +2,11 @@
 use super::ciphertext_path::{CiphertextDirectory, CiphertextFilePath, CiphertextFileType};
 use super::dir_id::DirIdLoader;
 use super::events::{EventSink, FilesystemEvent};
+use super::expiring::ExpiringMap;
 use super::long_names::deflate;
 use super::path::CleartextPath;
 use crate::constants::{CRYPTOMATOR_FILE_SUFFIX, DATA_DIR_NAME, ROOT_DIR_ID};
 use crate::Cryptor;
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,17 +20,8 @@ pub struct CryptoPathMapper {
     events: EventSink,
     /// `CiphertextDirCache`: mapping plus the time it was loaded, expiring after
     /// [`DIR_CACHE_TTL`](super::DIR_CACHE_TTL).
-    dir_cache: Mutex<HashMap<CleartextPath, CachedDir>>,
-    clock: super::Clock,
+    dir_cache: Mutex<ExpiringMap<CleartextPath, CiphertextDirectory>>,
     root: CiphertextDirectory,
-}
-
-/// One `dir_cache` entry: cryptofs caches with `expireAfterWrite`, so the load time is what
-/// decides, not the last access.
-#[derive(Clone)]
-struct CachedDir {
-    dir: CiphertextDirectory,
-    loaded: Instant,
 }
 
 impl std::fmt::Debug for CryptoPathMapper {
@@ -57,8 +48,7 @@ impl CryptoPathMapper {
             dir_ids,
             shortening_threshold: shortening_threshold as usize,
             events,
-            dir_cache: Mutex::new(HashMap::new()),
-            clock: super::Clock::default(),
+            dir_cache: Mutex::new(ExpiringMap::new()),
             root,
         }
     }
@@ -177,13 +167,17 @@ impl CryptoPathMapper {
     /// time, so a rename cannot extend an entry's life beyond the 20 seconds it started with.
     pub fn move_path_mapping(&self, src: &CleartextPath, dst: &CleartextPath) {
         let mut cache = super::lock(&self.dir_cache);
-        let moved: Vec<(CleartextPath, CachedDir)> = cache
+        let moved: Vec<(CleartextPath, Instant, CiphertextDirectory)> = cache
             .iter()
-            .filter(|(key, _)| key.starts_with(src))
-            .filter_map(|(key, dir)| key.rebase(src, dst).map(|k| (k, dir.clone())))
+            .filter(|(key, _, _)| key.starts_with(src))
+            .filter_map(|(key, loaded, dir)| {
+                key.rebase(src, dst).map(|k| (k, *loaded, dir.clone()))
+            })
             .collect();
         cache.retain(|key, _| !key.starts_with(src));
-        cache.extend(moved);
+        for (key, loaded, dir) in moved {
+            cache.insert(key, dir, loaded);
+        }
     }
 
     /// The content directory of a cleartext directory (root without I/O; others via `dir.c9r`).
@@ -191,30 +185,18 @@ impl CryptoPathMapper {
         if cleartext.is_root() {
             return Ok(self.root.clone());
         }
-        let now = self.clock.now();
-        if let Some(entry) = super::lock(&self.dir_cache).get(cleartext) {
-            if super::is_fresh(entry.loaded, now) {
-                return Ok(entry.dir.clone());
-            }
+        if let Some(dir) = super::lock(&self.dir_cache).get(cleartext) {
+            return Ok(dir.clone());
         }
         // not holding the lock: the lookup recurses into the parent directory
         let dir_file = self.ciphertext_file_path(cleartext)?.dir_file_path();
         let dir = self.resolve_directory(&dir_file)?;
-        let now = self.clock.now();
         let mut cache = super::lock(&self.dir_cache);
-        // Nothing else bounds the map, so a miss (which just did I/O anyway) drops what expired.
-        // cryptofs additionally caps the cache at 5000 entries; expiry alone bounds ours to the
-        // directories touched within the last 20 seconds.
-        cache.retain(|_, entry| super::is_fresh(entry.loaded, now));
+        let now = cache.now();
         // Overwrites a concurrently inserted entry instead of cryptofs' `putIfAbsent`: both were
-        // read from the same `dir.c9r`, and this one is the younger of the two.
-        cache.insert(
-            cleartext.clone(),
-            CachedDir {
-                dir: dir.clone(),
-                loaded: now,
-            },
-        );
+        // read from the same `dir.c9r`, and this one is the younger of the two. Pruning of
+        // whatever else expired is amortised inside `insert` (finding I1), not done here.
+        cache.insert(cleartext.clone(), dir.clone(), now);
         Ok(dir)
     }
 
@@ -230,7 +212,7 @@ impl CryptoPathMapper {
     /// Ages every cached mapping by `d` (the directory ids have their own clock).
     #[cfg(test)]
     pub(crate) fn advance(&self, d: std::time::Duration) {
-        self.clock.advance(d);
+        super::lock(&self.dir_cache).advance(d);
     }
 }
 

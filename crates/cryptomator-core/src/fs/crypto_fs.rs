@@ -1303,12 +1303,36 @@ mod tests {
 
     #[test]
     fn close_and_the_following_drop_do_not_flush_twice() {
+        // `close(self)` consumes the fs, so its own trailing Drop cannot be observed from here
+        // (control never returns to a `fs` to query). `flush_all` does the same
+        // `open_files.close_all()` without consuming `self`, so this drives that instead: one
+        // explicit `flush_all`, then an explicit `drop` -- the same two calls `close` makes back
+        // to back -- and checks that the second one writes nothing.
         let (dir, fs) = test_fs(220, false);
         let path = CleartextPath::parse("/buffered");
         let handle = fs.open_file(&path, OpenOptions::write_new()).unwrap();
         handle.write_all_at(b"payload", 0).unwrap();
-        // close() drains the registry, so the Drop that follows it finds nothing left to flush
-        fs.close().unwrap();
+
+        // an owned clone of the stats outlives `fs` itself, so the second flush stays observable
+        // after the `drop(fs)` below.
+        let stats = fs.stats.clone();
+
+        fs.flush_all().unwrap();
+        let after_first_flush = stats.snapshot();
+        assert!(
+            after_first_flush.bytes_encrypted > 0,
+            "the first flush must have encrypted and written the dirty chunk"
+        );
+
+        // the Drop finds an empty registry (flush_all already drained it): a real second flush
+        // would encrypt and write the same chunk again and move the counters a second time
+        drop(fs);
+        assert_eq!(
+            stats.snapshot(),
+            after_first_flush,
+            "the Drop must not flush a second time"
+        );
+
         let fs2 = reopen(dir.path());
         assert_eq!(fs2.read_file(&path).unwrap(), b"payload");
         drop(handle);

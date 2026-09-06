@@ -2,34 +2,28 @@
 //! (`dirid.c9r`: the directory id encrypted like file content, inside its own content directory).
 use super::ciphertext_path::CiphertextDirectory;
 use super::events::{EventSink, FilesystemEvent};
+use super::expiring::ExpiringMap;
 use crate::constants::{DIR_ID_BACKUP_FILE_NAME, MAX_DIR_ID_LENGTH};
 use crate::crypto::rng::Rng;
 use crate::crypto::stream::{decrypt_all, encrypt_all};
 use crate::error::{CoreError, Result};
 use crate::Cryptor;
 use data_encoding::BASE32;
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
 
 /// `DirectoryIdLoader.MAX_DIR_ID_LENGTH` (the loader tolerates more than the 36 chars of a UUID).
 pub const MAX_DIR_FILE_LENGTH: u64 = 1000;
 
-/// Caches every directory id it has read. cryptofs caches these forever; a mount runs for days,
-/// so an entry here expires after [`DIR_CACHE_TTL`](super::DIR_CACHE_TTL) like the mapper's, and a
-/// `dir.c9r` a synchronisation client rewrote is picked up at the latest 20 seconds later.
+/// Caches every directory id it has read. cryptofs caches these forever; a mount runs for days, so
+/// an entry here expires after [`DIR_CACHE_TTL`](super::DIR_CACHE_TTL) like the mapper's -- and
+/// because the mapper's own cache (`path_mapper.rs`) re-caches a mapping from a still-fresh id
+/// after `invalidate_path_mapping`, a mapping can carry a dir id read up to 2 * `DIR_CACHE_TTL`
+/// (40 s) earlier, not just `DIR_CACHE_TTL` (20 s).
 pub struct DirIdLoader {
     events: EventSink,
-    cache: Mutex<HashMap<PathBuf, CachedId>>,
-    clock: super::Clock,
-}
-
-/// One cache entry with the time it was read (`expireAfterWrite`).
-struct CachedId {
-    id: String,
-    loaded: Instant,
+    cache: Mutex<ExpiringMap<PathBuf, String>>,
 }
 
 impl std::fmt::Debug for DirIdLoader {
@@ -44,15 +38,14 @@ impl DirIdLoader {
     pub fn new(events: EventSink) -> Self {
         Self {
             events,
-            cache: Mutex::new(HashMap::new()),
-            clock: super::Clock::default(),
+            cache: Mutex::new(ExpiringMap::new()),
         }
     }
 
     /// Ages every cached id by `d`.
     #[cfg(test)]
     pub(crate) fn advance(&self, d: std::time::Duration) {
-        self.clock.advance(d);
+        super::lock(&self.cache).advance(d);
     }
 
     /// Reads `dir.c9r`. A missing file yields a fresh random UUID (which is cached, so a later
@@ -65,21 +58,12 @@ impl DirIdLoader {
     /// system (the daemon's only appends to a queue).
     pub fn load(&self, dir_file: &Path) -> io::Result<String> {
         let mut cache = super::lock(&self.cache);
-        let now = self.clock.now();
-        if let Some(entry) = cache.get(dir_file) {
-            if super::is_fresh(entry.loaded, now) {
-                return Ok(entry.id.clone());
-            }
+        if let Some(id) = cache.get(dir_file) {
+            return Ok(id.clone());
         }
         let id = self.load_uncached(dir_file)?;
-        cache.retain(|_, entry| super::is_fresh(entry.loaded, now));
-        cache.insert(
-            dir_file.to_path_buf(),
-            CachedId {
-                id: id.clone(),
-                loaded: now,
-            },
-        );
+        let now = cache.now();
+        cache.insert(dir_file.to_path_buf(), id.clone(), now);
         Ok(id)
     }
 
@@ -120,8 +104,8 @@ impl DirIdLoader {
     /// time, so a rename does not extend its life).
     pub fn move_id(&self, src: &Path, dst: &Path) {
         let mut cache = super::lock(&self.cache);
-        if let Some(id) = cache.remove(src) {
-            cache.insert(dst.to_path_buf(), id);
+        if let Some((loaded, id)) = cache.remove(src) {
+            cache.insert(dst.to_path_buf(), id, loaded);
         }
     }
 }
@@ -244,6 +228,37 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert!(uuid::Uuid::parse_str(&id).is_ok());
         assert_eq!(loader.load(&missing).unwrap(), id);
+    }
+
+    /// The cache lock is held across `load_uncached` (see the doc comment on `load`), so N threads
+    /// racing on the same missing `dir.c9r` must all observe one random UUID, never invent their
+    /// own -- otherwise one of them creates the directory under an id nobody else can find.
+    #[test]
+    fn concurrent_loads_of_a_missing_dir_file_agree_on_one_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = std::sync::Arc::new(DirIdLoader::new(crate::fs::discard_events()));
+        let missing = dir.path().join("dir.c9r");
+        const THREADS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (loader, missing, barrier) = (loader.clone(), missing.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    loader.load(&missing).unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<String> = workers
+            .into_iter()
+            .map(|w| w.join().expect("worker panicked"))
+            .collect();
+        let first = &ids[0];
+        assert!(uuid::Uuid::parse_str(first).is_ok());
+        assert!(
+            ids.iter().all(|id| id == first),
+            "every thread must observe the same UUID: {ids:?}"
+        );
     }
 
     #[test]

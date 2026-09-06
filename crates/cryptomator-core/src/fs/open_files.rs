@@ -267,7 +267,12 @@ impl FileHandle {
             return Ok(());
         }
         self.released = true;
-        let mut result = super::lock(&self.file).flush();
+        // The lock order everywhere else is registry (`files`) before file, so this flush must not
+        // still be holding the file lock once `files` is locked below. An explicit block scope
+        // makes the guard's drop visible at the call site, instead of resting on it dying at the
+        // statement's `;` -- a refactor to a named binding could silently keep it alive and invert
+        // the order.
+        let mut result = { super::lock(&self.file).flush() };
         let mut files = super::lock(&self.files);
         let mut file = super::lock(&self.file);
         if file.release() == 0 {
@@ -418,15 +423,40 @@ mod tests {
     }
 
     /// Fails the test instead of hanging forever when a lock-order regression deadlocks the
-    /// workers: every worker reports completion, and this waits at most 10 seconds for all of them.
+    /// workers: every worker reports completion, and this waits at most 10 seconds for all of
+    /// them. A sender only drops without sending when its worker panicked before reporting, so a
+    /// `Disconnected` receive means "join and re-raise that panic", not "deadlock" -- an actual
+    /// `Timeout` is the only case that is one.
     fn join_within_10s(workers: Vec<std::thread::JoinHandle<()>>, done: mpsc::Receiver<()>) {
         for _ in 0..workers.len() {
-            done.recv_timeout(Duration::from_secs(10))
-                .expect("a worker did not finish within 10 s (deadlock?)");
+            match done.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("a worker did not finish within 10 s (deadlock?)");
+                }
+                // a worker panicked; joining it below re-raises the actual panic payload
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
         for worker in workers {
-            worker.join().expect("worker panicked");
+            if let Err(payload) = worker.join() {
+                std::panic::resume_unwind(payload);
+            }
         }
+    }
+
+    /// A worker that panics before reporting drops its sender, which disconnects the channel
+    /// immediately. Before the M5 fix that looked exactly like a hung worker and was reported as
+    /// "did not finish within 10 s (deadlock?)"; now it re-raises the worker's own panic instead.
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn join_within_10s_reraises_a_workers_panic_instead_of_calling_it_a_deadlock() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _tx = tx; // dropped by the unwind below, disconnecting `rx` without a send
+            panic!("boom");
+        });
+        join_within_10s(vec![worker], rx);
     }
 
     #[test]

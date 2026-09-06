@@ -7,6 +7,7 @@ pub mod crypto_fs;
 pub mod dir_id;
 pub mod dir_stream;
 pub mod events;
+mod expiring;
 pub mod long_names;
 pub mod name_decryptor;
 pub mod open_file;
