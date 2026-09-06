@@ -3,11 +3,14 @@
 //! The crate is organised like Cryptomator's mount integration: [`api`] holds the service /
 //! builder / mount traits every provider implements, [`flags`] parses the user's mount flags,
 //! [`transcoder`] normalises file names between the FUSE peer and the vault, and [`mounttab`]
-//! answers whether a path is currently mounted.
+//! answers whether a path is currently mounted. [`fuse`] (feature `fuse`) holds the FUSE adapter
+//! itself.
 #![warn(missing_debug_implementations)]
 
 pub mod api;
 pub mod flags;
+#[cfg(feature = "fuse")]
+pub mod fuse;
 pub mod mounttab;
 pub mod transcoder;
 
@@ -16,5 +19,9 @@ pub use api::{
     ServiceInfo, UnmountError,
 };
 pub use flags::{current_uid_gid, parse_mount_flags, AdapterOptions, MountFlags};
+#[cfg(feature = "fuse")]
+pub use fuse::{
+    errno_for, DirHandles, DirListing, DirSnapshot, FileHandles, InodeTable, OpenFileEntry,
+};
 pub use mounttab::{is_mountpoint, mounted_paths};
 pub use transcoder::{FuseNormalization, NameTranscoder};

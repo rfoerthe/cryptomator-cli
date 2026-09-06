@@ -206,7 +206,17 @@ mod tests {
             .unwrap();
         s.create_symbolic_link(&CleartextPath::parse("/b"), "a")
             .unwrap();
-        assert!(s.resolve_recursively(&CleartextPath::parse("/a")).is_err());
+        let loop_err = s
+            .resolve_recursively(&CleartextPath::parse("/a"))
+            .unwrap_err();
+        assert_eq!(loop_err.kind(), io::ErrorKind::Other);
+        assert!(
+            loop_err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::fs::FilesystemLoop>())
+                .is_some(),
+            "a loop is recognisable by its payload: {loop_err}"
+        );
         assert_eq!(
             s.create_symbolic_link(&CleartextPath::parse("/c"), &"y".repeat(32_768))
                 .unwrap_err()

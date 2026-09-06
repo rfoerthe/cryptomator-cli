@@ -39,12 +39,18 @@ pub fn parse_mountinfo(mountinfo: &str) -> Vec<PathBuf> {
 
 /// Mount points from the output of `mount(8)`: lines of the form
 /// `<source> on <path> (<options>)`.
+///
+/// `mount(8)` quotes nothing, so the line is split at the last `" ("` (which opens the option
+/// list) and then at the last `" on "` before it -- device names may well contain `" on "`.
+/// Remaining ambiguity: a mount point that contains `" ("` *and* `" on "` after that `" ("`
+/// (e.g. `/mnt/a (b) on c`) is still split at the wrong place; the output format cannot express
+/// such a name unambiguously.
 pub fn parse_macos_mount(output: &str) -> Vec<PathBuf> {
     output
         .lines()
         .filter_map(|line| {
-            let start = line.find(" on ")? + " on ".len();
             let end = line.rfind(" (")?;
+            let start = line.get(..end)?.rfind(" on ")? + " on ".len();
             let path = line.get(start..end)?.trim();
             if path.is_empty() {
                 None
@@ -125,10 +131,14 @@ mod tests {
             parse_mountinfo(mi),
             vec![PathBuf::from("/mnt/my vault"), PathBuf::from("/proc")]
         );
-        let mo = "/dev/disk3s1s1 on / (apfs, sealed, local)\nfuse-t:/vault on /Users/x/mnt/Vault (nfs, nodev)\n";
+        let mo = "/dev/disk3s1s1 on / (apfs, sealed, local)\nfuse-t:/vault on /Users/x/mnt/Vault (nfs, nodev)\nconfusing on device on /mnt/x (nfs, nodev)\n";
         assert_eq!(
             parse_macos_mount(mo),
-            vec![PathBuf::from("/"), PathBuf::from("/Users/x/mnt/Vault")]
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/Users/x/mnt/Vault"),
+                PathBuf::from("/mnt/x")
+            ]
         );
         assert!(is_mountpoint(Path::new("/")));
         assert!(!is_mountpoint(Path::new("/definitely/not/mounted")));

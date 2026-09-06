@@ -30,7 +30,7 @@ pub use fs::{decrypt_filename, determine_supported_cleartext_file_name_length};
 pub use fs::{
     CiphertextDirectory, CiphertextFilePath, CiphertextFileType, CleartextPath, CryptoFs,
     CryptoFsOptions, CryptoPathMapper, DirEntry, DirIdLoader, EventSink, FileAttributes,
-    FileHandle, FilesystemEvent, OpenOptions,
+    FileHandle, FilesystemEvent, FilesystemLoop, OpenOptions,
 };
 pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
 pub use vault::init::{

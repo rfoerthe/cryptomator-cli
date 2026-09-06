@@ -36,6 +36,20 @@ use std::fmt::Display;
 use std::io;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+/// Payload of the `io::Error` a symlink loop produces (`ErrorKind::Other`, because
+/// `ErrorKind::FilesystemLoop` is unstable): downcast the error's inner value to it to recognise
+/// the loop, e.g. `err.get_ref().and_then(|e| e.downcast_ref::<FilesystemLoop>())`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemLoop(pub String);
+
+impl Display for FilesystemLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: too many levels of symbolic links", self.0)
+    }
+}
+
+impl std::error::Error for FilesystemLoop {}
+
 /// Locks without propagating poisoning: the protected data are caches and counters that stay
 /// consistent even if a panic interrupted a holder.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -99,9 +113,10 @@ mod io_errors {
             format!("{path}: not a symbolic link ({detail})"),
         )
     }
-    /// `ErrorKind::FilesystemLoop` is still unstable, so this uses `Other`.
+    /// `ErrorKind::FilesystemLoop` is still unstable, so this uses `Other` and carries the
+    /// [`FilesystemLoop`] marker as the payload so a FUSE adapter can still answer `ELOOP`.
     pub(crate) fn fs_loop(path: impl Display) -> io::Error {
-        io::Error::other(format!("{path}: too many levels of symbolic links"))
+        io::Error::other(FilesystemLoop(path.to_string()))
     }
 }
 
