@@ -332,26 +332,29 @@ pub fn write_line<W: Write>(w: &mut W, value: &impl Serialize) -> io::Result<()>
 
 /// Reads one line, without its terminator.
 ///
-/// Returns `Ok(None)` at end of input. A line longer than [`MAX_LINE_LEN`] is an
+/// Returns `Ok(None)` at end of input. A line longer than [`MAX_LINE_LEN`] (the terminator does
+/// not count towards the limit, so `\r\n` gets its own byte of headroom) is an
 /// [`io::ErrorKind::InvalidData`] error rather than an unbounded allocation, and the reader is
 /// left just past the limit -- the connection is not usable afterwards.
 pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
-    let limit = MAX_LINE_LEN as u64 + 1;
+    // Two bytes of headroom past MAX_LINE_LEN: one for `\n`, one more so a `\r\n` terminator on a
+    // line at exactly the limit still fits before the length check below rejects it.
+    let limit = MAX_LINE_LEN as u64 + 2;
     let mut line = String::with_capacity(LINE_BUFFER);
     let read = r.take(limit).read_line(&mut line)?;
     if read == 0 {
         return Ok(None);
     }
-    if !line.ends_with('\n') && read as u64 == limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("protocol line exceeds {MAX_LINE_LEN} bytes"),
-        ));
-    }
     // A last line without a terminator is accepted: peers that close right after writing are
     // common enough, and the JSON either parses or it does not.
     while line.ends_with('\n') || line.ends_with('\r') {
         line.pop();
+    }
+    if line.len() > MAX_LINE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("protocol line exceeds {MAX_LINE_LEN} bytes"),
+        ));
     }
     Ok(Some(line))
 }
@@ -545,6 +548,23 @@ mod tests {
 
         let mut too_long = vec![b'a'; MAX_LINE_LEN + 1];
         too_long.push(b'\n');
+        let err = read_line(&mut Cursor::new(too_long)).expect_err("beyond the limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn read_line_accepts_a_crlf_line_at_the_limit_and_rejects_one_beyond_it() {
+        let mut at_limit = vec![b'a'; MAX_LINE_LEN];
+        at_limit.extend_from_slice(b"\r\n");
+        let mut input = Cursor::new(at_limit);
+        let line = read_line(&mut input)
+            .expect("at the limit")
+            .expect("a line");
+        assert_eq!(line.len(), MAX_LINE_LEN);
+
+        let mut too_long = vec![b'a'; MAX_LINE_LEN + 1];
+        too_long.extend_from_slice(b"\r\n");
         let err = read_line(&mut Cursor::new(too_long)).expect_err("beyond the limit");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds"), "{err}");

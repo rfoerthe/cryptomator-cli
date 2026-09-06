@@ -15,8 +15,8 @@ pub mod state_dir;
 
 pub use cli_config::{default_mount_points_dir, CliConfig};
 pub use daemon::{
-    read_line, read_request, write_line, DaemonClient, ErrorBody, EventRecord, EventsResult, Hello,
-    Request, Response, StatsResult, StatusResult, StreamItem, MAX_LINE_LEN, PROTOCOL_VERSION,
+    DaemonClient, ErrorBody, EventRecord, EventsResult, Hello, Request, Response, StatsResult,
+    StatusResult, StreamItem, MAX_LINE_LEN, PROTOCOL_VERSION,
 };
 pub use error::{AppError, Result};
 pub use mounters::{alias_for, resolve_mounter};

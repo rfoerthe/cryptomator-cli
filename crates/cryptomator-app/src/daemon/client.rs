@@ -74,31 +74,60 @@ impl DaemonClient {
     /// a version mismatch -- and the last transient error is what surfaces when the deadline hits.
     pub fn connect_with_retry(socket: &Path, deadline: Duration) -> Result<Self> {
         let started = Instant::now();
+        let mut last_transient: Option<AppError> = None;
         loop {
-            match Self::try_connect(socket) {
+            let remaining = deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // No time left even for the read timeout of one more attempt. Stop here instead
+                // of calling `try_connect_within` with a zero `hello_timeout`, which would need
+                // `set_read_timeout(Some(Duration::ZERO))` -- that call is `EINVAL`.
+                return Err(last_transient.unwrap_or_else(|| {
+                    AppError::DaemonUnreachable(format!(
+                        "{}: timed out waiting for the daemon",
+                        socket.display()
+                    ))
+                }));
+            }
+            match Self::try_connect_within(socket, remaining.min(HELLO_TIMEOUT)) {
                 Ok(client) => return Ok(client),
                 Err(ConnectFailure::Fatal(err)) => return Err(err),
                 Err(ConnectFailure::Transient(err)) => {
-                    if started.elapsed() >= deadline {
+                    let remaining = deadline.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
                         return Err(err);
                     }
-                    thread::sleep(RETRY_INTERVAL);
+                    last_transient = Some(err);
+                    thread::sleep(RETRY_INTERVAL.min(remaining));
                 }
             }
         }
     }
 
     fn try_connect(socket: &Path) -> std::result::Result<Self, ConnectFailure> {
+        Self::try_connect_within(socket, HELLO_TIMEOUT)
+    }
+
+    /// Connects to `socket` once, bounding the wait for the [`Hello`] by `hello_timeout` (which
+    /// callers keep at or below [`HELLO_TIMEOUT`]).
+    fn try_connect_within(
+        socket: &Path,
+        hello_timeout: Duration,
+    ) -> std::result::Result<Self, ConnectFailure> {
         let stream = UnixStream::connect(socket).map_err(|err| {
-            ConnectFailure::Transient(AppError::DaemonUnreachable(format!(
-                "{}: {err}",
-                socket.display()
-            )))
+            let message = format!("{}: {err}", socket.display());
+            match err.kind() {
+                // A socket cannot become shorter or change its permissions by waiting: these
+                // never resolve themselves, so retrying only delays the error.
+                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
+                    ConnectFailure::Fatal(AppError::DaemonUnreachable(message))
+                }
+                _ => ConnectFailure::Transient(AppError::DaemonUnreachable(message)),
+            }
         })?;
         // Only the greeting is on a clock. Afterwards the client blocks for as long as the user
         // wants -- `events --follow` sits on the socket until it is interrupted.
         stream
-            .set_read_timeout(Some(HELLO_TIMEOUT))
+            .set_read_timeout(Some(hello_timeout))
             .map_err(|err| ConnectFailure::Transient(transport(&err)))?;
         let writer = stream
             .try_clone()
@@ -114,15 +143,9 @@ impl DaemonClient {
             }
             Err(err) => return Err(ConnectFailure::Transient(transport(&err))),
         };
-        let hello: Hello = serde_json::from_str(&line).map_err(|_| {
-            ConnectFailure::Fatal(AppError::DaemonUnreachable(
-                "the process on the socket is not a crypto daemon".to_owned(),
-            ))
-        })?;
+        let hello: Hello = serde_json::from_str(&line).map_err(|_| not_a_daemon())?;
         if hello.hello != Hello::MAGIC {
-            return Err(ConnectFailure::Fatal(AppError::DaemonUnreachable(
-                "the process on the socket is not a crypto daemon".to_owned(),
-            )));
+            return Err(not_a_daemon());
         }
         if hello.protocol != PROTOCOL_VERSION {
             return Err(ConnectFailure::Fatal(AppError::DaemonUnreachable(format!(
@@ -289,6 +312,13 @@ fn malformed() -> AppError {
     AppError::DaemonUnreachable("malformed message from the daemon".to_owned())
 }
 
+/// The greeting failed to parse, or its `hello` field is not [`Hello::MAGIC`].
+fn not_a_daemon() -> ConnectFailure {
+    ConnectFailure::Fatal(AppError::DaemonUnreachable(
+        "the process on the socket is not a crypto daemon".to_owned(),
+    ))
+}
+
 fn unexpected() -> AppError {
     AppError::DaemonUnreachable("unexpected message from the daemon".to_owned())
 }
@@ -297,6 +327,7 @@ fn unexpected() -> AppError {
 mod tests {
     use super::*;
     use crate::daemon::protocol::{read_request, ErrorBody};
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -412,6 +443,38 @@ mod tests {
             let Ok(conn) = conn else { return };
             handle(conn, protocol);
         }
+    }
+
+    /// A daemon stand-in that greets, reads exactly one request, and answers with whatever
+    /// `reply` (given the request's `id`) returns, written to the socket verbatim -- unlike
+    /// [`handle`], which always encodes a well-formed [`Response`]. Used to feed the client lines
+    /// it must reject: garbage JSON, or a `Response` with the wrong `id`.
+    fn spawn_fake_with_reply(
+        protocol: u32,
+        reply: impl FnOnce(u64) -> String + Send + 'static,
+    ) -> Fake {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).expect("binding the fake daemon socket");
+        thread::spawn(move || {
+            let Ok((conn, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(mut writer) = conn.try_clone() else {
+                return;
+            };
+            let mut reader = BufReader::new(conn);
+            if write_line(&mut writer, &greeting(protocol)).is_err() {
+                return;
+            }
+            let Ok(Some(request)) = read_request(&mut reader) else {
+                return;
+            };
+            let line = reply(request.id());
+            let _ = writer.write_all(line.as_bytes());
+            let _ = writer.flush();
+        });
+        Fake { _dir: dir, socket }
     }
 
     #[test]
@@ -546,5 +609,84 @@ mod tests {
             other => panic!("expected the daemon to be unreachable, got {other:?}"),
         }
         assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    /// A listener that accepts every connection and then never writes anything -- a daemon that
+    /// is wedged, or stopped, between `accept` and sending its `Hello`.
+    fn spawn_silent_listener() -> Fake {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let socket = dir.path().join("silent.sock");
+        let listener = UnixListener::bind(&socket).expect("binding the silent socket");
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                // Hold the connection open without ever writing the greeting.
+                thread::sleep(Duration::from_secs(60));
+                drop(conn);
+            }
+        });
+        Fake { _dir: dir, socket }
+    }
+
+    #[test]
+    fn connect_with_retry_does_not_overrun_the_deadline_waiting_for_a_stuck_hello() {
+        let fake = spawn_silent_listener();
+        let started = Instant::now();
+        match DaemonClient::connect_with_retry(&fake.socket, Duration::from_millis(300)) {
+            Err(AppError::DaemonUnreachable(_)) => {}
+            other => panic!("expected the daemon to be unreachable, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connect_with_retry must not wait out a full HELLO_TIMEOUT past its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_with_retry_fails_fast_on_an_overlong_socket_path() {
+        // `sun_path` is 104 bytes on macOS (108 on Linux): this path can never be connectable, no
+        // matter how long we wait.
+        let overlong = PathBuf::from(format!("/{}/x.sock", "a".repeat(200)));
+        let started = Instant::now();
+        match DaemonClient::connect_with_retry(&overlong, Duration::from_secs(2)) {
+            Err(AppError::DaemonUnreachable(_)) => {}
+            other => panic!("expected the daemon to be unreachable, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "an unconnectable path must not be retried: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn read_message_rejects_malformed_json() {
+        let fake = spawn_fake_with_reply(PROTOCOL_VERSION, |_id| "not json\n".to_owned());
+        let mut client = DaemonClient::connect(&fake.socket).expect("connects");
+        match client.ping() {
+            Err(AppError::DaemonUnreachable(message)) => {
+                assert!(message.contains("malformed"), "{message}");
+            }
+            other => panic!("expected a malformed-message error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_rejects_a_response_with_a_mismatched_id() {
+        let fake = spawn_fake_with_reply(PROTOCOL_VERSION, |id| {
+            let response = Response::ok(id + 1, serde_json::Value::Null);
+            format!(
+                "{}\n",
+                serde_json::to_string(&response).expect("a response serialises")
+            )
+        });
+        let mut client = DaemonClient::connect(&fake.socket).expect("connects");
+        match client.ping() {
+            Err(AppError::DaemonUnreachable(message)) => {
+                assert!(message.contains("unexpected"), "{message}");
+            }
+            other => panic!("expected an unexpected-message error, got {other:?}"),
+        }
     }
 }
