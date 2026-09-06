@@ -330,33 +330,76 @@ pub fn write_line<W: Write>(w: &mut W, value: &impl Serialize) -> io::Result<()>
     w.flush()
 }
 
-/// Reads one line, without its terminator.
+/// What [`read_line_into`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineStatus {
+    /// The buffer holds one complete line, terminator already stripped.
+    Complete,
+    /// End of input, and the buffer is empty.
+    Eof,
+    /// The read timed out before the line was complete. Whatever arrived is in the buffer and
+    /// the next call continues where this one stopped.
+    Incomplete,
+}
+
+/// Reads one line into `buf`, without its terminator, and says whether it is complete.
 ///
-/// Returns `Ok(None)` at end of input. A line longer than [`MAX_LINE_LEN`] (the terminator does
-/// not count towards the limit, so `\r\n` gets its own byte of headroom) is an
-/// [`io::ErrorKind::InvalidData`] error rather than an unbounded allocation, and the reader is
-/// left just past the limit -- the connection is not usable afterwards.
-pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
+/// Unlike [`read_line`] this survives a read timeout: a socket with
+/// [`set_read_timeout`](std::os::unix::net::UnixStream::set_read_timeout) reports
+/// [`LineStatus::Incomplete`] with the bytes that did arrive left in `buf`, so a caller polling
+/// for a signal in between cannot lose half a message. `buf` is only ever appended to; the caller
+/// clears it once it has taken the line.
+///
+/// A line longer than [`MAX_LINE_LEN`] (the terminator does not count towards the limit, so
+/// `\r\n` gets its own byte of headroom) is an [`io::ErrorKind::InvalidData`] error rather than an
+/// unbounded allocation, and the reader is left just past the limit -- the connection is not
+/// usable afterwards.
+pub fn read_line_into<R: BufRead>(r: &mut R, buf: &mut String) -> io::Result<LineStatus> {
     // Two bytes of headroom past MAX_LINE_LEN: one for `\n`, one more so a `\r\n` terminator on a
     // line at exactly the limit still fits before the length check below rejects it.
-    let limit = MAX_LINE_LEN as u64 + 2;
-    let mut line = String::with_capacity(LINE_BUFFER);
-    let read = r.take(limit).read_line(&mut line)?;
-    if read == 0 {
-        return Ok(None);
+    let limit = (MAX_LINE_LEN + 2).saturating_sub(buf.len()) as u64;
+    let read = match r.take(limit).read_line(buf) {
+        Ok(read) => read,
+        // The bytes read before the timeout stay in `buf` (`read_line` appends as it goes), so
+        // this is a resumption point, not a loss.
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            return Ok(LineStatus::Incomplete)
+        }
+        Err(e) => return Err(e),
+    };
+    if read == 0 && buf.is_empty() {
+        return Ok(LineStatus::Eof);
     }
     // A last line without a terminator is accepted: peers that close right after writing are
-    // common enough, and the JSON either parses or it does not.
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
+    // common enough, and the JSON either parses or it does not. `read_line` only returns without
+    // a `\n` at end of input or at the limit, so there is nothing more to wait for either way.
+    while buf.ends_with('\n') || buf.ends_with('\r') {
+        buf.pop();
     }
-    if line.len() > MAX_LINE_LEN {
+    if buf.len() > MAX_LINE_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("protocol line exceeds {MAX_LINE_LEN} bytes"),
         ));
     }
-    Ok(Some(line))
+    Ok(LineStatus::Complete)
+}
+
+/// Reads one line, without its terminator, from a blocking reader.
+///
+/// Returns `Ok(None)` at end of input. See [`read_line_into`] for the length limit; a reader with
+/// a read timeout should use that function instead, because a timeout here is an error that
+/// throws the partial line away.
+pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
+    let mut line = String::with_capacity(LINE_BUFFER);
+    match read_line_into(r, &mut line)? {
+        LineStatus::Complete => Ok(Some(line)),
+        LineStatus::Eof => Ok(None),
+        LineStatus::Incomplete => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the read timed out before the line was complete",
+        )),
+    }
 }
 
 /// Reads and decodes one [`Request`], wiping the raw line afterwards.
@@ -597,6 +640,78 @@ mod tests {
             other => panic!("expected an unlock, got {other:?}"),
         }
         assert_eq!(read_request(&mut input).expect("eof").map(|r| r.op()), None);
+    }
+
+    /// A reader that hands its input out in pieces with a timeout in between -- what a socket
+    /// with a read timeout looks like when a message arrives split in two.
+    struct Stuttering {
+        chunks: std::collections::VecDeque<&'static [u8]>,
+        timeout_next: bool,
+    }
+
+    impl Read for Stuttering {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.timeout_next {
+                self.timeout_next = false;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "timed out"));
+            }
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    self.timeout_next = true;
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn read_line_into_resumes_where_a_timeout_stopped_it() {
+        let mut input = io::BufReader::new(Stuttering {
+            chunks: [b"{\"a\":".as_slice(), b"1}\n{\"b\":2}\n".as_slice()].into(),
+            timeout_next: false,
+        });
+        let mut buf = String::new();
+        // The first half arrives, then the read times out -- and the half is still there.
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("first half"),
+            LineStatus::Incomplete
+        );
+        assert_eq!(buf, "{\"a\":");
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("second half"),
+            LineStatus::Complete
+        );
+        assert_eq!(buf, "{\"a\":1}", "nothing was lost across the timeout");
+
+        buf.clear();
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("the buffered second line"),
+            LineStatus::Complete
+        );
+        assert_eq!(buf, "{\"b\":2}");
+        buf.clear();
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("a timeout with nothing pending"),
+            LineStatus::Incomplete
+        );
+        assert_eq!(
+            read_line_into(&mut input, &mut buf).expect("end of input"),
+            LineStatus::Eof
+        );
+    }
+
+    #[test]
+    fn read_line_reports_a_timeout_as_an_error() {
+        let mut input = io::BufReader::new(Stuttering {
+            chunks: [b"{}\n".as_slice()].into(),
+            timeout_next: true,
+        });
+        let err = read_line(&mut input).expect_err("a timeout on a blocking reader is an error");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(read_line(&mut input).expect("the line"), Some("{}".into()));
     }
 
     #[test]

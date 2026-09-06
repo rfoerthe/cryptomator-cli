@@ -28,14 +28,18 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `vault info` | Shows the settings and the vault configuration of one vault | `crypto vault info Secret` |
 | `vault set` | Changes per-vault settings (mount point, mounter, flags, auto-lock, …) | `crypto vault set Secret --mount-point ~/mnt/secret --read-only true` |
 | `vault remove` | Unregisters a vault; its files stay on disk | `crypto vault remove Secret` |
-| `config get` | Prints one or all global settings | `crypto config get port` |
-| `config set` | Changes a global setting (`mountService`, `port`, `useKeychain`, `keychainProvider`, `debugMode`) | `crypto config set port 42427` |
+| `config get` | Prints one or all settings, from `settings.json` and `cli.json` together | `crypto config get port` |
+| `config set` | Changes a setting (`mountService`, `port`, `useKeychain`, `keychainProvider`, `debugMode`, `mountPointsDir`, `defaultMounter`, `logLevel`, `forceUnmountOnSignalAfterSecs`) | `crypto config set port 42427` |
 | `password change` | Changes the vault password and backs the old masterkey file up as `.bkup` | `crypto password change Secret --new-password-stdin` |
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
 | `unlock` | Mounts a vault in a background daemon | `crypto unlock Secret --mounter fuse-t` |
 | `lock` | Unmounts a vault and stops its daemon | `crypto lock Secret --force` |
+| `status` | Lists the registered vaults with their runtime state and mount point | `crypto status --json` |
+| `stats` | Throughput and cache counters of an unlocked vault | `crypto stats Secret --follow` |
+| `events` | The event log of an unlocked vault | `crypto events Secret --since 42` |
+| `mounters` | The mount services this build knows and which of them work here | `crypto mounters --all` |
 | `fs ls` | Lists a directory inside a locked vault | `crypto fs ls Secret /2026 -l` |
 | `fs tree` | Walks a directory tree; `--json --hash` prints the fixture-manifest shape | `crypto fs tree Secret --json --hash` |
 | `fs cat` | Writes a vault file to standard output | `crypto fs cat Secret /notes.md` |
@@ -90,6 +94,37 @@ environment or a file. The daemon writes its socket, pid, run info and log into 
 - **A crashed daemon** leaves its volume mounted (`STALE_MOUNT`); `crypto lock <VAULT> --force` takes
   it down by mount point and removes the leftover state files. If nothing is mounted any more, the
   leftovers are cleaned up on their own the next time a command looks at the vault.
+
+## Watching an unlocked vault
+
+`crypto status` answers from `settings.json` and the state directory alone — it never sends a
+request, so it works for locked, unlocked and crashed vaults alike:
+
+    crypto status                              # ID  NAME  STATE  MOUNTPOINT, one row per vault
+    crypto status Secret --json                # one object: id, displayName, path, state,
+                                               # mountpoint, mounter, pid, readOnly
+
+The states are the ones `crypto vault list` shows plus `UNLOCKED` and `STALE_MOUNT`. Naming a vault
+that is not registered is exit `3`; without an argument the output is an array, with one it is that
+vault's object.
+
+`crypto stats` and `crypto events` ask the daemon, so they need the vault to be **unlocked** (exit
+`5` otherwise, exit `10` if the daemon is gone):
+
+    crypto stats Secret                        # read 0 B/s  write 0 B/s  cache 0%  total read …
+    crypto stats Secret --follow --interval 5  # one line (or one JSON object) every 5 seconds
+    crypto events Secret                       # seq  time  KIND  message, oldest first
+    crypto events Secret --follow --json       # one JSON object per event, as it happens
+
+The per-second numbers are the deltas of the daemon's last sampling interval (one second), the
+totals are read at request time. The event log lives in the daemon, so it starts empty with every
+unlock and holds the last thousand entries; `--since <SEQ>` continues after the `seq` of the last
+event you saw. Both `--follow` modes print a notice on standard error, keep going until **Ctrl-C**
+and then exit `0`; with `--json` they print one object per line (NDJSON), not one document.
+
+`crypto mounters` lists the mount services of this build — the `ALIAS` column is what `--mounter`
+and `defaultMounter` accept, and `CLASS` is the Java class name stored in `settings.json`. Without
+`--all` only the services that work on this machine are listed.
 
 ## Mount-less access
 
@@ -158,6 +193,23 @@ the current one, and silently reusing it would keep the old password.
 environment (a `:`-separated list like Java's `-Dcryptomator.settingsPath`; the first entry is the
 file that gets written). Saving is atomic (`settings.json.<pid>.tmp` + rename) and keeps unknown fields, so
 a file written by the desktop app survives a round trip.
+
+### `cli.json`
+
+Everything the CLI needs *in addition* lives in `cli.json`, a sibling of `settings.json`, so a
+future desktop version cannot collide with it. Unknown keys are preserved there too, and the file
+is written 0600. `crypto config get|set` reads and writes both files in one flat namespace:
+
+| Key | What it does | Default |
+|---|---|---|
+| `mountPointsDir` | Where mount directories are created when neither the vault nor `--mount-point` names one | `~/Library/Application Support/Cryptomator/mnt` (macOS), `~/.local/share/Cryptomator/mnt` (Linux) |
+| `defaultMounter` | Mount service for vaults that name none; an alias is stored as the Java class name, `default` clears it | unset (the best available service) |
+| `logLevel` | Verbosity of the daemon log: `error`, `warn`, `info`, `debug`, `trace` | `info` |
+| `forceUnmountOnSignalAfterSecs` | How long a daemon tries a graceful unmount on shutdown before forcing it | `10` |
+
+    crypto config set mountPointsDir ~/mnt     # relative paths resolve against the shell's cwd
+    crypto config set defaultMounter fuse-t
+    crypto config get mountPointsDir           # the effective value, default included
 
 Because the file is shared, **close the desktop app before `crypto vault add` or `crypto vault
 remove`**: the running app keeps its own copy in memory and overwrites the file when it exits.

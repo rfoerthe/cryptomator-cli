@@ -23,9 +23,10 @@ pub mod protocol;
 pub mod server;
 
 pub use client::DaemonClient;
-pub use logging::{init_file_logger, level_filter};
+pub use logging::{format_timestamp, init_file_logger, level_filter};
 pub use protocol::{
-    read_line, read_request, write_line, ErrorBody, EventRecord, EventsResult, Hello, Request,
-    Response, StatsResult, StatusResult, StreamItem, MAX_LINE_LEN, PROTOCOL_VERSION,
+    read_line, read_line_into, read_request, write_line, ErrorBody, EventRecord, EventsResult,
+    Hello, LineStatus, Request, Response, StatsResult, StatusResult, StreamItem, MAX_LINE_LEN,
+    PROTOCOL_VERSION,
 };
 pub use server::{run_daemon, DaemonConfig};

@@ -907,3 +907,160 @@ fn password_change_new_password_error_names_the_new_password_flags() {
                 .and(predicate::str::contains("set CRYPTO_PASSWORD").not()),
         );
 }
+
+/// The class name of the mount service that mounts nothing.
+const NULL_MOUNTER: &str = "org.cryptomator.cli.NullMountProvider";
+/// Makes the null mounter usable; without it, it is listed but not supported.
+const ENABLE_NULL: &str = "CRYPTO_ENABLE_NULL_MOUNTER";
+
+fn json_of(cmd: &mut Command) -> serde_json::Value {
+    let out = cmd.assert().success().get_output().stdout.clone();
+    serde_json::from_slice(&out).unwrap()
+}
+
+/// The entry for `class` in a `crypto mounters --json` array, if it is listed at all.
+fn service<'a>(list: &'a serde_json::Value, class: &str) -> Option<&'a serde_json::Value> {
+    list.as_array()
+        .expect("an array of services")
+        .iter()
+        .find(|s| s["className"] == class)
+}
+
+#[test]
+fn mounters_lists_the_mount_services() {
+    let sb = Sandbox::new();
+
+    // Without `--all` only the services that work here are listed, and without the environment
+    // variable the null mounter does not work.
+    let supported = json_of(sb.crypto(&["--json", "mounters"]).env_remove(ENABLE_NULL));
+    assert!(service(&supported, NULL_MOUNTER).is_none(), "{supported}");
+    for entry in supported.as_array().unwrap() {
+        assert_eq!(entry["supported"], true, "{entry}");
+    }
+
+    // `--all` lists it, as unsupported.
+    let all = json_of(
+        sb.crypto(&["--json", "mounters", "--all"])
+            .env_remove(ENABLE_NULL),
+    );
+    let null = service(&all, NULL_MOUNTER).expect("the null mounter is listed by --all");
+    assert_eq!(null["supported"], false, "{null}");
+    assert_eq!(null["alias"], "null");
+    assert!(null["capabilities"].is_array());
+    assert!(null["displayName"].is_string());
+
+    // With the environment variable it becomes usable, and then it is listed without `--all` too.
+    let enabled = json_of(
+        sb.crypto(&["--json", "mounters", "--all"])
+            .env(ENABLE_NULL, "1"),
+    );
+    assert_eq!(service(&enabled, NULL_MOUNTER).unwrap()["supported"], true);
+    let usable = json_of(sb.crypto(&["--json", "mounters"]).env(ENABLE_NULL, "1"));
+    assert!(service(&usable, NULL_MOUNTER).is_some(), "{usable}");
+
+    sb.crypto(&["mounters", "--all"])
+        .env(ENABLE_NULL, "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ALIAS"))
+        .stdout(predicate::str::contains("CAPABILITIES"))
+        .stdout(predicate::str::contains("null"))
+        .stdout(predicate::str::contains(NULL_MOUNTER));
+}
+
+#[test]
+fn config_get_and_set_the_cli_settings() {
+    let sb = Sandbox::new();
+    let cli_json = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(sb.path("cli.json")).unwrap()).unwrap()
+    };
+
+    // Defaults, without a cli.json existing at all.
+    sb.crypto(&["config", "get", "logLevel"])
+        .assert()
+        .success()
+        .stdout("info\n");
+    sb.crypto(&["config", "get", "forceUnmountOnSignalAfterSecs"])
+        .assert()
+        .success()
+        .stdout("10\n");
+    // The effective mount-point base, i.e. the platform default while nothing is configured.
+    let dir = sb
+        .crypto(&["config", "get", "mountPointsDir"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let dir = String::from_utf8(dir).unwrap();
+    assert!(dir.trim().ends_with("Cryptomator/mnt"), "{dir}");
+    assert!(!sb.path("cli.json").exists(), "reading writes nothing");
+
+    sb.crypto(&["config", "set", "logLevel", "bogus"])
+        .assert()
+        .code(2);
+    sb.crypto(&["config", "set", "logLevel", "debug"])
+        .assert()
+        .success()
+        .stdout("logLevel=debug\n");
+    assert_eq!(cli_json()["logLevel"], "debug");
+
+    // A relative path is resolved against the shell's cwd, like every other path argument.
+    sb.crypto(&["config", "set", "mountPointsDir", "relative/mnt"])
+        .assert()
+        .success();
+    let configured = cli_json()["mountPointsDir"].as_str().unwrap().to_string();
+    assert!(
+        std::path::Path::new(&configured).is_absolute() && configured.ends_with("relative/mnt"),
+        "{configured}"
+    );
+    sb.crypto(&["config", "get", "mountPointsDir"])
+        .assert()
+        .success()
+        .stdout(format!("{configured}\n"));
+
+    // An alias is stored as the Java class name; "default" clears the setting again.
+    sb.crypto(&["config", "set", "defaultMounter", "fuse-t"])
+        .assert()
+        .success();
+    assert_eq!(
+        cli_json()["defaultMounter"],
+        "org.cryptomator.frontend.fuse.mount.FuseTMountProvider"
+    );
+    sb.crypto(&["config", "set", "defaultMounter", "bogus"])
+        .assert()
+        .code(2);
+    sb.crypto(&["config", "set", "defaultMounter", "default"])
+        .assert()
+        .success();
+    assert!(cli_json()["defaultMounter"].is_null());
+
+    sb.crypto(&["config", "set", "forceUnmountOnSignalAfterSecs", "30"])
+        .assert()
+        .success();
+    assert_eq!(cli_json()["forceUnmountOnSignalAfterSecs"], 30);
+    sb.crypto(&["config", "set", "forceUnmountOnSignalAfterSecs", "-1"])
+        .assert()
+        .code(2);
+    sb.crypto(&["config", "set", "mountPointsDir", ""])
+        .assert()
+        .code(2);
+
+    // One `config get` shows the settings.json keys and the cli.json keys together.
+    let all = json_of(&mut sb.crypto(&["--json", "config", "get"]));
+    assert_eq!(all["port"], 42427);
+    assert_eq!(all["logLevel"], "debug");
+    assert_eq!(all["forceUnmountOnSignalAfterSecs"], 30);
+    assert!(all["defaultMounter"].is_null());
+    sb.crypto(&["config", "get"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("logLevel=debug"))
+        .stdout(predicate::str::contains("port=42427"));
+
+    // Unknown keys are still refused, and the message names the cli.json keys too.
+    sb.crypto(&["config", "get", "nosuchkey"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("logLevel"));
+}

@@ -147,3 +147,21 @@
   would corrupt each other's ciphertext.
 - `maxCleartextFilenameLength` is probed on the first unlock of a writable vault and written back to
   `settings.json`; a read-only unlock cannot probe (the probe writes) and takes the cryptofs default.
+- CLI: `crypto status [VAULT]` prints the registered vaults with their runtime state and mount point
+  (an array, or that vault's object with an argument). It reads `settings.json` and the state
+  directory only — no request reaches a daemon — so it answers for locked, unlocked and crashed
+  vaults alike, and cleans up the state files a crashed daemon left behind on the way.
+- CLI: `crypto stats <VAULT>` and `crypto events <VAULT>` ask the vault's daemon over its socket and
+  therefore need an unlocked vault (exit `5` otherwise). Both take `--follow` — `stats` samples every
+  `--interval` seconds, `events` streams as they happen and continues after `--since <SEQ>` — print a
+  notice on standard error, stop on Ctrl-C with exit `0`, and emit NDJSON with `--json`.
+- CLI: `crypto mounters [--all]` lists the mount services of this build with their alias, Java class
+  name, whether they work here and their capabilities.
+- `cli.json` next to `settings.json` is now readable and writable through `crypto config get|set`:
+  `mountPointsDir` (absolutized), `defaultMounter` (alias or class name, `default` clears),
+  `logLevel` and `forceUnmountOnSignalAfterSecs`. `crypto config get` prints the keys of both files
+  in one flat object, and `config get mountPointsDir` reports the effective value including the
+  platform default.
+- `DaemonClient::set_read_timeout` and `stream_until` make a follow stream interruptible: a read
+  that times out becomes an idle callback instead of a blocked process, and `protocol::read_line_into`
+  keeps a message that arrives split across such a timeout from being lost.

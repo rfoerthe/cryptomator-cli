@@ -4,8 +4,8 @@
 //! deliberately blocking and single-threaded -- a command sends one request and waits for its
 //! answer -- and it owns the connection, so dropping it closes the socket.
 use crate::daemon::protocol::{
-    read_line, write_line, EventRecord, EventsResult, Hello, Request, Response, StatsResult,
-    StatusResult, StreamItem, PROTOCOL_VERSION,
+    read_line, read_line_into, write_line, EventRecord, EventsResult, Hello, LineStatus, Request,
+    Response, StatsResult, StatusResult, StreamItem, PROTOCOL_VERSION,
 };
 use crate::error::{AppError, Result};
 use serde::de::DeserializeOwned;
@@ -28,6 +28,10 @@ pub struct DaemonClient {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    /// The line being read, kept across calls: with a read timeout
+    /// ([`set_read_timeout`](DaemonClient::set_read_timeout)) a message can arrive in pieces, and
+    /// the piece that came before the timeout must not be thrown away.
+    pending: String,
     /// The greeting the daemon sent; it names the vault and the daemon's pid.
     pub hello: Hello,
 }
@@ -162,6 +166,7 @@ impl DaemonClient {
             reader,
             writer,
             next_id: 1,
+            pending: String::new(),
             hello,
         })
     }
@@ -194,18 +199,54 @@ impl DaemonClient {
     /// drop it.
     pub fn stream(
         &mut self,
+        request: Request,
+        on_item: impl FnMut(EventRecord) -> bool,
+    ) -> Result<()> {
+        self.stream_until(request, on_item, || true)
+    }
+
+    /// Bounds how long a read on this connection waits.
+    ///
+    /// `None` -- the state after [`connect`](Self::connect) -- blocks until the daemon says
+    /// something, which is what every request/response round trip wants. A timeout turns a quiet
+    /// connection into [`LineStatus::Incomplete`] instead, so [`stream_until`](Self::stream_until)
+    /// can look at a Ctrl-C flag in between; a partially received message survives that.
+    ///
+    /// # Errors
+    /// [`AppError::DaemonUnreachable`] if the socket refuses the timeout (a zero `Duration` is
+    /// `EINVAL`).
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(timeout)
+            .map_err(|err| transport(&err))
+    }
+
+    /// [`stream`](Self::stream), but interruptible: `on_idle` is called whenever a read times out
+    /// (see [`set_read_timeout`](Self::set_read_timeout)) and stops the stream by returning
+    /// `false`. Without a read timeout it is never called and this is exactly `stream`.
+    ///
+    /// # Errors
+    /// Anything [`stream`](Self::stream) reports.
+    pub fn stream_until(
+        &mut self,
         mut request: Request,
         mut on_item: impl FnMut(EventRecord) -> bool,
+        mut on_idle: impl FnMut() -> bool,
     ) -> Result<()> {
         let id = self.send(&mut request)?;
         drop(request);
         loop {
-            match self.read_message()? {
+            let Some(message) = self.read_message_or_idle()? else {
+                if on_idle() {
+                    continue;
+                }
+                return self.end_stream();
+            };
+            match message {
                 Message::StreamItem(item) if item.id == id => {
                     if !on_item(item.event) {
-                        // Errors are irrelevant here: we are done with the socket either way.
-                        let _ = self.writer.shutdown(Shutdown::Both);
-                        return Ok(());
+                        return self.end_stream();
                     }
                 }
                 Message::Response(response) if response.id == id => {
@@ -215,6 +256,13 @@ impl DaemonClient {
                 _ => return Err(unexpected()),
             }
         }
+    }
+
+    /// Shuts the socket down in both directions: the daemon takes the closed connection as the
+    /// end of the stream. Errors are irrelevant -- we are done with it either way.
+    fn end_stream(&mut self) -> Result<()> {
+        let _ = self.writer.shutdown(Shutdown::Both);
+        Ok(())
     }
 
     /// What the daemon has mounted, and since when.
@@ -263,19 +311,41 @@ impl DaemonClient {
     }
 
     fn read_message(&mut self) -> Result<Message> {
-        let Some(line) = read_line(&mut self.reader).map_err(|err| transport(&err))? else {
-            return Err(AppError::DaemonUnreachable(
-                "the daemon closed the connection".to_owned(),
-            ));
-        };
+        match self.read_message_or_idle()? {
+            Some(message) => Ok(message),
+            // Only reachable with a read timeout set, which no plain `call` does.
+            None => Err(AppError::DaemonUnreachable(
+                "the daemon did not answer in time".to_owned(),
+            )),
+        }
+    }
+
+    /// One message, or `None` when the read timed out before the line was complete.
+    fn read_message_or_idle(&mut self) -> Result<Option<Message>> {
+        let mut pending = std::mem::take(&mut self.pending);
+        let status = read_line_into(&mut self.reader, &mut pending).map_err(|err| transport(&err));
+        match status {
+            Ok(LineStatus::Incomplete) => {
+                self.pending = pending;
+                return Ok(None);
+            }
+            Ok(LineStatus::Eof) => {
+                return Err(AppError::DaemonUnreachable(
+                    "the daemon closed the connection".to_owned(),
+                ))
+            }
+            Ok(LineStatus::Complete) => {}
+            Err(err) => return Err(err),
+        }
+        let line = pending;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|_| malformed())?;
         if value.get("event").is_some() {
             serde_json::from_value(value)
-                .map(Message::StreamItem)
+                .map(|item| Some(Message::StreamItem(item)))
                 .map_err(|_| malformed())
         } else {
             serde_json::from_value(value)
-                .map(Message::Response)
+                .map(|response| Some(Message::Response(response)))
                 .map_err(|_| malformed())
         }
     }
@@ -475,6 +545,59 @@ mod tests {
             let _ = writer.flush();
         });
         Fake { _dir: dir, socket }
+    }
+
+    /// A daemon stand-in that greets, reads one request and then says nothing at all, so a
+    /// follow stream on it only ever sees read timeouts.
+    fn spawn_mute() -> Fake {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).expect("binding the mute daemon socket");
+        thread::spawn(move || {
+            let Ok((conn, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(mut writer) = conn.try_clone() else {
+                return;
+            };
+            let mut reader = BufReader::new(conn);
+            let _ = write_line(&mut writer, &greeting(PROTOCOL_VERSION));
+            let _ = read_request(&mut reader);
+            // Hold the connection open, answering nothing, until the client shuts it down.
+            let _ = read_line(&mut reader);
+        });
+        Fake { _dir: dir, socket }
+    }
+
+    #[test]
+    fn a_read_timeout_makes_a_follow_stream_interruptible() {
+        let fake = spawn_mute();
+        let mut client = DaemonClient::connect(&fake.socket).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("a read timeout can be set");
+        let mut idle = 0;
+        let mut items = 0;
+        client
+            .stream_until(
+                Request::Events {
+                    id: 0,
+                    follow: true,
+                    since: 0,
+                },
+                |_| {
+                    items += 1;
+                    true
+                },
+                || {
+                    idle += 1;
+                    // Ctrl-C on the third look.
+                    idle < 3
+                },
+            )
+            .expect("the stream ends when the idle callback says so");
+        assert_eq!(items, 0, "the mute daemon sent nothing");
+        assert_eq!(idle, 3);
     }
 
     #[test]

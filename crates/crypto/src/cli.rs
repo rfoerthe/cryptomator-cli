@@ -46,7 +46,7 @@ pub enum Command {
         #[command(subcommand)]
         command: RecoveryKeyCommand,
     },
-    /// Global settings (settings.json)
+    /// Global settings (settings.json) and CLI settings (cli.json)
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -65,6 +65,14 @@ pub enum Command {
     Unlock(UnlockArgs),
     /// Unmount and lock vaults
     Lock(LockArgs),
+    /// Show what is registered, what is unlocked and where
+    Status(StatusArgs),
+    /// Throughput and cache counters of an unlocked vault
+    Stats(StatsArgs),
+    /// The event log of an unlocked vault
+    Events(EventsArgs),
+    /// The mount services this build knows
+    Mounters(MountersArgs),
     /// The vault daemon itself; started by `crypto unlock`, never by hand.
     #[command(name = "__daemon", hide = true)]
     Daemon(DaemonArgs),
@@ -125,6 +133,49 @@ pub struct LockArgs {
     /// Unmount even while the volume is in use
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Vault id, display name or path; without one, every registered vault
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatsArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Keep printing one sample per interval until Ctrl-C
+    #[arg(long)]
+    pub follow: bool,
+    /// Seconds between samples with --follow
+    #[arg(long, value_name = "SECS", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Keep printing events as they happen until Ctrl-C
+    #[arg(long)]
+    pub follow: bool,
+    /// Only events after this sequence number (the `seq` of the last one you saw)
+    #[arg(long, value_name = "SEQ", default_value_t = 0)]
+    pub since: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct MountersArgs {
+    /// Include the services that do not work on this machine
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]
@@ -218,13 +269,19 @@ pub struct SetArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Print one or all global settings
+    /// Print one or all settings
     Get {
-        /// mountService | port | useKeychain | keychainProvider | debugMode
+        /// settings.json: mountService | port | useKeychain | keychainProvider | debugMode;
+        /// cli.json: mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs
         key: Option<String>,
     },
-    /// Change a global setting
-    Set { key: String, value: String },
+    /// Change a setting
+    // Values may start with a dash (a negative number is refused later, with a reason).
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
 }
 
 #[derive(Args, Debug)]

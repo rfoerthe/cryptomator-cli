@@ -103,6 +103,10 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Name { command } => commands::name::run(&ctx, command),
         Command::Unlock(args) => commands::unlock::unlock(&ctx, args),
         Command::Lock(args) => commands::lock::lock(&ctx, args),
+        Command::Status(args) => commands::status::status(&ctx, args),
+        Command::Stats(args) => commands::stats::stats(&ctx, args),
+        Command::Events(args) => commands::events::events(&ctx, args),
+        Command::Mounters(args) => commands::mounters::mounters(&ctx, args),
         Command::Daemon(args) => commands::daemon::run(&ctx, args),
     }
 }

@@ -1,18 +1,22 @@
 //! Command implementations; each returns the process exit code.
 pub mod config;
 pub mod daemon;
+pub mod events;
 pub mod fs;
 pub mod lock;
+pub mod mounters;
 pub mod name;
 pub mod password;
 pub mod recovery;
+pub mod stats;
+pub mod status;
 pub mod unlock;
 pub mod vault;
 
 use crate::output::Output;
 use anyhow::Result;
 use cryptomator_app::settings::{resolve_vault_index, SettingsStore, VaultSettingsJson};
-use cryptomator_app::{AppError, StateDir, VaultRegistry};
+use cryptomator_app::{AppError, RuntimeState, StateDir, VaultInfo, VaultRegistry};
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::PathBuf;
 
@@ -32,6 +36,29 @@ impl Ctx {
     pub fn registry(&self) -> VaultRegistry {
         VaultRegistry::new(self.store.clone(), self.state_dir.clone())
     }
+}
+
+/// Resolves a vault reference and requires a daemon to be serving it, returning the vault and the
+/// socket to talk to that daemon on.
+///
+/// `crypto stats` and `crypto events` both need one: their answers exist only inside the running
+/// daemon. A vault in any other state -- locked, or left behind by a crashed daemon -- is an
+/// [`AppError::WrongState`] (exit code 5), not an empty result.
+///
+/// # Errors
+/// [`AppError::VaultNotFound`] / [`AppError::AmbiguousVault`] (exit code 3) for a reference that
+/// names no vault, [`AppError::WrongState`] (5) for one that is not unlocked.
+pub fn unlocked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultInfo, PathBuf)> {
+    let info = ctx.registry().info(reference)?;
+    if info.state != RuntimeState::Unlocked {
+        return Err(AppError::WrongState {
+            expected: RuntimeState::Unlocked.as_str().to_string(),
+            actual: info.state.as_str().to_string(),
+        }
+        .into());
+    }
+    let socket = ctx.state_dir.files(&info.id).socket;
+    Ok((info, socket))
 }
 
 /// Resolves a vault reference to its settings entry and path, requiring the vault to be in state

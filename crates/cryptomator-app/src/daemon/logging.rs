@@ -106,9 +106,12 @@ impl Log for FileLogger {
 
 /// `time` as `2026-09-06T10:00:00Z`.
 ///
+/// One UTC format for everything the daemon and the CLI print: the log lines here and the
+/// timestamps of `crypto events`.
+///
 /// A time before the epoch cannot come from a monotonic clock read here, and there is nothing
 /// useful to print for it; it is clamped to the epoch.
-fn format_timestamp(time: SystemTime) -> String {
+pub fn format_timestamp(time: SystemTime) -> String {
     let secs = time
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

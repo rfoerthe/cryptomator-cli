@@ -475,3 +475,149 @@ fn a_mount_that_fails_reports_the_daemon_log() {
     // The log survives the state files, so the failure can still be looked at.
     assert!(fx.state_file(".log").is_file());
 }
+
+/// Reads the first line of `stream` in a thread, so a test can give up instead of blocking on a
+/// child that never says anything.
+fn first_line(stream: impl std::io::Read + Send + 'static) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line);
+        let _ = tx.send(line);
+    });
+    rx.recv_timeout(DEADLINE)
+        .expect("the child says something within the deadline")
+}
+
+/// Runs `args` in the sandbox, requires exit code 0 and parses the `--json` output.
+fn json_out(fx: &Fixture, args: &[&str]) -> Value {
+    let out = fx
+        .crypto_daemon(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    json(&out)
+}
+
+/// Ctrl-C, the way a shell sends it.
+fn interrupt(pid: u32) {
+    std::process::Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .unwrap();
+}
+
+#[test]
+fn status_stats_and_events_follow_a_vault_through_unlock_and_lock() {
+    let fx = Fixture::new("v");
+    let id = fx.id();
+
+    // Locked: `status` reads the registry only, so it works without any daemon.
+    let before = json_out(&fx, &["--json", "status"]);
+    let rows = before.as_array().expect("an array of vaults");
+    assert_eq!(rows.len(), 1, "{before}");
+    assert_eq!(rows[0]["id"], id);
+    assert_eq!(rows[0]["state"], "LOCKED");
+    assert!(rows[0]["mountpoint"].is_null());
+    // With a vault argument it is that vault's object, not an array.
+    let one = json_out(&fx, &["--json", "status", "v"]);
+    assert_eq!(one["id"], id);
+    assert_eq!(one["state"], "LOCKED");
+    fx.crypto_daemon(&["status", "nope"]).assert().code(3);
+    // A locked vault has no daemon to ask.
+    fx.crypto_daemon(&["stats", "v"]).assert().code(5);
+    fx.crypto_daemon(&["events", "v"]).assert().code(5);
+
+    let result = unlock(&fx);
+    let mountpoint = mountpoint_of(&result);
+
+    let after = json_out(&fx, &["--json", "status", "v"]);
+    assert_eq!(after["state"], "UNLOCKED");
+    assert_eq!(after["mountpoint"], result["mountpoint"]);
+    assert_eq!(after["mounter"], NULL_MOUNTER);
+    assert_eq!(after["displayName"], "v");
+    fx.crypto_daemon(&["status"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("MOUNTPOINT"))
+        .stdout(predicates::str::contains("UNLOCKED"))
+        .stdout(predicates::str::contains(mountpoint.to_str().unwrap()));
+
+    // `stats` needs the daemon; every documented field is there.
+    let stats = json_out(&fx, &["--json", "stats", "v"]);
+    for field in [
+        "bytesPerSecondRead",
+        "bytesPerSecondWritten",
+        "bytesPerSecondEncrypted",
+        "bytesPerSecondDecrypted",
+        "cacheHitRate",
+        "totalBytesRead",
+        "totalBytesWritten",
+        "totalBytesEncrypted",
+        "totalBytesDecrypted",
+        "filesRead",
+        "filesWritten",
+        "totalFilesAccessed",
+        "lastActivity",
+    ] {
+        assert!(stats.get(field).is_some(), "{field} missing in {stats}");
+    }
+    fx.crypto_daemon(&["stats", "v"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("read "))
+        .stdout(predicates::str::contains("cache "))
+        .stdout(predicates::str::contains("files "));
+
+    // Nothing has gone wrong inside the vault, so the event log is empty.
+    let events = json_out(&fx, &["--json", "events", "v"]);
+    assert_eq!(events, serde_json::json!([]), "{events}");
+    fx.crypto_daemon(&["events", "v"]).assert().success();
+
+    fx.crypto_daemon(&["lock", "v"]).assert().success();
+    let locked = json_out(&fx, &["--json", "status"]);
+    assert_eq!(locked[0]["state"], "LOCKED");
+    assert!(locked[0]["mountpoint"].is_null());
+    fx.crypto_daemon(&["stats", "v"]).assert().code(5);
+}
+
+#[test]
+fn stats_and_events_follow_until_they_are_interrupted() {
+    let fx = Fixture::new("w");
+    unlock(&fx);
+
+    for args in [
+        vec!["--json", "stats", "w", "--follow", "--interval", "1"],
+        vec!["--json", "events", "w", "--follow"],
+    ] {
+        let mut child = fx
+            .crypto_daemon_cmd(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The notice is printed *after* the SIGINT handler is installed, so seeing it means the
+        // interrupt below cannot arrive too early and kill the child instead.
+        let notice = first_line(child.stderr.take().unwrap());
+        assert!(notice.contains("Ctrl-C"), "{args:?}: {notice}");
+        interrupt(child.id());
+        let status = wait_for_exit(&mut child);
+        assert_eq!(status.code(), Some(0), "{args:?} ends cleanly on Ctrl-C");
+    }
+}
+
+#[test]
+fn the_mount_points_dir_from_cli_json_decides_where_a_vault_is_mounted() {
+    let fx = Fixture::new("m");
+    let elsewhere = fx.path("elsewhere");
+    fx.crypto_daemon(&["config", "set", "mountPointsDir"])
+        .arg(&elsewhere)
+        .assert()
+        .success();
+    let result = unlock(&fx);
+    assert_eq!(mountpoint_of(&result), elsewhere.join("m"));
+    assert!(elsewhere.join("m").join(MARKER).is_file());
+}
