@@ -408,6 +408,13 @@ dependencies = [
  "cryptomator-core",
  "fuser",
  "libloading",
+ "log",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]

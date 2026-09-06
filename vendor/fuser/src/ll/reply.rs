@@ -1114,12 +1114,9 @@ mod abi_test {
         assert_eq!(u32_at(attr, 80), 512, "blksize");
         // Darwin file flags are deliberately dropped: on Linux this field is `FUSE_ATTR_*`.
         assert_eq!(u32_at(attr, 84), 0, "flags");
-        // `crtime`/`crtimensec` have no Linux offset at all - the struct ends after `flags`.
-        assert_eq!(
-            attr.len().min(ATTR_LINUX),
-            ATTR_LINUX,
-            "fuse_attr too short"
-        );
+        // Every offset above must actually lie inside the buffer; `crtime`/`crtimensec` have no
+        // Linux offset at all, the struct ends after `flags`.
+        assert!(attr.len() >= ATTR_LINUX, "fuse_attr too short");
     }
 
     /// The native (macFUSE) layout must be untouched by the patch: `crtime` at 48, `crtimensec`

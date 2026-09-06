@@ -3,7 +3,9 @@
 Upstream: https://github.com/cberner/fuser (MIT, see LICENSE.md). Vendored because FUSE-T on macOS
 speaks the Linux struct layouts while fuser hard-codes the macFUSE layouts under `target_os = "macos"`.
 
-Patches (all under `#[cfg(target_os = "macos")]`, no behaviour change on Linux):
+Patches. All but the last are under `#[cfg(target_os = "macos")]` and change nothing on Linux;
+the EOF patch is unconditional but unreachable on `/dev/fuse`, which never returns a zero-length
+read (see the last bullet):
 - `KernelAbi { Native, Linux }` and `Config.abi: KernelAbi` in `src/mnt/mount_options.rs`
   (`Native` = upstream behaviour, `Linux` = Linux struct layouts), re-exported from `src/lib.rs`.
 - Linux-layout twins `fuse_attr_linux`, `fuse_entry_out_linux`, `fuse_attr_out_linux`,

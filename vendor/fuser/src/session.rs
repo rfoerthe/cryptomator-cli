@@ -715,14 +715,35 @@ mod abi_session_test {
         request(26, 1, &arg)
     }
 
+    /// The session under test, running on its own thread.
+    type SessionThread = JoinHandle<io::Result<()>>;
+
     /// Read one reply: the 16-byte `fuse_out_header` says how long the whole message is.
-    fn read_reply(peer: &mut UnixStream) -> Vec<u8> {
+    fn try_read_reply(peer: &mut UnixStream) -> io::Result<Vec<u8>> {
         let mut header = [0u8; OUT_HEADER];
-        peer.read_exact(&mut header).expect("reply header");
-        let len = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
-        let mut body = vec![0u8; len - OUT_HEADER];
-        peer.read_exact(&mut body).expect("reply body");
-        body
+        peer.read_exact(&mut header)?;
+        let len = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let mut body = vec![0u8; len.saturating_sub(OUT_HEADER)];
+        peer.read_exact(&mut body)?;
+        Ok(body)
+    }
+
+    /// Reads one reply, or reports why none came: a session that died leaves nothing behind on the
+    /// socket but EOF, so the session's own error is the one worth seeing.
+    fn read_reply(
+        peer: &mut UnixStream,
+        session: &mut Option<SessionThread>,
+        what: &str,
+    ) -> Vec<u8> {
+        match try_read_reply(peer) {
+            Ok(body) => body,
+            Err(error) => match session.take().map(JoinHandle::join) {
+                Some(Ok(Ok(()))) => panic!("no {what} reply ({error}): the session ended early"),
+                Some(Ok(Err(failure))) => panic!("no {what} reply: session failed with {failure}"),
+                Some(Err(_)) => panic!("no {what} reply: the session thread panicked"),
+                None => panic!("no {what} reply: {error}"),
+            },
+        }
     }
 
     fn u32_at(buf: &[u8], off: usize) -> u32 {
@@ -751,14 +772,16 @@ mod abi_session_test {
             })
             .expect("spawn");
 
+        let mut session = Some(handle);
+
         peer.write_all(&init_request()).expect("write init");
-        let init_reply = read_reply(&mut peer);
+        let init_reply = read_reply(&mut peer, &mut session, "init");
         // fuse_init_out starts with major/minor.
         assert_eq!(u32_at(&init_reply, 0), 7, "init major");
 
         peer.write_all(&request(3, 2, &[0u8; 16]))
             .expect("write getattr");
-        let attr_reply = read_reply(&mut peer);
+        let attr_reply = read_reply(&mut peer, &mut session, "getattr");
         assert_eq!(
             attr_reply.len(),
             ATTR_OUT_PREFIX + ATTR_LINUX,
@@ -770,11 +793,18 @@ mod abi_session_test {
         assert_eq!(u32_at(attr, 68), 501, "uid");
         assert_eq!(u32_at(attr, 72), 20, "gid");
         assert_eq!(u32_at(attr, 80), 512, "blksize");
+        // The Darwin file flags (`flags: 0xdead` above) must not reach a Linux-ABI peer: at offset
+        // 84 Linux expects `FUSE_ATTR_*` bits, which we never set.
+        assert_eq!(u32_at(attr, 84), 0, "flags");
 
         // Closing the peer is what `umount` does to a FUSE-T session: the session must end with
         // `Ok(())`, not with the "Invalid request" that a zero-length read used to produce.
         drop(peer);
-        let result = handle.join().expect("join");
+        let result = session
+            .take()
+            .expect("session still running")
+            .join()
+            .expect("join");
         assert!(result.is_ok(), "session ended with {result:?}");
     }
 }
