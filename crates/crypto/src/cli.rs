@@ -14,6 +14,9 @@ pub struct Cli {
     /// Path to settings.json (default: the Cryptomator desktop app's file, or $CRYPTO_SETTINGS_PATH)
     #[arg(long, global = true, value_name = "PATH")]
     pub settings: Option<PathBuf>,
+    /// Directory holding the socket, pid and run info of every unlocked vault
+    #[arg(long, global = true, value_name = "PATH", env = "CRYPTO_STATE_DIR")]
+    pub state_dir: Option<PathBuf>,
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
@@ -54,6 +57,81 @@ pub enum Command {
         #[command(subcommand)]
         command: NameCommand,
     },
+    /// Unlock and mount a vault in a background daemon
+    Unlock(UnlockArgs),
+    /// Unmount and lock vaults
+    Lock(LockArgs),
+    /// The vault daemon itself; started by `crypto unlock`, never by hand.
+    #[command(name = "__daemon", hide = true)]
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct UnlockArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Mounter alias (fuse-t, macfuse, fuse, webdav) or Java class name
+    #[arg(long, value_name = "MOUNTER")]
+    pub mounter: Option<String>,
+    /// Where to mount (default: the vault's mountPoint, else <mountPointsDir>/<name>)
+    #[arg(long, value_name = "PATH")]
+    pub mount_point: Option<PathBuf>,
+    /// Extra mount flag, e.g. --mount-option=-oallow_other (repeatable)
+    // Mount options start with a dash; without `allow_hyphen_values` clap would read them as
+    // options, and `require_equals` keeps a missing value from swallowing the next flag.
+    #[arg(
+        long,
+        value_name = "OPTION",
+        allow_hyphen_values = true,
+        require_equals = true
+    )]
+    pub mount_option: Vec<String>,
+    /// Mount read-only, whatever the vault's usesReadOnlyMode says
+    #[arg(long)]
+    pub read_only: bool,
+    /// Volume name shown by the operating system
+    #[arg(long, value_name = "NAME")]
+    pub volume_name: Option<String>,
+    /// Serve the vault in this process instead of a detached daemon (Ctrl-C locks it)
+    #[arg(long)]
+    pub foreground: bool,
+    /// Open the mount point in the file manager afterwards
+    #[arg(long)]
+    pub reveal: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+// The group carries `required(true)`: one of the two ways of naming what to lock has to be given,
+// and `--all` excludes an explicit list.
+#[derive(Args, Debug)]
+#[command(group = clap::ArgGroup::new("lock-targets").required(true).multiple(false))]
+pub struct LockArgs {
+    /// Vault ids, display names or paths
+    // No `allow_hyphen_values` here, unlike the single-vault commands: on a repeated positional it
+    // swallows every following flag, so `crypto lock v --force` would look for a vault called
+    // "--force". A vault id starting with `-` is reachable as `crypto lock -- -id`.
+    #[arg(group = "lock-targets")]
+    pub vaults: Vec<String>,
+    /// Lock every unlocked vault
+    #[arg(long, group = "lock-targets")]
+    pub all: bool,
+    /// Unmount even while the volume is in use
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonArgs {
+    /// The vault to serve, by its id in settings.json
+    #[arg(long, value_name = "ID", allow_hyphen_values = true)]
+    pub vault_id: String,
+    /// The control socket to bind. Informational: the state directory and the vault id decide,
+    /// and `crypto unlock` passes the path it expects so a mismatch shows up in the log.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

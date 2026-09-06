@@ -1,15 +1,18 @@
 //! Command implementations; each returns the process exit code.
 pub mod config;
+pub mod daemon;
 pub mod fs;
+pub mod lock;
 pub mod name;
 pub mod password;
 pub mod recovery;
+pub mod unlock;
 pub mod vault;
 
 use crate::output::Output;
 use anyhow::Result;
 use cryptomator_app::settings::{resolve_vault_index, SettingsStore, VaultSettingsJson};
-use cryptomator_app::AppError;
+use cryptomator_app::{AppError, StateDir, VaultRegistry};
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::PathBuf;
 
@@ -17,6 +20,18 @@ use std::path::PathBuf;
 pub struct Ctx {
     pub store: SettingsStore,
     pub out: Output,
+    /// Where the daemons publish their socket, pid and run info.
+    pub state_dir: StateDir,
+    /// The `--settings` path exactly as it was given, so a spawned daemon can be handed the same
+    /// one. `None` means "resolve it from the environment", which the child does the same way.
+    pub settings_arg: Option<PathBuf>,
+}
+
+impl Ctx {
+    /// The vaults of `settings.json` together with what the state directory says about them.
+    pub fn registry(&self) -> VaultRegistry {
+        VaultRegistry::new(self.store.clone(), self.state_dir.clone())
+    }
 }
 
 /// Resolves a vault reference to its settings entry and path, requiring the vault to be in state

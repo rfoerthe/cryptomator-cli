@@ -50,6 +50,10 @@ pub fn open_fs(
     needs_write: bool,
 ) -> Result<CryptoFs> {
     let (vault, path) = locked_vault(ctx, reference)?;
+    // A mounted vault belongs to its daemon: a second `CryptoFs` over the same directory would
+    // write behind the daemon's caches and open files. Reading is refused too -- it would show a
+    // state the mount has not flushed yet. Both are exit code 5, and `crypto lock` is the way out.
+    ctx.registry().require_locked(&vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?

@@ -122,3 +122,28 @@
   (Hub only) and `fs` access to a mounted vault. `fs`/`name` require state `LOCKED` as recorded in
   the vault directory; a *running* mount cannot be detected yet, and the README says so instead of
   promising a refusal that does not exist.
+
+### M4 – FUSE mount and the vault daemon
+
+- CLI: `crypto unlock <VAULT>` mounts a vault in a detached per-vault daemon and `crypto lock`
+  takes it down again. The password is read, normalised and turned into the vault key in the
+  `crypto unlock` process; the key reaches the daemon as the first message on its 0600 control
+  socket, so it never appears in `argv`, in the environment or in a file. The daemon is spawned
+  with `setsid(2)`, its working directory at `/`, `$CRYPTO_PASSWORD` removed and stdout/stderr
+  appended to `<state dir>/<id>.log`; a failed unlock prints the last 20 lines of that log.
+  `--foreground` runs the same daemon in the calling process instead, where SIGINT and SIGTERM lock
+  the vault.
+- `crypto lock <VAULT>…` asks the daemon over its socket, `--force` unmounts a busy volume, and
+  `--all` locks every unlocked vault (`{"locked": [ids]}`, plus `"failed"` when something refused;
+  the first failure decides the exit code and the remaining vaults are still locked). A volume a
+  crashed daemon left behind is taken down by mount point through the mount service that made it,
+  and its leftover state files are removed.
+- Global `--state-dir <PATH>` / `$CRYPTO_STATE_DIR` for the directory holding the socket, pid, run
+  info and log of every unlocked vault. Exit codes `6` (mount failed), `7` (unmount failed) and
+  `10` (daemon unreachable) join the existing table.
+- `crypto fs …` now refuses a vault that a daemon has unlocked or a crashed daemon left mounted
+  (exit `5`), reading included — the M3 caveat that a running mount could not be detected is
+  resolved. The mount holds state that is not on disk yet, and two writers on one vault directory
+  would corrupt each other's ciphertext.
+- `maxCleartextFilenameLength` is probed on the first unlock of a writable vault and written back to
+  `settings.json`; a read-only unlock cannot probe (the probe writes) and takes the cryptofs default.

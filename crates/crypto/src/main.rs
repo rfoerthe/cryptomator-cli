@@ -8,6 +8,7 @@ use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand};
 use commands::Ctx;
 use cryptomator_app::settings::SettingsStore;
+use cryptomator_app::StateDir;
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
 use output::Output;
 use std::io::Read;
@@ -38,13 +39,19 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
-    let store = match cli.settings {
+    let store = match cli.settings.clone() {
         Some(path) => SettingsStore::at(path),
         None => SettingsStore::from_env_or_default()?,
+    };
+    let state_dir = match cli.state_dir {
+        Some(path) => StateDir::at(path),
+        None => StateDir::from_env_or_default()?,
     };
     let ctx = Ctx {
         store,
         out: Output { json: cli.json },
+        state_dir,
+        settings_arg: cli.settings,
     };
     match cli.command {
         Command::Vault { command } => match command {
@@ -87,5 +94,8 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         },
         Command::Fs { command } => commands::fs::run(&ctx, command),
         Command::Name { command } => commands::name::run(&ctx, command),
+        Command::Unlock(args) => commands::unlock::unlock(&ctx, args),
+        Command::Lock(args) => commands::lock::lock(&ctx, args),
+        Command::Daemon(args) => commands::daemon::run(&ctx, args),
     }
 }

@@ -34,6 +34,8 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
+| `unlock` | Mounts a vault in a background daemon | `crypto unlock Secret --mounter fuse-t` |
+| `lock` | Unmounts a vault and stops its daemon | `crypto lock Secret --force` |
 | `fs ls` | Lists a directory inside a locked vault | `crypto fs ls Secret /2026 -l` |
 | `fs tree` | Walks a directory tree; `--json --hash` prints the fixture-manifest shape | `crypto fs tree Secret --json --hash` |
 | `fs cat` | Writes a vault file to standard output | `crypto fs cat Secret /notes.md` |
@@ -63,14 +65,40 @@ The key is read from standard input (it never appears in the process list or the
 It prints `valid` and exits `0`, or prints `invalid` and exits `4`. Error messages never quote the
 input.
 
+## Unlocking and locking
+
+`crypto unlock <VAULT>` reads the password, derives the vault key and hands it to a **background
+daemon** that owns the mount from then on. The password stays in the `crypto unlock` process and the
+key is sent over the daemon's private control socket — it never appears in the process list, the
+environment or a file. The daemon writes its socket, pid, run info and log into the state directory
+(`--state-dir`, `$CRYPTO_STATE_DIR`, otherwise a per-user run-time directory).
+
+    crypto unlock Secret                       # mounts and returns; the daemon keeps running
+    crypto unlock Secret --json                # {"id":…,"mountpoint":…,"mounter":…,"pid":…}
+    crypto lock Secret                         # unmounts and stops the daemon
+    crypto lock --all --force                  # everything, even while volumes are in use
+
+- **`--mounter <ALIAS|CLASS>`** picks the mount service (`fuse-t`, `macfuse`, `fuse`), `--mount-point`
+  where to mount, `--mount-option=-o…` (repeatable) adds mount flags, `--read-only` and
+  `--volume-name` do what they say. An unknown mounter name is a usage error (exit `2`).
+- **`--foreground`** serves the vault in this process instead of detaching; Ctrl-C locks it again.
+- **`--reveal`** (or the vault's `actionAfterUnlock=REVEAL`) opens the mount point in the file
+  manager afterwards.
+- **Exit codes:** `5` for a vault that is already unlocked or not unlocked, `6` when the mount fails
+  (the last lines of the daemon's log are printed), `7` when an unmount fails — a busy volume needs
+  `crypto lock … --force` — and `10` when the daemon cannot be reached.
+- **A crashed daemon** leaves its volume mounted (`STALE_MOUNT`); `crypto lock <VAULT> --force` takes
+  it down by mount point and removes the leftover state files. If nothing is mounted any more, the
+  leftovers are cleaned up on their own the next time a command looks at the vault.
+
 ## Mount-less access
 
 `crypto fs …` and `crypto name …` read and write vault contents **without a mount**, straight through
-the cleartext layer. The vault has to be registered and in state `LOCKED` as recorded in the vault
-directory (exit `5` otherwise). M3 cannot detect a *running* mount, so do not point the `fs` write
-commands at a vault that is currently mounted — the mounter and `crypto` would write the same
-ciphertext behind each other's back. M4 adds that check. Hub vaults are rejected before any password
-is read. Passwords come from the sources listed above.
+the cleartext layer. The vault has to be registered and in state `LOCKED` (exit `5` otherwise): a
+vault a daemon has unlocked, and one a crashed daemon left mounted, are both refused — reading
+included, because the mount may be holding changes that are not on disk yet. `crypto lock` is the way
+out. Hub vaults are rejected before any password is read. Passwords come from the sources listed
+above.
 
 - **Read-only vaults.** `usesReadOnlyMode` (from `crypto vault set … --read-only true`) is respected:
   `put`, `rm`, `mkdir` and `mv` fail with exit `5`, listing and reading still work.
