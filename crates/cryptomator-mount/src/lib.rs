@@ -4,7 +4,8 @@
 //! builder / mount traits every provider implements, [`flags`] parses the user's mount flags,
 //! [`transcoder`] normalises file names between the FUSE peer and the vault, and [`mounttab`]
 //! answers whether a path is currently mounted. [`fuse`] (feature `fuse`) holds the FUSE adapter
-//! and the platform back ends, and [`registry`] lists the services the CLI can choose from.
+//! and the platform back ends, [`webdav`] (feature `webdav`) holds the loopback WebDAV server and
+//! its mounters, and [`registry`] lists the services the CLI can choose from.
 #![warn(missing_debug_implementations)]
 
 pub mod api;
@@ -16,6 +17,11 @@ pub mod registry;
 #[cfg(test)]
 mod testing;
 pub mod transcoder;
+// The WebDAV back ends need no FFI at all, so the whole module is `forbid(unsafe_code)`: the
+// crate's only `unsafe` lives under `fuse/`.
+#[cfg(feature = "webdav")]
+#[forbid(unsafe_code)]
+pub mod webdav;
 
 pub use api::{
     unsupported, Mount, MountBuilder, MountCapability, MountError, MountService, Mountpoint,
