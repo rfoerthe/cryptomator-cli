@@ -19,8 +19,9 @@ const PROGRAM_NAME: &str = "cryptomator-cli";
 
 /// libfuse 2.x `struct fuse_args`.
 ///
-/// `allocated` stays 0: the argv array below belongs to this process, so libfuse must not try to
-/// free it (`fuse_opt_free_args` only frees what it allocated itself).
+/// `allocated` stays 0 on the way in: the argv array below belongs to this process, so libfuse
+/// must not try to free it (`fuse_opt_free_args` only frees what it allocated itself). libfuse
+/// *writes the struct back* though -- see [`LibFuse::mount`].
 #[repr(C)]
 struct FuseArgs {
     argc: c_int,
@@ -93,7 +94,8 @@ impl LibFuse {
             .map(|arg| arg.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        let args = FuseArgs {
+        // `mut`, because libfuse writes this struct back; see the SAFETY comment on the call.
+        let mut args = FuseArgs {
             argc,
             argv: argv.as_ptr(),
             allocated: 0,
@@ -107,18 +109,32 @@ impl LibFuse {
 
         // SAFETY: `fuse_mount_compat25` is libfuse 2.x's mount entry point, declared as
         // `int fuse_mount_compat25(const char *mountpoint, struct fuse_args *args)`; the type
-        // below spells exactly that signature, and `FuseArgs` mirrors `struct fuse_args`.
-        let mount: Symbol<unsafe extern "C" fn(*const c_char, *const FuseArgs) -> c_int> =
+        // below spells exactly that signature, and `FuseArgs` mirrors `struct fuse_args`. The
+        // `args` pointer is `*mut`, not `*const`: the parameter is a plain `struct fuse_args *`
+        // and libfuse does write through it (see the call below).
+        let mount: Symbol<unsafe extern "C" fn(*const c_char, *mut FuseArgs) -> c_int> =
             unsafe { self.lib.get(b"fuse_mount_compat25\0") }.map_err(|err| {
                 MountError::Failed(format!(
                     "{} has no fuse_mount_compat25: {err}",
                     self.path.display()
                 ))
             })?;
-        // SAFETY: both pointers stay valid for the duration of the call -- `path` and
-        // `argv_owned`/`argv` outlive it -- and libfuse neither stores nor frees them
-        // (`allocated == 0`).
-        let raw_fd = unsafe { mount(path.as_ptr(), &args) };
+        // SAFETY: both pointers stay valid for the duration of the call -- `path`,
+        // `argv_owned` and `argv` outlive it -- and libfuse neither stores nor frees the argv we
+        // hand in (`allocated == 0`, and `fuse_opt_free_args` only frees what libfuse allocated).
+        //
+        // It does, however, *write the struct back*: `fuse_mount_compat25` → `fuse_kern_mount` →
+        // `fuse_opt_parse` builds its own malloc'd argv, stores it in `args->argv` and sets
+        // `args->allocated = 1`. That is why `args` is passed as `&mut` through a `*mut`
+        // parameter -- writing through a pointer derived from a shared borrow would be undefined
+        // behaviour in Rust's model even though `args` is dead afterwards. Nothing reads the
+        // struct after the call, so the values written back are simply dropped.
+        //
+        // Accepted leak: the caller is meant to hand the written-back struct to
+        // `fuse_opt_free_args`, which we do not (the symbol is not part of the small surface this
+        // module loads, and libfuse 2.x's own `fuse_mount` examples leak it just as readily). It
+        // is a handful of small allocations, once per mount, in a process that serves one mount.
+        let raw_fd = unsafe { mount(path.as_ptr(), &mut args) };
         if raw_fd < 0 {
             return Err(MountError::Failed(format!(
                 "mounting {} through {} failed: {}",

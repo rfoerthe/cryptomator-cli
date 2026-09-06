@@ -180,9 +180,21 @@ impl VaultOps {
         }
     }
 
-    /// The path of an inode the kernel still holds; a forgotten one is gone (`ENOENT`).
+    /// The path of an inode the kernel still holds; a forgotten one is gone (`ENOENT`), and so is
+    /// one whose name an `unlink` or a `rename` over it took away.
     fn path_of(&self, ino: u64) -> Result<CleartextPath, Errno> {
         self.inodes.path(ino).ok_or(Errno::ENOENT)
+    }
+
+    /// The path of `ino`, or `None` for an inode that has lost its name while `fh` is still open
+    /// on it -- the case POSIX keeps working (`fstat`/`ftruncate`/`futimens` on an unlinked
+    /// descriptor). An inode with neither a name nor an open handle is `ENOENT`.
+    fn path_or_open(&self, ino: u64, fh: Option<u64>) -> Result<Option<CleartextPath>, Errno> {
+        match self.inodes.path(ino) {
+            Some(path) => Ok(Some(path)),
+            None if fh.is_some_and(|fh| self.files.get(fh).is_some()) => Ok(None),
+            None => Err(Errno::ENOENT),
+        }
     }
 
     /// `parent` + a name from the FUSE peer, composed for the vault. A name that is not valid
@@ -239,8 +251,13 @@ impl VaultOps {
     /// Attributes of an inode; an open handle supplies the size the file has right now -- and, for
     /// a file that was unlinked while it is open, the attributes altogether.
     pub fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<Attr, Errno> {
-        let path = self.path_of(ino)?;
         let open = fh.and_then(|fh| self.files.get(fh));
+        // An inode whose name is gone has no path to stat -- and for one that was renamed *over*
+        // there is a different file behind the old name, which must not be described here.
+        let Some(path) = self.inodes.path(ino) else {
+            let entry = open.ok_or(Errno::ENOENT)?;
+            return Ok(self.attr_of_open_file(ino, &entry));
+        };
         let attrs = match self.fs.symlink_metadata(&path) {
             Ok(attrs) => attrs,
             // `fstat` on a descriptor whose name is gone must keep working (POSIX): the inode
@@ -299,29 +316,37 @@ impl VaultOps {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
     ) -> Result<Attr, Errno> {
-        let path = self.path_of(ino)?;
+        let path = self.path_or_open(ino, fh)?;
         if size.is_some() || atime.is_some() || mtime.is_some() {
             self.assert_writable()?;
         }
         if let Some(size) = size {
-            self.truncate(&path, fh, size)?;
+            self.truncate(path.as_ref(), fh, size)?;
         }
         if atime.is_some() || mtime.is_some() {
-            self.set_times(&path, fh, atime, mtime)?;
+            self.set_times(path.as_ref(), fh, atime, mtime)?;
         }
         self.getattr(ino, fh)
     }
 
     /// `ftruncate` through the open handle if there is a writable one, `truncate` through a
-    /// short-lived handle otherwise. A file that was unlinked while it is open has no path left to
-    /// open, so there the handle is the only way -- and a read-only one is `EBADF`.
-    fn truncate(&self, path: &CleartextPath, fh: Option<u64>, size: u64) -> Result<(), Errno> {
+    /// short-lived handle otherwise. A file that lost its name while it is open (`path` is `None`,
+    /// or the name is gone from the vault) has nothing to open, so there the handle is the only
+    /// way -- and a read-only one is `EBADF`.
+    fn truncate(
+        &self,
+        path: Option<&CleartextPath>,
+        fh: Option<u64>,
+        size: u64,
+    ) -> Result<(), Errno> {
         let open = fh.and_then(|fh| self.files.get(fh));
-        let unlinked = match self.fs.symlink_metadata(path) {
-            Ok(attrs) if attrs.is_dir() => return Err(Errno::EISDIR),
-            Ok(_) => false,
-            Err(e) if open.is_some() && is_not_found(&e) => true,
-            Err(e) => return Err(errno_for(&e)),
+        let unlinked = match path.map(|path| self.fs.symlink_metadata(path)) {
+            // No name at all: `path_or_open` only reports that when there is an open handle.
+            None => true,
+            Some(Ok(attrs)) if attrs.is_dir() => return Err(Errno::EISDIR),
+            Some(Ok(_)) => false,
+            Some(Err(e)) if open.is_some() && is_not_found(&e) => true,
+            Some(Err(e)) => return Err(errno_for(&e)),
         };
         if let Some(entry) = open {
             if entry.writable {
@@ -331,6 +356,8 @@ impl VaultOps {
                 return Err(Errno::EBADF);
             }
         }
+        // Unreachable: `unlinked` is only true with an open handle, which the block above answers.
+        let path = path.ok_or(Errno::ENOENT)?;
         let handle = self
             .fs
             .open_file(path, OpenOptions::read_write())
@@ -340,25 +367,34 @@ impl VaultOps {
         result.and(closed)
     }
 
-    /// `utimensat` through the path. A file that was unlinked while it is open has no path left,
-    /// so its modification time is kept on the handle instead -- which is what `futimens` on an
-    /// unlinked descriptor does. Both times are recorded on the handle as well, so the `fstat`
-    /// that follows can report them ([`attr_of_open_file`](Self::attr_of_open_file)).
+    /// `utimensat` through the path. A file that lost its name while it is open has no path left
+    /// (`path` is `None`, or the name is gone from the vault), so its modification time is kept on
+    /// the handle instead -- which is what `futimens` on an unlinked descriptor does. Both times
+    /// are recorded on the handle as well, so the `fstat` that follows can report them
+    /// ([`attr_of_open_file`](Self::attr_of_open_file)).
     fn set_times(
         &self,
-        path: &CleartextPath,
+        path: Option<&CleartextPath>,
         fh: Option<u64>,
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
     ) -> Result<(), Errno> {
-        let Err(e) = self
-            .fs
-            .set_times(path, mtime.map(resolve_time), atime.map(resolve_time))
-        else {
-            return Ok(());
+        // `None` = there was no name to set the times on; `Some(e)` = setting them failed.
+        let failed = match path {
+            None => None,
+            Some(path) => {
+                match self
+                    .fs
+                    .set_times(path, mtime.map(resolve_time), atime.map(resolve_time))
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) => Some(e),
+                }
+            }
         };
+        let name_is_gone = failed.as_ref().is_none_or(is_not_found);
         match fh.and_then(|fh| self.files.get(fh)) {
-            Some(entry) if is_not_found(&e) => {
+            Some(entry) if name_is_gone => {
                 let mtime = mtime.map(resolve_time);
                 if let Some(mtime) = mtime {
                     entry.handle.set_last_modified(mtime);
@@ -366,7 +402,9 @@ impl VaultOps {
                 entry.set_times(atime.map(resolve_time), mtime);
                 Ok(())
             }
-            _ => Err(errno_for(&e)),
+            // Unreachable with `failed == None`: `path_or_open` reports no path only when the
+            // handle is there.
+            _ => Err(failed.map_or(Errno::ENOENT, |e| errno_for(&e))),
         }
     }
 
@@ -521,6 +559,9 @@ impl VaultOps {
     /// Creates and opens in one step. `O_EXCL` makes it exclusive (`EEXIST` if the name is
     /// taken); without it an existing file is opened (and truncated for `O_TRUNC`).
     pub fn create(&self, parent: u64, name: &OsStr, flags: OpenFlags) -> Result<Created, Errno> {
+        // Writability first, so a read-only mount answers `EROFS` for every name -- `mkdir` and
+        // `symlink` do, and `create("._x")` used to answer `EPERM` instead.
+        self.assert_writable()?;
         self.assert_not_apple_double(name)?;
         let path = self.child_of(parent, name)?;
         let options = self.open_options(flags, true)?;
@@ -1107,6 +1148,27 @@ mod tests {
         };
         assert_eq!(create("._x").unwrap_err(), Errno::EPERM);
         assert_eq!(ops.mkdir(1, OsStr::new("._d")).unwrap_err(), Errno::EPERM);
+        // On a read-only mount the mount's own answer comes first, for every name alike --
+        // `mkdir` and `symlink` have always answered `EROFS` there, and `create` used to differ.
+        let (_ro_dir, ro) = test_ops_with(true, false, true);
+        for name in ["._x", "x"] {
+            assert_eq!(
+                ro.create(
+                    1,
+                    OsStr::new(name),
+                    OpenFlags(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL),
+                )
+                .unwrap_err(),
+                Errno::EROFS,
+                "create({name}) on a read-only mount"
+            );
+        }
+        assert_eq!(ro.mkdir(1, OsStr::new("._d")).unwrap_err(), Errno::EROFS);
+        assert_eq!(
+            ro.symlink(1, OsStr::new("._l"), Path::new("x"))
+                .unwrap_err(),
+            Errno::EROFS
+        );
         assert_eq!(
             ops.symlink(1, OsStr::new("._l"), Path::new("x"))
                 .unwrap_err(),

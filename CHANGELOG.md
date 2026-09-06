@@ -247,6 +247,23 @@
   README gained a "Mounting" chapter with the prerequisites per platform, the FUSE-T limits, the
   state directory and an exit-code table.
 
+- After the final review: the vendored fuser's `ChannelSender::send` loops over short writes
+  instead of assuming an atomic `writev` (a signal on the FUSE thread could truncate a reply on
+  FUSE-T's stream socket and desynchronise the channel for good); the state directory's
+  symlink/owner check now guards every *read* path as well (`status`, `lock`, `stats`, `events`,
+  `fs` -- a foreign directory on the shared default locations could otherwise feed the CLI a forged
+  run info and a socket that answers); an inode a `rename` overwrote no longer resolves to the file
+  that took its name (a `setattr(size)` on it would have truncated the wrong file); the loser of a
+  daemon start-up race takes back only its *own* pid file; `create` answers `EROFS` before it looks
+  at AppleDouble names; a `readdir` batch whose first entry does not fit answers `EINVAL` instead
+  of an empty listing the kernel reads as the end of the directory; the state files' temporary file
+  is created with `O_EXCL`; and the vault key no longer passes through a plain `[u8; 64]` on its
+  way into `Masterkey` (`Masterkey::from_zeroizing`).
+- The declared MSRV is **1.89**, not 1.85: `aes 0.9.3` needs 1.89 and `libloading 0.9` needs 1.88,
+  both since M1. The workspace's own code is still 1.85-clean; only the dependency set is not.
+- Documented: `-oallow_other` hands every local user full access to the decrypted vault unless
+  `-odefault_permissions` is passed with it.
+
 #### Decisions taken along the way
 
 *Mounting*

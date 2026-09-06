@@ -3,10 +3,10 @@
 Upstream: https://github.com/cberner/fuser (MIT, see LICENSE.md). Vendored because FUSE-T on macOS
 speaks the Linux struct layouts while fuser hard-codes the macFUSE layouts under `target_os = "macos"`.
 
-Patches. All but the last two are under `#[cfg(target_os = "macos")]` and change nothing on Linux;
-the EOF patch and the request-framing patch are unconditional but inert on `/dev/fuse`, which
-never returns a zero-length read and never splits a request across two reads (see the last two
-bullets):
+Patches. All but the last three are under `#[cfg(target_os = "macos")]` and change nothing on
+Linux; the EOF patch, the request-framing patch and the short-write patch are unconditional but
+inert on `/dev/fuse`, which never returns a zero-length read, never splits a request across two
+reads and never accepts a reply only in part (see the last three bullets):
 - `KernelAbi { Native, Linux }` and `Config.abi: KernelAbi` in `src/mnt/mount_options.rs`
   (`Native` = upstream behaviour, `Linux` = Linux struct layouts), re-exported from `src/lib.rs`.
 - Linux-layout twins `fuse_attr_linux`, `fuse_entry_out_linux`, `fuse_attr_out_linux`,
@@ -64,6 +64,19 @@ bullets):
   with a pause in between, and `two_requests_that_arrive_in_one_read_are_both_answered` writes
   INIT+GETATTR and then three GETATTRs in single `write_all`s and insists on a reply for each.
   Both peers have a read timeout, so a regression fails rather than hangs.
+- `ChannelSender::send` writes the whole reply (`src/channel.rs`): the `writev` moved into
+  `write_all_vectored`, which loops with `IoSlice::advance_slices` until nothing is pending,
+  retries `EINTR` and reports `ErrorKind::WriteZero` when the channel accepts nothing. Upstream
+  writes once and only `debug_assert_eq!`s the byte count (compiled out in release), because
+  `/dev/fuse` is message oriented and takes a whole reply per `writev`. FUSE-T's channel is the
+  same stream socket the framing patch is about: a blocking write on one returns a *partial* count
+  when a signal lands after some bytes have gone out (`SA_RESTART` does not undo a partial
+  transfer), replies run to `rwsize=262144` bytes, and the CLI installs SIGINT/SIGTERM/SIGHUP
+  handlers that can be delivered on the FUSE thread. A truncated reply desynchronises the stream
+  permanently -- the peer reads the tail of one reply as the head of the next -- which is the read
+  side's failure mode mirrored. Covered by `src/channel.rs::send_test` (six tests over a fake
+  writer: short writes resumed in order, a single full write, `EINTR` retried, `WriteZero`, other
+  errors propagated, an empty write as a no-op).
 
 ## Touched upstream files
 
@@ -72,7 +85,7 @@ Exactly ten files under `src/` differ from the registry source (`diff -qr` again
 
 | File | Why |
 |---|---|
-| `src/channel.rs` | `Channel::receive_retrying` returns exactly one request: it reassembles one that arrives in several reads and spills what follows it into `Channel::spill` (stream-socket channels) |
+| `src/channel.rs` | `Channel::receive_retrying` returns exactly one request: it reassembles one that arrives in several reads and spills what follows it into `Channel::spill` (stream-socket channels); `ChannelSender::send` loops over short writes through `write_all_vectored`, plus `mod send_test` |
 | `src/lib.rs` | `pub use ... KernelAbi`; `#![allow(clippy::io_other_error)]`; dropped the `experimental` module declaration |
 | `src/ll/fuse_abi.rs` | the eight Linux-layout twins + `From` impls; `IntoBytes` on the three request twins (so tests can build wire buffers); five per-item `#[allow(dead_code)]` |
 | `src/ll/mod.rs` | re-exports `ResponseEntry`, `ResponseAttr` and `ResponseCreate` |

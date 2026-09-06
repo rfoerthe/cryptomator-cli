@@ -14,7 +14,9 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/rfoerthe/cryptomator-cli"
-rust-version = "1.85"
+# 1.89 because `aes 0.9.3` (and `libloading 0.9`, 1.88) need it; the workspace's own code is
+# 1.85-clean, but the lock file is what has to build.
+rust-version = "1.89"
 
 [workspace.dependencies]
 aes-siv = "0.8"

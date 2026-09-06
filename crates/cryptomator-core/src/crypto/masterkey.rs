@@ -1,7 +1,7 @@
 //! 512-bit vault masterkey (`api/Masterkey.java`): encryption key || MAC key.
 use crate::crypto::rng::Rng;
 use crate::error::{CoreError, Result};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const SUBKEY_LEN: usize = 32;
 pub const MASTERKEY_LEN: usize = 64;
@@ -14,6 +14,20 @@ pub struct Masterkey {
 impl Masterkey {
     pub fn from_raw(raw: [u8; MASTERKEY_LEN]) -> Self {
         Self { raw }
+    }
+
+    /// A masterkey from raw bytes that are already held in a wiping buffer.
+    ///
+    /// `[u8; MASTERKEY_LEN]` is `Copy`, so [`from_raw`](Self::from_raw) takes a *copy* of the
+    /// caller's array: unwrapping a `Zeroizing` to call it (`from_raw(*key)`) leaves those 64
+    /// bytes behind in an argument slot that no `Drop` ever reaches. This constructor copies them
+    /// straight into the field instead, and the caller's buffer is consumed and wiped.
+    pub fn from_zeroizing(raw: Zeroizing<[u8; MASTERKEY_LEN]>) -> Self {
+        let mut key = Self {
+            raw: [0u8; MASTERKEY_LEN],
+        };
+        key.raw.copy_from_slice(raw.as_slice());
+        key
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
@@ -83,6 +97,21 @@ mod tests {
         assert_eq!(key.mac_key()[0], 0x20);
         assert_eq!(key.mac_key()[31], 0x3f);
         assert_eq!(key.raw(), &sequential_key());
+    }
+
+    #[test]
+    fn from_zeroizing_takes_the_bytes_out_of_the_wiping_buffer() {
+        let raw = Zeroizing::new(sequential_key());
+        let key = Masterkey::from_zeroizing(raw);
+        assert_eq!(key.raw(), &sequential_key());
+        assert_eq!(
+            key.enc_key(),
+            Masterkey::from_raw(sequential_key()).enc_key()
+        );
+        assert_eq!(
+            key.mac_key(),
+            Masterkey::from_raw(sequential_key()).mac_key()
+        );
     }
 
     #[test]

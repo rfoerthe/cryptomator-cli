@@ -154,6 +154,13 @@ in Finder could never be deleted.
 `--mount-option=-o…` adds flags (repeatable, and the `=` form is required so a forgotten value
 cannot swallow the next flag); `crypto vault set <VAULT> --mount-flags="…"` stores them.
 
+> **`-oallow_other` opens the decrypted vault to every local user.** It lifts the kernel's
+> owner-only restriction, and the adapter itself grants every access it is asked about, so without
+> `-odefault_permissions` (off by default) any other account on the machine can read and write the
+> whole vault. Pass the two together — `--mount-option=-oallow_other
+> --mount-option=-odefault_permissions` — or leave `allow_other` out. The same goes for
+> `-oallow_root`, on a smaller scale.
+
 ### Still to verify by hand
 
 Three things the automated tests cannot reach. Until someone has run them, the README does not

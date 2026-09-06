@@ -223,8 +223,12 @@ fn run_daemon_with_hook(
     let listener = match bind_socket(&files.socket) {
         Ok(listener) => listener,
         // A daemon that won the race in the meantime owns the files now; removing them would be
-        // exactly the damage `refuse_if_serving` prevents. Anything else is ours to clean up.
-        Err(err) if is_already_serving(&err) => return Err(err),
+        // exactly the damage `refuse_if_serving` prevents -- except for the pid file, which
+        // `write_pid` above has already overwritten with ours. Anything else is ours to clean up.
+        Err(err) if is_already_serving(&err) => {
+            drop_pid_file_if_ours(&files, pid);
+            return Err(err);
+        }
         Err(err) => {
             let _ = files.remove_all();
             return Err(err);
@@ -290,6 +294,32 @@ fn refuse_if_serving(path: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Takes back the pid file this daemon wrote, after losing the start-up race.
+///
+/// [`refuse_if_serving`] runs before anything is written, but it is a TOCTOU: another daemon can
+/// bind the socket between that probe and [`bind_socket`]'s. By then `<id>.pid` names *this*
+/// process, which is about to die -- and a pid file naming a dead process is how a crashed daemon
+/// looks to [`VaultRegistry::runtime_state`](crate::registry::VaultRegistry::runtime_state), so
+/// the winner would carry a wrong one for its whole life.
+///
+/// The file is removed **only while it still names us**: if the winner's own `write_pid` landed
+/// after ours, that pid is the one that belongs there and must survive. Everything else the winner
+/// owns (the socket, the run info) is left alone, which is the Task-11 pid → socket → info order
+/// seen from the losing side.
+fn drop_pid_file_if_ours(files: &VaultStateFiles, pid: u32) {
+    if files.read_pid() != Some(pid) {
+        return;
+    }
+    match std::fs::remove_file(&files.pid) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!(
+            "cannot take back the pid file at {}: {err}",
+            files.pid.display()
+        ),
+    }
 }
 
 /// Whether `err` is what [`refuse_if_serving`] reports.
@@ -543,11 +573,15 @@ fn decode_key(encoded: &str) -> std::result::Result<Zeroizing<[u8; 64]>, &'stati
             .decode(encoded.as_bytes())
             .map_err(|_| "the key is not valid base64")?,
     );
-    let key: [u8; 64] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| "the key must decode to 64 bytes")?;
-    Ok(Zeroizing::new(key))
+    if raw.len() != 64 {
+        return Err("the key must decode to 64 bytes");
+    }
+    // Built *inside* the `Zeroizing` and filled by reference: `[u8; 64]` is `Copy`, so decoding
+    // into a plain array and wrapping it afterwards would leave the key bytes in a stack slot
+    // nobody wipes.
+    let mut key = Zeroizing::new([0u8; 64]);
+    key.copy_from_slice(&raw);
+    Ok(key)
 }
 
 /// Opens the vault with `key`, mounts it and publishes the [`RunInfo`].
@@ -583,15 +617,16 @@ fn unlock(
         .path_buf()
         .ok_or_else(|| AppError::MountFailed(format!("vault {vault_id} has no path")))?;
 
+    // `from_zeroizing`, not `from_raw(*key)`: dereferencing the `Zeroizing` would copy the 64
+    // bytes onto the stack as a plain argument that nothing wipes afterwards.
     let opened =
-        open_vault_with_key(&path, Masterkey::from_raw(*key)).map_err(|err| match err {
+        open_vault_with_key(&path, Masterkey::from_zeroizing(key)).map_err(|err| match err {
             // The one error a user is likely to cause, and the one the CLI has a hint for.
             CoreError::VaultKeyInvalid => {
                 AppError::MountFailed("vault key does not match".to_owned())
             }
             other => AppError::MountFailed(other.to_string()),
         })?;
-    drop(key);
 
     let read_only = overrides.read_only.unwrap_or(vault.uses_read_only_mode);
     let fs = Arc::new(CryptoFs::open(
@@ -2404,6 +2439,89 @@ mod tests {
         );
         assert_eq!(files.read_pid(), Some(4242), "its pid file is untouched");
         drop(listener);
+        drop(dir);
+    }
+
+    /// The lost start-up race: `refuse_if_serving` passes, `write_pid` overwrites `<id>.pid` with
+    /// this daemon's pid, and only `bind_socket`'s own probe then finds the winner. The loser has
+    /// to take its pid back -- but only its own: if the winner's `write_pid` landed after ours,
+    /// removing the file would leave the winner without one for its whole life.
+    #[test]
+    fn the_loser_of_the_start_up_race_takes_back_only_its_own_pid_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = StateDir::at(dir.path().join("s"));
+        state_dir.ensure().expect("state dir");
+        let files = state_dir.files(VAULT_ID);
+        let ours = std::process::id();
+
+        // Our own pid, written a moment before the race was lost: it names a process that is
+        // about to die, and a pid file naming a dead process is what a crashed daemon looks like.
+        files.write_pid(ours).expect("write pid");
+        drop_pid_file_if_ours(&files, ours);
+        assert_eq!(files.read_pid(), None, "we take our own pid back");
+
+        // The winner wrote its pid after ours: that one belongs there and has to survive.
+        files.write_pid(4242).expect("the winner's pid");
+        drop_pid_file_if_ours(&files, ours);
+        assert_eq!(
+            files.read_pid(),
+            Some(4242),
+            "the winner's pid file is left alone"
+        );
+
+        // No pid file at all (or an unreadable one) is not an error either.
+        std::fs::remove_file(&files.pid).expect("remove");
+        drop_pid_file_if_ours(&files, ours);
+        std::fs::write(&files.pid, b"not a pid").expect("garbage");
+        drop_pid_file_if_ours(&files, ours);
+        assert!(files.pid.exists(), "a pid file we cannot read is not ours");
+        drop(dir);
+    }
+
+    /// Two `run_daemon`s on the same state directory: exactly one serves the vault, the other
+    /// fails fast with `ALREADY_UNLOCKED`, and the pid file that survives names the winner.
+    #[test]
+    fn two_daemons_on_one_state_dir_leave_exactly_one_serving() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = state_file_config(dir.path());
+        let files = first.state_dir.files(VAULT_ID);
+        let second = state_file_config(dir.path());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (winner_tx, winner) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_daemon_with_hook(first, flag, |shared| {
+                let _ = ready_tx.send(Arc::clone(shared));
+            });
+            let _ = winner_tx.send(result);
+        });
+        // Only start the second one once the first is listening, so "already serving" is a fact
+        // and not a race the test has to win.
+        let shared = ready_rx
+            .recv_timeout(DEADLINE)
+            .expect("the first daemon starts");
+        assert_eq!(files.read_pid(), Some(shared.pid), "the winner's pid file");
+
+        let err = run_daemon(second, Arc::new(AtomicBool::new(false)))
+            .expect_err("the vault is already served");
+        assert_eq!(error_code(&err), ErrorBody::ALREADY_UNLOCKED);
+        assert_eq!(
+            files.read_pid(),
+            Some(shared.pid),
+            "the loser did not take the winner's pid file with it"
+        );
+        assert!(
+            files.socket.exists(),
+            "nor its socket -- the winner is still listening on it"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        winner
+            .recv_timeout(DEADLINE)
+            .expect("the first daemon stops")
+            .expect("cleanly");
         drop(dir);
     }
 

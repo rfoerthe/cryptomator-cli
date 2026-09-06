@@ -138,37 +138,43 @@ impl VaultRegistry {
     /// write order.
     ///
     /// # Errors
-    /// Anything [`SettingsStore::load`] reports.
+    /// Anything [`SettingsStore::load`] and [`StateDir::validate`] report.
     pub fn runtime_state(&self, vault_id: &str) -> Result<(RuntimeState, Option<RunInfo>)> {
         let settings = self.store.load()?;
         let vault = settings.directories.iter().find(|v| v.id == vault_id);
-        Ok(self.runtime_state_of(
+        self.runtime_state_of(
             vault_id,
             vault.and_then(VaultSettingsJson::path_buf).as_deref(),
-        ))
+        )
     }
 
     /// [`VaultRegistry::runtime_state`] for a vault that has already been looked up; `path` is the
     /// vault directory from `settings.json`, if it has one.
+    ///
+    /// # Errors
+    /// [`StateDir::validate`]: everything below reads the state files, connects to the socket and
+    /// deletes leftovers, so a state directory that is not ours is refused here rather than
+    /// trusted -- see that method for what a foreign one could otherwise claim.
     fn runtime_state_of(
         &self,
         vault_id: &str,
         path: Option<&Path>,
-    ) -> (RuntimeState, Option<RunInfo>) {
+    ) -> Result<(RuntimeState, Option<RunInfo>)> {
+        self.state_dir.validate()?;
         let files = self.state_dir.files(vault_id);
         let info = files.read_info();
         // A socket file that nobody listens on is a leftover; only a successful connect proves
         // that a daemon is there.
         if files.socket.exists() && UnixStream::connect(&files.socket).is_ok() {
-            return (RuntimeState::Unlocked, info);
+            return Ok((RuntimeState::Unlocked, info));
         }
         // Between fork and `bind` there is no socket yet, but there is a pid file.
         if files.read_pid().is_some_and(process_alive) {
-            return (RuntimeState::Unlocked, info);
+            return Ok((RuntimeState::Unlocked, info));
         }
         if let Some(mountpoint) = info.as_ref().and_then(|i| i.mountpoint.as_deref()) {
             if is_mountpoint(Path::new(mountpoint)) {
-                return (RuntimeState::StaleMount, info);
+                return Ok((RuntimeState::StaleMount, info));
             }
         }
         // `files.info.exists()`, not `info.is_some()`: a corrupt `<id>.json` cannot be parsed but
@@ -181,47 +187,51 @@ impl VaultRegistry {
             }
         }
         let Some(path) = path else {
-            return (RuntimeState::Missing, None);
+            return Ok((RuntimeState::Missing, None));
         };
-        match determine_vault_state(path) {
+        Ok(match determine_vault_state(path) {
             Ok(state) => (state.into(), None),
             Err(e) => {
                 log::debug!("cannot determine the state of {}: {e}", path.display());
                 (RuntimeState::Error, None)
             }
-        }
+        })
     }
 
     /// Every vault in `settings.json`, in the order the file lists them.
     ///
     /// # Errors
-    /// Anything [`SettingsStore::load`] reports.
+    /// Anything [`SettingsStore::load`] and [`StateDir::validate`] report.
     pub fn infos(&self) -> Result<Vec<VaultInfo>> {
         let settings = self.store.load()?;
-        Ok(settings
+        settings
             .directories
             .iter()
             .map(|v| self.info_of(v))
-            .collect())
+            .collect()
     }
 
     /// The vault matching `reference` (id, display name or path).
     ///
     /// # Errors
     /// [`AppError::VaultNotFound`] or [`AppError::AmbiguousVault`] from
-    /// [`resolve_vault_index`], plus anything [`SettingsStore::load`] reports.
+    /// [`resolve_vault_index`], plus anything [`SettingsStore::load`] and [`StateDir::validate`]
+    /// report.
     pub fn info(&self, reference: &str) -> Result<VaultInfo> {
         let settings = self.store.load()?;
         let index = resolve_vault_index(&settings, reference)?;
-        Ok(self.info_of(&settings.directories[index]))
+        self.info_of(&settings.directories[index])
     }
 
     /// The settings entry plus its runtime state.
-    fn info_of(&self, vault: &VaultSettingsJson) -> VaultInfo {
+    ///
+    /// # Errors
+    /// Anything [`runtime_state_of`](Self::runtime_state_of) reports.
+    fn info_of(&self, vault: &VaultSettingsJson) -> Result<VaultInfo> {
         let path = vault.path_buf();
-        let (state, info) = self.runtime_state_of(&vault.id, path.as_deref());
+        let (state, info) = self.runtime_state_of(&vault.id, path.as_deref())?;
         let running = info.filter(|_| state.is_mounted());
-        VaultInfo {
+        Ok(VaultInfo {
             id: vault.id.clone(),
             display_name: vault.display_name.clone(),
             path: vault.path.clone(),
@@ -230,7 +240,7 @@ impl VaultRegistry {
             mounter: running.as_ref().map(|i| i.mounter.clone()),
             pid: running.as_ref().map(|i| i.pid),
             read_only: running.as_ref().map(|i| i.read_only),
-        }
+        })
     }
 
     /// The mount-service class names of every vault that is currently unlocked, taken from the
@@ -255,10 +265,11 @@ impl VaultRegistry {
     /// mount out of the way.
     ///
     /// # Errors
-    /// [`AppError::WrongState`] when a daemon serves the vault or left a mount behind.
+    /// [`AppError::WrongState`] when a daemon serves the vault or left a mount behind, plus
+    /// anything [`StateDir::validate`] reports.
     pub fn require_locked(&self, vault: &VaultSettingsJson) -> Result<()> {
         let path = vault.path_buf();
-        let (state, info) = self.runtime_state_of(&vault.id, path.as_deref());
+        let (state, info) = self.runtime_state_of(&vault.id, path.as_deref())?;
         if !state.is_mounted() {
             return Ok(());
         }
@@ -325,6 +336,59 @@ mod tests {
             registry: VaultRegistry::new(store, state_dir),
             vault_path,
         }
+    }
+
+    /// A state directory another local user planted: on the shared default locations the loser of
+    /// the create race would otherwise read a forged run info and connect to a foreign socket.
+    #[test]
+    fn a_state_directory_that_is_not_ours_is_refused_by_every_read_path() {
+        let f = fixture();
+        let root = f.registry.state_dir().root().to_path_buf();
+        let elsewhere = root.with_file_name("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("other directory");
+        std::fs::remove_dir_all(&root).expect("remove the real one");
+        std::os::unix::fs::symlink(&elsewhere, &root).expect("symlink");
+
+        let vault = VaultSettingsJson::new("AAAAAAAAAAAA".to_owned(), Path::new("/vaults/V"));
+        for err in [
+            f.registry
+                .runtime_state("AAAAAAAAAAAA")
+                .expect_err("crypto status <vault>"),
+            f.registry.infos().expect_err("crypto status"),
+            f.registry.info("V").expect_err("crypto lock"),
+            f.registry
+                .running_mounters()
+                .expect_err("the mounter's conflict check"),
+            f.registry.require_locked(&vault).expect_err("crypto fs"),
+        ] {
+            let AppError::Io(io) = &err else {
+                panic!("expected an I/O error, got {err:?}")
+            };
+            assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("symbolic link"), "{err}");
+        }
+    }
+
+    /// The other half: a root that simply is not there yet must not turn every command into an
+    /// error -- it holds no daemons, so the vault directory decides.
+    #[test]
+    fn a_missing_state_directory_reports_the_states_on_disk() {
+        let f = fixture();
+        std::fs::remove_dir_all(f.registry.state_dir().root()).expect("remove");
+        assert_eq!(
+            f.registry.runtime_state("AAAAAAAAAAAA").expect("state").0,
+            RuntimeState::Locked
+        );
+        assert_eq!(
+            f.registry.info("V").expect("info").state,
+            RuntimeState::Locked
+        );
+        assert_eq!(f.registry.infos().expect("infos").len(), 1);
+        assert!(f.registry.running_mounters().expect("mounters").is_empty());
+        assert!(
+            !f.registry.state_dir().root().exists(),
+            "reading the registry does not create the state directory"
+        );
     }
 
     fn run_info(pid: u32, mountpoint: Option<&str>) -> RunInfo {

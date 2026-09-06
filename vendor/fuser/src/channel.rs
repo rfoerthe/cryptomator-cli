@@ -171,12 +171,7 @@ pub(crate) struct ChannelSender(Arc<DevFuse>);
 
 impl ChannelSender {
     pub(crate) fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let rc = nix::sys::uio::writev(&self.0, bufs)?;
-        // writev is atomic, so do not need to check how many bytes are written.
-        // libfuse does not do it either
-        // https://github.com/libfuse/libfuse/blob/6278995cca991978abd25ebb2c20ebd3fc9e8a13/lib/fuse_lowlevel.c#L267
-        debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc);
-        Ok(())
+        write_all_vectored(bufs, |slices| nix::sys::uio::writev(&self.0, slices))
     }
 
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
@@ -185,5 +180,139 @@ impl ChannelSender {
 
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         unsafe { BackingId::wrap_raw(&self.0, id) }
+    }
+}
+
+/// Writes every byte of `bufs` through `writev`, looping until they are all gone.
+///
+/// `/dev/fuse` is message oriented and hands out one whole reply per `writev`, which is why
+/// upstream only `debug_assert!`s the count. FUSE-T's channel is a **stream socket**: a blocking
+/// write on one returns a *partial* count when a signal is delivered after some bytes have already
+/// gone out (`SA_RESTART` does not undo a partial transfer), and replies run to `rwsize` bytes. A
+/// truncated reply desynchronises the stream for good -- the peer reads the tail of one reply as
+/// the head of the next and the volume hangs, the same failure mode the request-framing patch
+/// fixed on the read side.
+///
+/// `writev` is a parameter rather than the file descriptor so the loop is testable with a writer
+/// that accepts a fixed number of bytes per call.
+///
+/// # Errors
+/// [`io::ErrorKind::WriteZero`] if the writer accepts nothing while bytes are still pending, and
+/// whatever `writev` reports other than `EINTR`, which is retried.
+fn write_all_vectored(
+    bufs: &[io::IoSlice<'_>],
+    mut writev: impl FnMut(&[io::IoSlice<'_>]) -> nix::Result<usize>,
+) -> io::Result<()> {
+    // `advance_slices` needs to rewrite the slice list in place, and the caller's is shared.
+    let mut owned: Vec<io::IoSlice<'_>> = bufs.to_vec();
+    let mut rest: &mut [io::IoSlice<'_>] = &mut owned;
+    while !rest.is_empty() {
+        match writev(rest) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the FUSE channel accepted none of the reply",
+                ));
+            }
+            Ok(written) => io::IoSlice::advance_slices(&mut rest, written),
+            Err(Errno::EINTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod send_test {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn slices<'a>(parts: &'a [&'a [u8]]) -> Vec<io::IoSlice<'a>> {
+        parts.iter().map(|p| io::IoSlice::new(p)).collect()
+    }
+
+    /// The case the fork is about: a stream socket that takes a few bytes at a time. Every byte
+    /// has to arrive, in order, across as many calls as it takes.
+    #[test]
+    fn a_short_write_is_resumed_until_everything_is_out() {
+        let sink = RefCell::new(Vec::new());
+        let calls = RefCell::new(0usize);
+        let bufs = slices(&[b"header--", b"payload", b"!"]);
+        write_all_vectored(&bufs, |slices| {
+            *calls.borrow_mut() += 1;
+            // Accept at most three bytes per call, taken from the front of the list.
+            let mut taken = 0;
+            for slice in slices {
+                for byte in slice.iter() {
+                    if taken == 3 {
+                        break;
+                    }
+                    sink.borrow_mut().push(*byte);
+                    taken += 1;
+                }
+                if taken == 3 {
+                    break;
+                }
+            }
+            Ok(taken)
+        })
+        .expect("the write completes");
+        assert_eq!(sink.into_inner(), b"header--payload!");
+        assert_eq!(calls.into_inner(), 6, "16 bytes at 3 bytes per call");
+    }
+
+    #[test]
+    fn a_writer_that_takes_everything_is_called_once() {
+        let calls = RefCell::new(0usize);
+        let bufs = slices(&[b"one", b"two"]);
+        write_all_vectored(&bufs, |slices| {
+            *calls.borrow_mut() += 1;
+            Ok(slices.iter().map(|s| s.len()).sum())
+        })
+        .expect("the write completes");
+        assert_eq!(calls.into_inner(), 1);
+    }
+
+    /// A signal delivered before any byte went out: `writev` reports `EINTR` and the whole reply
+    /// is still pending.
+    #[test]
+    fn eintr_is_retried() {
+        let calls = RefCell::new(0usize);
+        let bufs = slices(&[b"abc"]);
+        write_all_vectored(&bufs, |slices| {
+            let mut calls = calls.borrow_mut();
+            *calls += 1;
+            if *calls < 3 {
+                return Err(Errno::EINTR);
+            }
+            Ok(slices.iter().map(|s| s.len()).sum())
+        })
+        .expect("the write completes");
+        assert_eq!(calls.into_inner(), 3);
+    }
+
+    #[test]
+    fn a_writer_that_accepts_nothing_is_write_zero() {
+        let bufs = slices(&[b"abc"]);
+        let err = write_all_vectored(&bufs, |_| Ok(0)).expect_err("no progress");
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn other_errors_are_reported() {
+        let bufs = slices(&[b"abc"]);
+        let err = write_all_vectored(&bufs, |_| Err(Errno::EPIPE)).expect_err("EPIPE");
+        assert_eq!(err.raw_os_error(), Some(Errno::EPIPE as i32));
+    }
+
+    #[test]
+    fn nothing_to_write_calls_the_writer_not_at_all() {
+        let calls = RefCell::new(0usize);
+        write_all_vectored(&[], |_| {
+            *calls.borrow_mut() += 1;
+            Ok(0)
+        })
+        .expect("an empty write is a no-op");
+        assert_eq!(calls.into_inner(), 0);
     }
 }

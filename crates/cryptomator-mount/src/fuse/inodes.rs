@@ -19,6 +19,12 @@ const ROOT_LOOKUPS: u64 = u64::MAX / 2;
 #[derive(Debug)]
 struct Entry {
     path: CleartextPath,
+    /// The name this inode had is gone: it was unlinked, or another file was renamed over it.
+    /// The inode itself lives on until the kernel forgets it, because open handles still refer to
+    /// it -- but `path` no longer describes it. In the rename case something *else* sits there
+    /// now, which is why [`InodeTable::path`] must not hand it out: a `getattr` would describe the
+    /// wrong file and a `setattr(size)` without an `fh` would truncate it.
+    unlinked: bool,
     lookups: u64,
 }
 
@@ -50,6 +56,7 @@ impl InodeTable {
             ROOT_INO,
             Entry {
                 path: root.clone(),
+                unlinked: false,
                 lookups: ROOT_LOOKUPS,
             },
         );
@@ -64,11 +71,15 @@ impl InodeTable {
         }
     }
 
-    /// The path of a known inode; `None` once it has been forgotten.
+    /// The path of a known inode; `None` once it has been forgotten -- and `None` as well while
+    /// it is [unlinked](Entry::unlinked), because then nothing (or something else) is behind that
+    /// name. The callers treat `None` from an inode they still hold as "this file has no name any
+    /// more" and answer from the open handle instead.
     pub fn path(&self, ino: u64) -> Option<CleartextPath> {
         lock(&self.inner)
             .by_ino
             .get(&ino)
+            .filter(|entry| !entry.unlinked)
             .map(|entry| entry.path.clone())
     }
 
@@ -98,6 +109,7 @@ impl InodeTable {
             ino,
             Entry {
                 path: path.clone(),
+                unlinked: false,
                 lookups: 1,
             },
         );
@@ -126,8 +138,10 @@ impl InodeTable {
     }
 
     /// Re-keys `from` and everything below it after a rename, so inodes the kernel still holds
-    /// keep resolving to the right file. An inode that already sat at `to` is treated like an
-    /// unlinked one: it keeps its number but is no longer reachable by path.
+    /// keep resolving to the right file. An inode that already sat at `to` is marked
+    /// [unlinked](Entry::unlinked), exactly like one whose name an `unlink` took away: it keeps
+    /// its number for the handles that still hold it, but it is reachable neither by path nor
+    /// through [`path`](Self::path) -- the file that took the name is a different one.
     pub fn rename(&self, from: &CleartextPath, to: &CleartextPath) {
         let mut inner = lock(&self.inner);
         let affected: Vec<(CleartextPath, u64)> = inner
@@ -144,14 +158,29 @@ impl InodeTable {
             if let Some(entry) = inner.by_ino.get_mut(&ino) {
                 entry.path = new.clone();
             }
-            inner.by_path.insert(new, ino);
+            // `insert` hands back the inode that sat at the destination, if any: that one has
+            // just lost its name to the file being renamed.
+            if let Some(victim) = inner.by_path.insert(new, ino) {
+                if victim != ino {
+                    if let Some(entry) = inner.by_ino.get_mut(&victim) {
+                        entry.unlinked = true;
+                    }
+                }
+            }
         }
     }
 
     /// After `unlink`/`rmdir`: the path no longer resolves to an inode, but the inode itself
-    /// survives until it is forgotten, so open handles keep working (as in libfuse).
+    /// survives until it is forgotten, so open handles keep working (as in libfuse). The entry is
+    /// marked [unlinked](Entry::unlinked), so nothing resolves it back to the name it lost.
     pub fn remove_path(&self, path: &CleartextPath) {
-        lock(&self.inner).by_path.remove(path);
+        let mut inner = lock(&self.inner);
+        let Some(ino) = inner.by_path.remove(path) else {
+            return;
+        };
+        if let Some(entry) = inner.by_ino.get_mut(&ino) {
+            entry.unlinked = true;
+        }
     }
 
     /// Number of inodes the kernel may still refer to (at least the root).
@@ -177,11 +206,11 @@ mod tests {
         assert_eq!(t.path(ab).unwrap().to_string(), "/x/b");
         assert_eq!(t.lookup(&CleartextPath::parse("/x")), a);
         t.remove_path(&CleartextPath::parse("/x/b"));
-        assert_eq!(
-            t.path(ab).unwrap().to_string(),
-            "/x/b",
-            "ino survives until forget"
+        assert!(
+            t.path(ab).is_none(),
+            "the name is gone, so the inode no longer resolves to it"
         );
+        assert_eq!(t.len(), 3, "the ino itself survives until forget");
         assert_ne!(
             t.lookup(&CleartextPath::parse("/x/b")),
             ab,
@@ -220,19 +249,49 @@ mod tests {
         let src = t.lookup(&CleartextPath::parse("/src"));
         let child = t.lookup(&CleartextPath::parse("/src/deep/child"));
         let dst = t.lookup(&CleartextPath::parse("/dst"));
+        let len_before = t.len();
         t.rename(&CleartextPath::parse("/src"), &CleartextPath::parse("/dst"));
         assert_eq!(t.lookup(&CleartextPath::parse("/dst")), src);
-        assert_eq!(t.path(child).unwrap().to_string(), "/dst/deep/child");
         assert_eq!(
-            t.path(dst).unwrap().to_string(),
+            t.path(src).unwrap().to_string(),
             "/dst",
-            "the overwritten inode survives for open handles"
+            "the renamed inode carries the destination path"
         );
-        assert!(t.path(src).is_some());
-        // The stale inode is not moved along by a second rename.
+        assert_eq!(t.path(child).unwrap().to_string(), "/dst/deep/child");
+        // The victim keeps its number for the handles the kernel still holds, but it must not
+        // resolve to `/dst` any more -- that name belongs to the file that replaced it, and a
+        // `getattr`/`setattr(size)` on the victim would otherwise describe or truncate *that* one.
+        assert!(
+            t.path(dst).is_none(),
+            "the overwritten inode lost its name to the rename"
+        );
+        assert_eq!(t.len(), len_before, "but it is still allocated");
+        // The stale inode is not moved along by a second rename either.
         t.rename(&CleartextPath::parse("/dst"), &CleartextPath::parse("/end"));
         assert_eq!(t.path(src).unwrap().to_string(), "/end");
-        assert_eq!(t.path(dst).unwrap().to_string(), "/dst");
+        assert!(t.path(dst).is_none());
+        // And it is freed the moment the kernel forgets it, like any other inode.
+        t.forget(dst, 1);
+        assert_eq!(t.len(), len_before - 1);
+    }
+
+    /// The same rule from the other side: `unlink` takes the name away, the inode stays until the
+    /// kernel forgets it, and a file re-created under that name is a different inode.
+    #[test]
+    fn removing_a_path_unlinks_its_inode_without_freeing_it() {
+        let t = InodeTable::new();
+        let path = CleartextPath::parse("/f");
+        let f = t.lookup(&path);
+        t.remove_path(&path);
+        assert!(t.path(f).is_none(), "the name is gone");
+        assert_eq!(t.len(), 2, "the inode is not");
+        let fresh = t.lookup(&path);
+        assert_ne!(fresh, f);
+        assert_eq!(t.path(fresh).unwrap().to_string(), "/f");
+        assert!(t.path(f).is_none(), "the old inode stays nameless");
+        t.forget(f, 1);
+        assert_eq!(t.len(), 2, "forgetting the old one leaves the fresh one");
+        t.remove_path(&CleartextPath::parse("/never-mapped"));
     }
 
     #[test]

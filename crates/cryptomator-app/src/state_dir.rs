@@ -112,19 +112,60 @@ impl StateDir {
     /// from creating the directory, reading its metadata or changing its mode.
     pub fn ensure(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        // `symlink_metadata`, not `metadata`: the latter follows a symbolic link and would report
-        // the *target's* type and owner.
-        let metadata = std::fs::symlink_metadata(&self.root)?;
+        let Some(metadata) = self.check_existing_root()? else {
+            // `create_dir_all` just succeeded, so it was there a moment ago and somebody has
+            // removed it since -- exactly the kind of meddling this check is about.
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "state directory {} disappeared while it was being created",
+                    self.root.display()
+                ),
+            )));
+        };
+        if metadata.permissions().mode() & 0o777 != DIR_MODE {
+            std::fs::set_permissions(&self.root, Permissions::from_mode(DIR_MODE))?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a root that is not ours, **without** creating one.
+    ///
+    /// [`ensure`](Self::ensure) is the check of everything that writes into the directory
+    /// (`crypto unlock` and the daemon). Everything that only *reads* it -- `status`, `lock`,
+    /// `stats`, `events`, `fs` -- needs the same guarantee: on the shared default locations
+    /// (`$XDG_RUNTIME_DIR`, `/tmp/crypto-<uid>`) another local user who wins the create race can
+    /// otherwise plant a run info the CLI shows as fact and a socket that answers `hello`, so
+    /// `crypto lock` would report success without anything being locked. No key and no signal is
+    /// at risk, but the report is.
+    ///
+    /// A root that does not exist yet is fine and reports `Ok(())`: it holds no run infos and no
+    /// sockets, and a read-only command must not create it.
+    ///
+    /// # Errors
+    /// The same [`AppError::Io`] with [`std::io::ErrorKind::PermissionDenied`] as
+    /// [`ensure`](Self::ensure), plus any I/O error from reading the root's metadata.
+    pub fn validate(&self) -> Result<()> {
+        self.check_existing_root().map(|_| ())
+    }
+
+    /// The root's metadata once [`check_root`] has accepted it, or `None` if there is no root yet.
+    ///
+    /// `symlink_metadata`, not `metadata`: the latter follows a symbolic link and would report the
+    /// *target's* type and owner.
+    fn check_existing_root(&self) -> Result<Option<Metadata>> {
+        let metadata = match std::fs::symlink_metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(AppError::Io(e)),
+        };
         if let Err(reason) = check_root(&metadata, nix::unistd::geteuid().as_raw()) {
             return Err(permission_denied(format!(
                 "state directory {}: {reason}",
                 self.root.display()
             )));
         }
-        if metadata.permissions().mode() & 0o777 != DIR_MODE {
-            std::fs::set_permissions(&self.root, Permissions::from_mode(DIR_MODE))?;
-        }
-        Ok(())
+        Ok(Some(metadata))
     }
 
     /// The state files of `vault_id`.
@@ -143,8 +184,10 @@ impl StateDir {
     /// failing the whole listing -- a leftover from a crash must not break `crypto status`.
     ///
     /// # Errors
-    /// I/O errors other than "the directory does not exist".
+    /// Anything [`validate`](Self::validate) reports about a root that is not ours, plus I/O
+    /// errors other than "the directory does not exist".
     pub fn list_run_infos(&self) -> Result<Vec<RunInfo>> {
+        self.validate()?;
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -386,10 +429,20 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "state".to_owned());
     let tmp = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    // Remove a leftover first (a crash left one behind, or the pid was reused), because the open
+    // below refuses an existing name. `remove_file` unlinks a symbolic link rather than following
+    // it, so a planted one is taken away instead of being written through.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(AppError::Io(e)),
+    }
     let written = std::fs::File::options()
         .write(true)
-        .create(true)
-        .truncate(true)
+        // `create_new` (`O_EXCL`), not `create`: `O_EXCL` never follows a symbolic link, so a
+        // link planted at the temp path cannot get its target truncated. This is the one write
+        // that can run without `StateDir::ensure`/`validate` having vetted the directory.
+        .create_new(true)
         .mode(FILE_MODE)
         .open(&tmp)
         .and_then(|mut file| {
@@ -515,6 +568,69 @@ mod tests {
             0o755,
             "the link's target was not chmod-ed through the link"
         );
+    }
+
+    #[test]
+    fn validate_accepts_a_missing_root_and_refuses_a_symlinked_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // A root that is not there yet holds no run infos and no sockets, and a read-only command
+        // must not create one on the way.
+        let missing = StateDir::at(dir.path().join("not-yet"));
+        missing.validate().expect("a missing root is fine");
+        assert!(!missing.root().exists(), "validate creates nothing");
+        assert!(missing.list_run_infos().expect("list").is_empty());
+
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("target");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let planted = StateDir::at(link.clone());
+        for err in [
+            planted.validate().expect_err("a symlinked root"),
+            planted.list_run_infos().expect_err("a symlinked root"),
+        ] {
+            let AppError::Io(io) = &err else {
+                panic!("expected an I/O error, got {err:?}")
+            };
+            assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+            let message = err.to_string();
+            assert!(message.contains(&link.display().to_string()), "{message}");
+            assert!(message.contains("symbolic link"), "{message}");
+        }
+
+        // Our own directory passes, and nothing is created or changed by asking.
+        let ours = StateDir::at(dir.path().join("ours"));
+        ours.ensure().expect("ensure");
+        ours.validate().expect("our own root");
+    }
+
+    #[test]
+    fn write_private_does_not_follow_a_symlink_planted_at_the_temp_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = StateDir::at(dir.path().join("state"));
+        state.ensure().expect("ensure");
+        let files = state.files("CCCCCCCCCCCC");
+
+        // The name `write_private` uses for its temporary file, plus a symbolic link pointing at
+        // a file that must survive untouched.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not truncate me").expect("victim");
+        let tmp = files.pid.with_file_name(format!(
+            "{}.{}.tmp",
+            files.pid.file_name().expect("file name").to_string_lossy(),
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(&victim, &tmp).expect("symlink");
+
+        files.write_pid(4242).expect("the write still succeeds");
+        assert_eq!(files.read_pid(), Some(4242));
+        assert_eq!(
+            std::fs::read(&victim).expect("victim"),
+            b"do not truncate me",
+            "the symlink's target was written through"
+        );
+        assert!(!tmp.exists(), "the temporary file is renamed away");
     }
 
     #[test]

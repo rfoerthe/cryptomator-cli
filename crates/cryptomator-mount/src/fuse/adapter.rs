@@ -384,12 +384,23 @@ impl Filesystem for CryptoFuse {
     ) {
         match self.ops.readdir(fh.0, offset, READDIR_BATCH) {
             Ok(entries) => {
+                let offered = entries.len();
+                let mut added = 0usize;
                 for (entry, next_offset) in entries {
                     if reply.add(INodeNo(entry.ino), next_offset, entry.kind, &entry.name) {
                         break; // the reply buffer is full; the kernel asks again from `next_offset`
                     }
+                    added += 1;
                 }
-                reply.ok();
+                if readdir_batch_may_be_answered(offered, added) {
+                    reply.ok();
+                } else {
+                    log::warn!(
+                        "the readdir reply buffer does not hold even one entry; \
+                         answering EINVAL rather than truncating the listing"
+                    );
+                    reply.error(Errno::EINVAL);
+                }
             }
             Err(e) => reply.error(e),
         }
@@ -507,6 +518,18 @@ impl Filesystem for CryptoFuse {
     }
 }
 
+/// Whether a `readdir` batch of `offered` entries, of which `added` fit into the reply, may be
+/// answered with `ok()`.
+///
+/// `reply.add` reporting "full" is how a listing is normally split: the kernel asks again from the
+/// offset of the first entry that did not fit. That only works while *something* fit. If the very
+/// first entry of a non-empty batch is already too large for the reply buffer, `ok()` would send
+/// an empty reply -- which the kernel reads as the end of the directory, silently truncating the
+/// listing. There is no offset to resume from either, so the honest answer is an error.
+fn readdir_batch_may_be_answered(offered: usize, added: usize) -> bool {
+    offered == 0 || added > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +645,20 @@ mod tests {
         // The bits survive decoding even where fuser does not name them (FUSE-T on macOS).
         let both = RenameFlags::from_bits_retain(RENAME_NOREPLACE | RENAME_EXCHANGE);
         assert_eq!(both.bits(), 3);
+    }
+
+    /// `ReplyDirectory` can only be built from a live channel sender, so the decision `readdir`
+    /// makes about the batch it just filled is tested on its own.
+    #[test]
+    fn a_batch_whose_first_entry_does_not_fit_is_not_answered_with_ok() {
+        // Nothing to list: an empty `ok()` is the correct end of the directory.
+        assert!(readdir_batch_may_be_answered(0, 0));
+        // The normal split: some entries fit, the kernel asks again from the next offset.
+        assert!(readdir_batch_may_be_answered(64, 1));
+        assert!(readdir_batch_may_be_answered(64, 63));
+        assert!(readdir_batch_may_be_answered(64, 64));
+        // The one that would silently truncate the listing.
+        assert!(!readdir_batch_may_be_answered(1, 0));
+        assert!(!readdir_batch_may_be_answered(64, 0));
     }
 }
