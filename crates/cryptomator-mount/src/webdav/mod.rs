@@ -14,6 +14,8 @@ pub mod fs;
 pub mod os_mount;
 pub mod server;
 
+pub use fs::{fs_error, CryptoDavEntry, CryptoDavFs, CryptoDavMeta};
+
 /// Set to `1` to let [`set_bind_address`] accept an address the rest of the network can reach.
 pub const ALLOW_NONLOOPBACK_ENV: &str = "CRYPTO_WEBDAV_ALLOW_NONLOOPBACK";
 

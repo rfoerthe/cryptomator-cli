@@ -47,7 +47,7 @@ rpassword = "7.5"
 unicode-normalization = "0.1"
 regex = "1"
 proptest = "1"
-nix = { version = "0.31", features = ["process", "signal", "user", "fs"] }
+nix = { version = "0.31", features = ["process", "signal", "user", "fs", "feature"] }
 libc = "0.2"
 signal-hook = "0.3"
 log = "0.4"
