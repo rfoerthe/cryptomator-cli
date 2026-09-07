@@ -250,7 +250,7 @@ pub struct SetArgs {
     /// Use the mounter's default flags
     #[arg(long)]
     pub default_mount_flags: bool,
-    /// Mounter alias (fuse-t, macfuse, fuse, null, webdav), Java class name, or "default"
+    /// Mounter alias (fuse-t, macfuse, fuse, null, webdav, webdav-applescript, webdav-gio), Java class name, or "default"
     #[arg(long, value_name = "MOUNTER")]
     pub mounter: Option<String>,
     /// TCP port for loopback mounters (WebDAV)

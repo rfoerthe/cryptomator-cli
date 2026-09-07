@@ -373,12 +373,19 @@ impl DavFile for CryptoDavFile {
         let handle = self.handle();
         Box::pin(async move {
             let handle = handle?;
-            let size = blocking(move || Ok(handle.size())).await?;
+            // Only `End` needs to know how long the file is. `handle_put` (`Content-Range`) and
+            // `handle_gethead` (`Range`) seek exclusively from `Start`, so asking for the size
+            // unconditionally would put a blocking-pool round trip on every ranged GET and every
+            // partial PUT for nothing.
+            //
             // `i128` so that `size + offset` cannot wrap for any `u64`/`i64` pair.
             let target = match pos {
                 io::SeekFrom::Start(offset) => i128::from(offset),
-                io::SeekFrom::End(offset) => i128::from(size) + i128::from(offset),
                 io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+                io::SeekFrom::End(offset) => {
+                    let size = blocking(move || Ok(handle.size())).await?;
+                    i128::from(size) + i128::from(offset)
+                }
             };
             // Seeking before the start is the caller's bug; `handle_put` turns the error into
             // `416 Range Not Satisfiable`.
@@ -691,6 +698,7 @@ mod tests {
     use crate::testing::{test_fs, test_fs_with};
     use dav_server::fs::ReadDirMeta;
     use futures_util::StreamExt;
+    use std::time::Duration;
 
     /// Every test drives the futures on a current-thread runtime with a blocking pool, because
     /// `blocking()` uses `spawn_blocking`.
@@ -1153,6 +1161,62 @@ mod tests {
                 "reading past the end returns nothing, not an error"
             );
             assert_eq!(file.metadata().await.expect("metadata").len(), 10);
+        });
+    }
+
+    /// `Start` and `Current` must not touch the file system: `handle_gethead` seeks once per
+    /// ranged GET and `handle_put` once per `Content-Range` PUT, and a blocking-pool round trip
+    /// for a number this function already has is pure latency.
+    ///
+    /// Proved by starving the pool: a runtime with a single blocking thread, that thread parked,
+    /// and a `Start` seek that answers anyway -- while the `End` seek right after it, which does
+    /// need the size, waits for the thread that never comes.
+    #[test]
+    fn seeking_from_the_start_needs_no_blocking_thread() {
+        let (_dir, fs) = test_fs();
+        fs.write_file(&CleartextPath::parse("/s.bin"), b"0123456789", false)
+            .expect("write");
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        runtime.block_on(async {
+            let options = OpenOptions {
+                read: true,
+                ..Default::default()
+            };
+            // The open still needs the pool, so it happens before the pool is taken away.
+            let mut file = dav.open(&dav_path("/s.bin"), options).await.expect("open");
+            tokio::task::spawn_blocking(move || {
+                let _ = parked.recv();
+            });
+            // Let the parked task actually claim the one thread there is.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let seeked =
+                tokio::time::timeout(Duration::from_secs(5), file.seek(io::SeekFrom::Start(4)))
+                    .await
+                    .expect("a `Start` seek answers with no thread to run on")
+                    .expect("seek");
+            assert_eq!(seeked, 4);
+            let seeked =
+                tokio::time::timeout(Duration::from_secs(5), file.seek(io::SeekFrom::Current(2)))
+                    .await
+                    .expect("and so does `Current`")
+                    .expect("seek");
+            assert_eq!(seeked, 6);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), file.seek(io::SeekFrom::End(-2)),)
+                    .await
+                    .is_err(),
+                "`End` is the one variant that does read the size"
+            );
+            let _ = release.send(());
         });
     }
 

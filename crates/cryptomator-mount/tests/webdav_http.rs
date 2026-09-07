@@ -8,8 +8,8 @@ use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions};
 use cryptomator_core::{initialize, open_vault_with_key, CipherCombo, DetRng, Masterkey};
 use cryptomator_mount::webdav::fs::CryptoDavFs;
 use cryptomator_mount::webdav::server::{
-    probe_context_root, strip_prefix_for, WebDavServerConfig, WebDavServerError,
-    WebDavServerHandle, HEALTH_TIMEOUT,
+    host_header_allowed, probe_context_root, strip_prefix_for, WebDavServerConfig,
+    WebDavServerError, WebDavServerHandle, HEALTH_TIMEOUT,
 };
 use hyper::{HeaderMap, StatusCode};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -69,8 +69,23 @@ fn server_at(fs: Arc<CryptoFs>, context_path: &str) -> WebDavServerHandle {
 }
 
 /// One request over a fresh connection; returns status, headers and the body as a string.
+///
+/// The `Host` is the address that was dialled, which is what every real client sends and what
+/// [`host_header_allowed`] therefore has to accept; [`send_with_host`] overrides it.
 async fn send(
     addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &'static [u8],
+) -> (StatusCode, HeaderMap, String) {
+    send_with_host(addr, &addr.to_string(), method, path, headers, body).await
+}
+
+/// The same, with a `Host` header of our choosing.
+async fn send_with_host(
+    addr: SocketAddr,
+    host: &str,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
@@ -87,7 +102,7 @@ async fn send(
     let mut builder = hyper::Request::builder()
         .method(method)
         .uri(path)
-        .header("host", addr.to_string());
+        .header("host", host);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -549,5 +564,189 @@ fn an_aborted_put_is_still_on_disk_once_the_server_has_stopped() {
             .len(),
         PARTIAL_BODY,
         "every byte that reached the server before the abort is in the vault"
+    );
+}
+
+/// The `Host` rule, at the level the server applies it: a literal address (with or without a
+/// port, brackets and all) or the name `localhost` -- and nothing else, because a name that is
+/// not `localhost` can only have got here through DNS, which is what a rebinding attack uses.
+#[test]
+fn only_a_literal_address_or_localhost_is_an_acceptable_host() {
+    for allowed in [
+        "127.0.0.1",
+        "127.0.0.1:42427",
+        "localhost",
+        "LocalHost:42427",
+        "[::1]",
+        "[::1]:42427",
+        "::1",
+        "0:0:0:0:0:0:0:1",
+    ] {
+        assert!(
+            host_header_allowed(allowed),
+            "{allowed} is a client of ours"
+        );
+    }
+    for refused in [
+        "evil.example",
+        "evil.example:42427",
+        "localhost.evil.example",
+        "vault.localhost",
+        "[::1",
+        "[::1]x",
+        "[::1]:notaport",
+        "127.0.0.1:notaport",
+        "",
+    ] {
+        assert!(!host_header_allowed(refused), "{refused} is not");
+    }
+}
+
+/// DNS rebinding, end to end: a page served from a name the attacker controls sends that name as
+/// its `Host`, and the server answers `400` with nothing in the body. The addresses a real client
+/// sends -- the dialled `127.0.0.1:<port>`, the `localhost` that `cli_daemon.rs` uses, and the
+/// bracketed IPv6 form -- all still reach the vault.
+#[test]
+fn a_foreign_host_header_is_refused_and_the_real_ones_are_not() {
+    let (_dir, fs) = test_fs();
+    let handle = server(fs);
+    let addr = handle.local_addr();
+    let port = handle.port();
+    runtime().block_on(async move {
+        let (status, _, body) = send_with_host(
+            addr,
+            "evil.example",
+            "PROPFIND",
+            CTX,
+            &[("depth", "0")],
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty(), "nothing leaks in the body: {body:?}");
+
+        for host in [
+            format!("127.0.0.1:{port}"),
+            "localhost".to_owned(),
+            format!("[::1]:{port}"),
+        ] {
+            let (status, _, _) =
+                send_with_host(addr, &host, "PROPFIND", CTX, &[("depth", "0")], b"").await;
+            assert_eq!(status, StatusCode::MULTI_STATUS, "Host: {host}");
+        }
+    });
+}
+
+/// An HTTP/1.0 request carries no `Host` at all, and RFC 7230 lets it: an absent header is served,
+/// because a browser's rebinding machinery cannot produce one.
+#[test]
+fn a_request_without_a_host_header_is_served() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let (_dir, fs) = test_fs();
+    let handle = server(fs);
+    let addr = handle.local_addr();
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    stream
+        .write_all(
+            format!("PROPFIND {CTX} HTTP/1.0\r\nDepth: 0\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+        )
+        .expect("request");
+    stream.flush().expect("flush");
+    let mut status = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut status)
+        .expect("a status line");
+    // hyper answers an HTTP/1.0 request in kind, hence the version is not pinned here.
+    assert!(status.starts_with("HTTP/1.0 207"), "{status:?}");
+}
+
+/// The `Content-Range` PUT, through `handle_put`'s own header parsing rather than a hand-made
+/// `seek`: it must patch the named bytes and leave everything around them -- and the file's
+/// length -- alone. `truncate = options.truncate` in `CryptoDavFs::open` is what makes that work;
+/// the defect it replaced wiped the file.
+#[test]
+fn a_content_range_put_patches_bytes_in_place() {
+    let (_dir, fs) = test_fs();
+    let handle = server(Arc::clone(&fs));
+    let addr = handle.local_addr();
+    runtime().block_on(async move {
+        let (status, _, _) =
+            send(addr, "PUT", &format!("{CTX}/patch.bin"), &[], b"0123456789").await;
+        assert!(status.is_success(), "{status}");
+
+        let (status, _, _) = send(
+            addr,
+            "PUT",
+            &format!("{CTX}/patch.bin"),
+            &[("content-range", "bytes 2-4/*")],
+            b"XYZ",
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+
+        let (status, _, body) = send(addr, "GET", &format!("{CTX}/patch.bin"), &[], b"").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "01XYZ56789", "only bytes 2..=4 changed");
+    });
+    assert_eq!(
+        fs.read_file(&CleartextPath::parse("/patch.bin"))
+            .expect("read back"),
+        b"01XYZ56789",
+        "and the file is no longer or shorter than it was"
+    );
+}
+
+/// The conditional PUTs, whose status depends on this adapter's `FsError` mapping rather than on
+/// `dav-server`: `If-None-Match: *` sets `create_new`, so an existing file has to come back as
+/// `412` and not as the `409` a plain `Exists` would give; `If-Match: *` clears `create`, so a
+/// missing file is `412` too.
+#[test]
+fn conditional_puts_answer_412_rather_than_409() {
+    let (_dir, fs) = test_fs();
+    let handle = server(Arc::clone(&fs));
+    let addr = handle.local_addr();
+    runtime().block_on(async move {
+        let (status, _, _) = send(addr, "PUT", &format!("{CTX}/cond.bin"), &[], b"first").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _, _) = send(
+            addr,
+            "PUT",
+            &format!("{CTX}/cond.bin"),
+            &[("if-none-match", "*")],
+            b"second",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "`If-None-Match: *` on a file that exists"
+        );
+
+        let (status, _, _) = send(
+            addr,
+            "PUT",
+            &format!("{CTX}/missing.bin"),
+            &[("if-match", "*")],
+            b"nope",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "`If-Match: *` on a file that does not exist"
+        );
+    });
+    assert_eq!(
+        fs.read_file(&CleartextPath::parse("/cond.bin"))
+            .expect("read back"),
+        b"first",
+        "the refused PUT wrote nothing"
+    );
+    assert!(
+        fs.symlink_metadata(&CleartextPath::parse("/missing.bin"))
+            .is_err(),
+        "and neither did the other one"
     );
 }

@@ -11,6 +11,7 @@
 use crate::api::{MountError, UnmountError};
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,22 +44,29 @@ impl CommandOutput {
 
 /// Runs `command`, waits at most `timeout` and collects both output streams.
 ///
-/// Both pipes are read *after* the process ended, which is only safe for a command whose output
-/// fits in the pipe buffer -- every caller here prints one line (`mount | grep`, `gio mount`).
-/// A command that fills the buffer blocks, misses the deadline and is killed, which is the same
-/// outcome as any other hang.
+/// Both pipes are drained by a thread of their own, started *before* the wait. Reading them
+/// afterwards would only be safe for a command whose whole output fits in the 64 KiB pipe buffer,
+/// and one of the callers is a bare `mount` (`webdav::os_mount::applescript_mount`): on a machine
+/// with a few hundred volumes its listing passes that, the child blocks in `write`, the deadline
+/// runs out and a Finder volume that mounted perfectly well is reported as a failed mount.
+///
+/// The readers share the command's deadline: whatever they have not handed over by then is
+/// dropped, and the threads are left to end on their own when the pipe closes.
 ///
 /// # Errors
 /// [`MountError::Io`] if the command cannot be spawned and [`MountError::Failed`] if it does not
 /// finish within `timeout`.
 pub fn run_command(mut command: Command, timeout: Duration) -> Result<CommandOutput, MountError> {
+    let deadline = Instant::now() + timeout;
     let description = describe(&command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
-    let Some(status) = wait_for_exit(&mut child, timeout)? else {
+    let stdout = drain_pipe(child.stdout.take());
+    let stderr = drain_pipe(child.stderr.take());
+    let Some(status) = wait_until(&mut child, deadline)? else {
         let _ = child.kill();
         reap(child);
         return Err(MountError::Failed(format!(
@@ -68,8 +76,8 @@ pub fn run_command(mut command: Command, timeout: Duration) -> Result<CommandOut
     };
     Ok(CommandOutput {
         status,
-        stdout: read_pipe(child.stdout.take()),
-        stderr: read_pipe(child.stderr.take()),
+        stdout: collect_pipe(&stdout, deadline),
+        stderr: collect_pipe(&stderr, deadline),
     })
 }
 
@@ -146,7 +154,12 @@ pub fn probe_command(program: &str, args: &[&str], timeout: Duration) -> bool {
 /// # Errors
 /// Whatever [`Child::try_wait`] reports.
 pub fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + timeout;
+    wait_until(child, Instant::now() + timeout)
+}
+
+/// [`wait_for_exit`] against an absolute deadline, so that the wait and the pipe readers of
+/// [`run_command`] answer to the same clock.
+fn wait_until(child: &mut Child, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
@@ -176,10 +189,43 @@ fn reap(child: Child) {
         });
 }
 
+/// Reads one of the child's pipes to EOF on a thread of its own and hands the result over once.
+///
+/// A thread rather than a poll loop: `read` on a pipe is the one blocking call here that has no
+/// timeout, and the point is precisely that it may block -- while it does, the child can keep
+/// writing instead of stalling against a full buffer. If the thread cannot be spawned, or the
+/// pipe was never opened, the sender is dropped and [`collect_pipe`] reads the stream as empty;
+/// losing a command's output is bad, but not as bad as failing the mount over it.
+fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    if let Some(pipe) = pipe {
+        let _ = thread::Builder::new()
+            .name("crypto-command-pipe".to_owned())
+            .spawn(move || {
+                let _ = sender.send(read_pipe(Some(pipe)));
+            });
+    }
+    receiver
+}
+
+/// What a [`drain_pipe`] reader produced, waiting no longer than `deadline`.
+///
+/// The child has already exited by the time this runs, so its end of the pipe is closed and the
+/// reader is normally done already; the deadline only covers the case of a grandchild that
+/// inherited the descriptor and is still holding it open. The floor of one [`POLL_INTERVAL`]
+/// keeps a command that finished in the very last millisecond of its budget from losing output it
+/// has already produced.
+fn collect_pipe(pipe: &mpsc::Receiver<String>, deadline: Instant) -> String {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(POLL_INTERVAL);
+    pipe.recv_timeout(remaining).unwrap_or_default()
+}
+
 /// One of the child's pipes, lossily decoded; a pipe that was never opened reads as empty.
 ///
-/// An unmount helper writes one short line, well below the pipe buffer, so reading it after the
-/// process ended cannot deadlock -- see [`run_command`] for the same caveat on `stdout`.
+/// [`run_unmount_command`] calls this on the exited child's `stderr` directly: an unmount helper
+/// writes one short line, well below the pipe buffer, so that read cannot deadlock.
 fn read_pipe(pipe: Option<impl Read>) -> String {
     let Some(mut pipe) = pipe else {
         return String::new();
@@ -281,6 +327,28 @@ mod tests {
             ),
             Err(MountError::Io(_))
         ));
+    }
+
+    /// The regression the pipe-reader threads exist for: a child whose output does not fit in the
+    /// 64 KiB pipe buffer used to block in `write` while the parent sat in `wait`, miss the
+    /// deadline and be killed. `mount` on a machine with a few hundred volumes is that child.
+    #[test]
+    fn a_command_that_outgrows_the_pipe_buffer_still_finishes() {
+        const BYTES: usize = 200_000;
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("yes | head -c {BYTES}")]);
+        let started = Instant::now();
+        let output = run_command(command, Duration::from_secs(10)).expect("sh runs");
+        assert!(output.success(), "{:?}", output.status);
+        assert_eq!(
+            output.stdout.len(),
+            BYTES,
+            "every byte the child wrote came back"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it finished well inside the deadline, not by hitting it"
+        );
     }
 
     /// A command that outlives its deadline is killed, and the caller is told which one it was.

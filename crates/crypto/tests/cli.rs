@@ -23,6 +23,30 @@ fn no_arguments_prints_help_and_exits_with_usage_code() {
         .stderr(predicate::str::contains("Usage: crypto"));
 }
 
+/// The alias list `vault set --mounter` prints has to name every alias `unlock --mounter` takes:
+/// a value this help text omits is still stored and still mounted, and the WebDAV ones were
+/// missing.
+#[test]
+fn vault_set_help_lists_every_mounter_alias() {
+    let assertion = Command::cargo_bin("crypto")
+        .unwrap()
+        .args(["vault", "set", "--help"])
+        .assert()
+        .success();
+    let help = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    for alias in [
+        "fuse-t",
+        "macfuse",
+        "fuse",
+        "null",
+        "webdav",
+        "webdav-applescript",
+        "webdav-gio",
+    ] {
+        assert!(help.contains(alias), "`{alias}` is missing from:\n{help}");
+    }
+}
+
 const VALID_KEY: &str = "pathway lift abuse plenty export texture gentleman landscape beyond ceiling around leaf cafe charity border breakdown victory surely computer cat linger restrict infer crowd live computer true written amazed investor boot depth left theory snow whereby terminal weekly reject happiness circuit partial cup ad";
 
 #[test]

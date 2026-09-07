@@ -751,6 +751,10 @@ fn the_webdav_bind_address_from_cli_json_reaches_the_server() {
     );
     let url = result["mountpoint"].as_str().unwrap().to_owned();
     assert!(url.starts_with("http://[::1]:"), "{url}");
+    // `localhost` rather than the `[::1]` authority on purpose: the server's `Host` check
+    // (`webdav::server::host_header_allowed`) allows a literal address or the name `localhost` and
+    // refuses everything else, so this line is both a bind-address test and the proof that the
+    // one name a client may send still gets through.
     let response = http(
         &authority(&url),
         &format!(

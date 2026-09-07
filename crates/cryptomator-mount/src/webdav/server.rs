@@ -271,6 +271,60 @@ impl Drop for WebDavServerHandle {
     }
 }
 
+/// Whether a `Host` header may reach the vault.
+///
+/// The server is unauthenticated by design, so the only thing standing between a web page the user
+/// happens to open and the decrypted vault is the same-origin policy -- and DNS rebinding takes
+/// that away: a name the attacker controls resolves to `127.0.0.1` after its TTL flips, and the
+/// page's `fetch()` is suddenly same-origin with this server. The context path is no secret
+/// (`settings.json` holds it) and the port defaults to the well-known `42427`, so the `Host` is
+/// what has to be checked. Cryptomator's own servlet does not do this; the cost here is one string
+/// comparison.
+///
+/// Allowed is what a client that was handed a URL of ours actually sends: the literal address with
+/// or without a port (`127.0.0.1:42427`, `[::1]:42427`, `::1`), or the name `localhost`, which
+/// resolves only through the hosts file and which `crates/crypto/tests/cli_daemon.rs` sends for
+/// exactly that reason. Everything else is a name, and a name is either useless (it cannot be
+/// reached without DNS pointing it here) or an attack. An absent header is allowed: HTTP/1.0
+/// clients do not send one, and a request without a `Host` cannot have come from a browser's
+/// same-origin machinery.
+pub fn host_header_allowed(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // The bracket form is the only one that can carry both an IPv6 literal and a port.
+        let Some((inside, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_is_sane = match after.strip_prefix(':') {
+            Some(port) => port.chars().all(|c| c.is_ascii_digit()),
+            None => after.is_empty(),
+        };
+        if !port_is_sane {
+            return false;
+        }
+        inside
+    } else if host.matches(':').count() == 1 {
+        // `localhost:42427`, `127.0.0.1:42427`.
+        match host.split_once(':') {
+            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+            _ => return false,
+        }
+    } else {
+        // No colon at all, or several: a bare name, or an unbracketed IPv6 literal, which RFC 7230
+        // does not allow in a `Host` but which carries no port either way.
+        host
+    };
+    name.parse::<IpAddr>().is_ok() || name.eq_ignore_ascii_case("localhost")
+}
+
+/// The answer to a request whose `Host` [`host_header_allowed`] refused: `400`, no body, and
+/// nothing that tells the caller anything about the vault.
+fn rejected_host_response() -> hyper::Response<dav_server::body::Body> {
+    let mut response = hyper::Response::new(dav_server::body::Body::empty());
+    *response.status_mut() = hyper::StatusCode::BAD_REQUEST;
+    response
+}
+
 /// The accept loop: one hyper HTTP/1 connection per socket, all of them watched by one
 /// [`GracefulShutdown`] so `stop()` drains instead of cutting.
 async fn serve(
@@ -310,6 +364,19 @@ async fn serve(
                         // Request paths are cleartext vault paths, so this never rises above
                         // debug.
                         log::debug!("WebDAV {} {}", request.method(), request.uri().path());
+                        if let Some(host) = request.headers().get(hyper::header::HOST) {
+                            let allowed = host.to_str().is_ok_and(host_header_allowed);
+                            if !allowed {
+                                // The header itself may be attacker-chosen, so it is logged at
+                                // debug and lossily, like a request path.
+                                log::debug!(
+                                    "WebDAV request refused: Host {:?} is neither a literal \
+                                     address nor `localhost`",
+                                    String::from_utf8_lossy(host.as_bytes())
+                                );
+                                return Ok(rejected_host_response());
+                            }
+                        }
                         Ok::<_, std::convert::Infallible>(handler.handle(request).await)
                     }
                 });

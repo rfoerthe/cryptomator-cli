@@ -106,6 +106,11 @@ and skips the mount-table wait: nothing of it appears in the mount table
 {"id":1,"ok":true,"result":{"mountpoint":"http://127.0.0.1:42427/UARWQsp1etRW"}}
 ```
 
+A client that talks to that server itself has one rule to keep: the `Host` header must be a literal
+address (with or without a port, `[::1]` brackets included) or the name `localhost`, or absent
+altogether. Anything else is answered with `400` and an empty body — that is the server's DNS
+rebinding guard, and sending back the authority from the `mountpoint` URL satisfies it.
+
 A failure is `MOUNT_FAILED`, and the daemon stops itself afterwards.
 
 ### `lock` and `shutdown`

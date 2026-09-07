@@ -286,8 +286,10 @@ operating system to mount it for you.
 They are chosen automatically when no FUSE back end works on this machine — their Java priorities
 put them below every FUSE provider (`50` for the two OS-integrated ones, `0` for the plain
 fallback), so on a Mac without macFUSE and FUSE-T an ordinary `crypto unlock Secret` ends in a
-Finder volume — and explicitly with `--mounter webdav`, `--mounter webdav-applescript` or
-`--mounter webdav-gio`:
+Finder volume, as long as there is a GUI session; over SSH or headless use `--mounter webdav`,
+because the auto-choice only checks that `/usr/bin/osascript` exists and the AppleScript mount then
+fails with exit `6` instead of falling back to the URL. All three can also be asked for by name,
+with `--mounter webdav`, `--mounter webdav-applescript` or `--mounter webdav-gio`:
 
 | Alias | Class (what `settings.json` stores) | Where it works | What `unlock` answers with |
 |---|---|---|---|
@@ -325,10 +327,22 @@ otherwise `settings.json`'s `port` — both default to `42427`. A port that is a
 the unlock with exit `6` and names both ways out in the message.
 
 **No authentication.** The server asks for no credentials: whoever can reach the port can read and
-write the decrypted vault. That is why it binds a loopback address and nothing else.
-`crypto config set webdavBind ::1` moves it to another loopback address; a non-loopback address is
-refused (exit `2`) unless `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` is set, and setting that publishes the
-decrypted vault to everyone who can reach that interface.
+write the decrypted vault. Loopback keeps it off the network but **not** away from other accounts on
+this machine: any local process, whatever its uid, can read and write the decrypted vault while it
+is unlocked. Cryptomator's own WebDAV server has the same property; the FUSE back ends do not.
+Prefer a FUSE back end on a shared machine.
+
+`crypto config set webdavBind ::1` moves the server to another loopback address; a non-loopback
+address is refused (exit `2`) unless `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` is set, and setting that
+publishes the decrypted vault to everyone who can reach that interface.
+
+**The `Host` header is checked.** A request is served only if its `Host` is a literal address —
+with or without a port, `[::1]` brackets included — or the name `localhost`, or if there is no
+`Host` at all (an HTTP/1.0 client). Anything else is `400`. That closes DNS rebinding: a web page
+the browser loaded from a name the attacker controls can otherwise re-point that name at
+`127.0.0.1` and reach this server as same-origin, and neither the port (`42427` by default) nor the
+vault id in the URL is a secret. Every real client — Finder, `mount_webdav`, `gio`, `curl`,
+`rclone` — sends the address it dialled, so the rule is invisible to them.
 
 **Locking.** `crypto lock <VAULT>` always works — it stops the server, and with the two OS mounters
 it unmounts the volume first (`diskutil umount`, `gio mount -u`). `crypto lock <VAULT> --force` is
@@ -352,6 +366,10 @@ it is dead either way, and `gio mount -u "dav://…"` clears the entry.
   the vault the way the macOS FUSE back ends do; whatever the client writes is stored.
 - **Symbolic links inside the vault are invisible** over WebDAV — neither listed nor addressable —
   exactly as in Cryptomator's own servlet.
+- As a consequence, **a directory whose only remaining child is a symlink cannot be deleted** over
+  WebDAV: the client never sees the link, so it cannot remove it first, and `DELETE` on the
+  directory answers `409` for as long as the link is there. Remove it through a FUSE mount, or with
+  `crypto rm`.
 - Names are normalised to **NFC** on the way in, and answers are not translated back to NFD for
   macOS clients (Cryptomator's servlet does that for the `WebDAVFS` user agent; the user agent is
   not visible from inside the file system implementation).
