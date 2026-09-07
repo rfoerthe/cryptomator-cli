@@ -18,6 +18,14 @@ pub const MOUNTER_ALIASES: &[(&str, &str)] = &[
         "webdav",
         "org.cryptomator.frontend.webdav.mount.FallbackMounter",
     ),
+    (
+        "webdav-applescript",
+        "org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter",
+    ),
+    (
+        "webdav-gio",
+        "org.cryptomator.frontend.webdav.mount.LinuxGioMounter",
+    ),
     // The built-in null mounter; only usable with CRYPTO_ENABLE_NULL_MOUNTER=1 and only listed by
     // `crypto mounters --all`.
     ("null", "org.cryptomator.cli.NullMountProvider"),
@@ -75,6 +83,14 @@ mod tests {
             "org.cryptomator.frontend.webdav.mount.FallbackMounter"
         );
         assert_eq!(
+            resolve_mounter("webdav-gio").unwrap(),
+            "org.cryptomator.frontend.webdav.mount.LinuxGioMounter"
+        );
+        assert_eq!(
+            alias_for("org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter"),
+            Some("webdav-applescript")
+        );
+        assert_eq!(
             resolve_mounter("null").unwrap(),
             "org.cryptomator.cli.NullMountProvider"
         );
@@ -96,5 +112,40 @@ mod tests {
             Some("fuse-t")
         );
         assert_eq!(alias_for("org.example.Custom"), None);
+    }
+
+    /// The two alias tables -- this one and `cryptomator_mount::registry`'s -- are maintained by
+    /// hand and have to agree: the CLI resolves `--mounter` here, and `crypto mounters` labels the
+    /// services with the registry's names. A class that only one of them knows would print a row
+    /// without an alias, or accept a name that resolves to nothing.
+    #[test]
+    fn both_alias_tables_name_the_same_classes() {
+        use cryptomator_mount::registry::alias_for_class;
+
+        for (alias, class) in MOUNTER_ALIASES {
+            assert_eq!(
+                alias_for_class(class),
+                Some(*alias),
+                "the mount registry does not know {alias} -> {class}"
+            );
+            assert_eq!(
+                resolve_mounter(alias).expect("a known alias resolves"),
+                *class,
+                "round trip for {alias}"
+            );
+        }
+        // And the other way round: every alias the registry hands to `crypto mounters` is one the
+        // CLI accepts back.
+        for service in cryptomator_mount::registry::all_services() {
+            let class = service.java_class_name();
+            let Some(alias) = alias_for_class(class) else {
+                continue;
+            };
+            assert_eq!(
+                resolve_mounter(alias).expect("the registry's alias resolves"),
+                class,
+                "{alias} is printed by `crypto mounters` but unknown to --mounter"
+            );
+        }
     }
 }

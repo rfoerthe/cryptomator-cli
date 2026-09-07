@@ -59,9 +59,6 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     // Before the password: an unusable mounter name is a usage error, not a failed unlock.
     let mounter = args.mounter.as_deref().map(resolve_mounter).transpose()?;
     let (vault, path) = locked_vault(ctx, &args.vault)?;
-    // Refuses a vault a daemon is already serving, or whose volume a crashed daemon left behind
-    // (`crypto lock --force` is the way out of the latter -- the same hint `crypto fs` gets).
-    ctx.registry().require_locked(&vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?
@@ -87,6 +84,7 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
         mounter,
         mount_point,
         mount_options: args.mount_option.clone(),
+        port: args.port,
         // `None`, not `Some(false)`: without the flag the vault's own `usesReadOnlyMode` decides.
         read_only: args.read_only.then_some(true),
         volume_name: args.volume_name.clone(),
@@ -307,10 +305,38 @@ fn report(
         }),
         || format!("Unlocked {name} at {mountpoint}"),
     )?;
+    // A URL is not something the shell can `cd` into: the one line that says what to do with it
+    // goes to stderr, so `--json`'s document on stdout keeps its shape.
+    if is_url(mountpoint) {
+        eprintln!("{}", url_hint(mountpoint));
+    }
     if args.reveal || vault.action_after_unlock == WhenUnlocked::Reveal {
         reveal(mountpoint, info.as_ref().map(|i| i.mounter.as_str()));
     }
     Ok(exit::OK)
+}
+
+/// Whether the daemon answered with a URL instead of a path -- what the WebDAV back ends serve.
+///
+/// A mount point is always absolute (`absolute_mount_point`, and the daemon's own default), so the
+/// two cannot be confused.
+fn is_url(mountpoint: &str) -> bool {
+    !mountpoint.starts_with('/') && mountpoint.contains("://")
+}
+
+/// The one line telling the user how to mount a WebDAV URL by hand. The vault is served the moment
+/// `unlock` returns; mounting it in the file manager is a separate, optional step.
+fn url_hint(url: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("Mount it in Finder: Go -> Connect to Server, then enter {url}")
+    } else {
+        // `gio` wants the WebDAV scheme, not the HTTP one: `gio mount http://…` is a download,
+        // `gio mount dav://…` is the volume. The file manager's dialog takes either.
+        format!(
+            "Mount it with `gio mount {}`, or in the file manager: Other Locations -> Connect to Server",
+            url.replacen("http://", "dav://", 1)
+        )
+    }
 }
 
 /// Opens the mount point in the desktop's file manager, best effort: a missing `open`/`xdg-open`
@@ -357,6 +383,11 @@ fn reveal_command(
     overridden: Option<&str>,
 ) -> Option<Vec<String>> {
     if mountpoint.is_empty() {
+        return None;
+    }
+    // A WebDAV URL is skipped even with the override: the opener would hand it to a browser, and a
+    // browser is not the vault. The hint printed above is what the user needs instead.
+    if is_url(mountpoint) {
         return None;
     }
     let mut argv: Vec<String> = match overridden.map(str::trim).filter(|cmd| !cmd.is_empty()) {
@@ -483,6 +514,37 @@ mod tests {
             reveal_command("/mnt/v", Some(NULL_MOUNTER_CLASS), Some("/bin/echo")),
             Some(vec!["/bin/echo".to_owned(), "/mnt/v".to_owned()])
         );
+    }
+
+    #[test]
+    fn a_webdav_url_is_recognised_and_never_opened() {
+        assert!(is_url("http://127.0.0.1:42427/AAAAAAAAAAAA"));
+        assert!(is_url("dav://127.0.0.1:42427/AAAAAAAAAAAA"));
+        assert!(!is_url("/mnt/v"), "a mount point is always absolute");
+        assert!(!is_url("/mnt/http://weird"), "still a path");
+        assert!(!is_url(""), "no mount point at all is no URL either");
+        // Not even the test override opens a URL: a browser is not the vault.
+        assert_eq!(
+            reveal_command(
+                "http://127.0.0.1:42427/AAAAAAAAAAAA",
+                Some("org.cryptomator.frontend.webdav.mount.FallbackMounter"),
+                Some("/bin/echo")
+            ),
+            None
+        );
+        let hint = url_hint("http://127.0.0.1:42427/AAAAAAAAAAAA");
+        assert!(
+            hint.contains("http://127.0.0.1:42427/AAAAAAAAAAAA"),
+            "{hint}"
+        );
+        assert!(hint.contains("Connect to Server"), "{hint}");
+        if !cfg!(target_os = "macos") {
+            // `gio` takes the WebDAV scheme, not the HTTP one.
+            assert!(
+                hint.contains("dav://127.0.0.1:42427/AAAAAAAAAAAA"),
+                "{hint}"
+            );
+        }
     }
 
     #[test]

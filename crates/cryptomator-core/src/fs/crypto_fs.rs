@@ -166,16 +166,31 @@ impl CryptoFs {
         }
     }
 
-    /// `assertCleartextNameLengthAllowed` (chars, like Java's `String.length()` for BMP names)
-    fn assert_cleartext_name_length_allowed(&self, path: &CleartextPath) -> io::Result<()> {
-        let len = path.file_name().map(|n| n.chars().count()).unwrap_or(0);
-        if len > self.options.max_cleartext_name_length {
+    /// Whether a cleartext name fits the vault's shortening scheme, without touching the disk.
+    ///
+    /// This is the same check [`Self::open_file`], [`Self::create_dir`], [`Self::rename`] and
+    /// [`Self::copy`] run on the write path (`assertCleartextNameLengthAllowed`, chars like Java's
+    /// `String.length()` for BMP names) before they report a generic `InvalidInput`. It is `pub`
+    /// so an adapter that wants to reject an over-long name early -- with its own, more specific
+    /// error -- can call the vault's actual policy instead of reimplementing it and drifting from
+    /// it silently.
+    pub fn check_cleartext_name(&self, name: &str) -> io::Result<()> {
+        if name.chars().count() > self.options.max_cleartext_name_length {
             return Err(super::name_too_long(
-                path,
+                name,
                 self.options.max_cleartext_name_length,
             ));
         }
         Ok(())
+    }
+
+    /// `assertCleartextNameLengthAllowed` applied to `path`'s last component; a path with none
+    /// (the root) trivially fits.
+    fn assert_cleartext_name_length_allowed(&self, path: &CleartextPath) -> io::Result<()> {
+        let Some(name) = path.file_name() else {
+            return Ok(());
+        };
+        self.check_cleartext_name(name)
     }
 
     fn lister(&self) -> DirectoryLister<'_> {

@@ -196,6 +196,9 @@ impl ChannelSender {
 /// `writev` is a parameter rather than the file descriptor so the loop is testable with a writer
 /// that accepts a fixed number of bytes per call.
 ///
+/// The first `writev` is made against the caller's own slice list; only a short write allocates the
+/// owned copy the resume loop needs.
+///
 /// # Errors
 /// [`io::ErrorKind::WriteZero`] if the writer accepts nothing while bytes are still pending, and
 /// whatever `writev` reports other than `EINTR`, which is retried.
@@ -203,9 +206,30 @@ fn write_all_vectored(
     bufs: &[io::IoSlice<'_>],
     mut writev: impl FnMut(&[io::IoSlice<'_>]) -> nix::Result<usize>,
 ) -> io::Result<()> {
+    if bufs.is_empty() {
+        return Ok(());
+    }
+    let total: usize = bufs.iter().map(|buf| buf.len()).sum();
+    // The fast path, and the only one `/dev/fuse` ever takes: one `writev` moves the whole reply
+    // and nothing is allocated. `IoSlice::advance_slices` needs an owned, writable slice list, so
+    // the copy below is made only when a write really did come up short -- which is FUSE-T's
+    // stream socket, not the character device.
+    let already = match writev(bufs) {
+        Ok(written) if written == total => return Ok(()),
+        Ok(0) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "the FUSE channel accepted none of the reply",
+            ));
+        }
+        Ok(written) => written,
+        Err(Errno::EINTR) => 0,
+        Err(err) => return Err(err.into()),
+    };
     // `advance_slices` needs to rewrite the slice list in place, and the caller's is shared.
     let mut owned: Vec<io::IoSlice<'_>> = bufs.to_vec();
     let mut rest: &mut [io::IoSlice<'_>] = &mut owned;
+    io::IoSlice::advance_slices(&mut rest, already);
     while !rest.is_empty() {
         match writev(rest) {
             Ok(0) => {
@@ -259,6 +283,28 @@ mod send_test {
         .expect("the write completes");
         assert_eq!(sink.into_inner(), b"header--payload!");
         assert_eq!(calls.into_inner(), 6, "16 bytes at 3 bytes per call");
+    }
+
+    /// The fast path the fork added for `/dev/fuse`: a reply that goes out in one `writev` is
+    /// handed the caller's own slice list, so nothing is copied. The pointer identity is the
+    /// observable part -- an owned copy would be a different list -- and the single call is the
+    /// other half of it.
+    #[test]
+    fn a_full_write_passes_the_callers_own_slices_and_copies_nothing() {
+        let calls = RefCell::new(0usize);
+        let bufs = slices(&[b"header--", b"payload", b"!"]);
+        let callers_list = bufs.as_ptr();
+        write_all_vectored(&bufs, |slices| {
+            *calls.borrow_mut() += 1;
+            assert!(
+                std::ptr::eq(slices.as_ptr(), callers_list),
+                "the first writev gets the caller's list, not an owned copy of it"
+            );
+            assert_eq!(slices.len(), 3, "and all of it, unchanged");
+            Ok(slices.iter().map(|s| s.len()).sum())
+        })
+        .expect("the write completes");
+        assert_eq!(calls.into_inner(), 1, "one writev, no resume loop");
     }
 
     #[test]

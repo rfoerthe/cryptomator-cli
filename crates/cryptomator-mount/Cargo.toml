@@ -8,12 +8,27 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["fuse"]
+default = ["fuse", "webdav"]
 fuse = ["dep:fuser", "dep:libloading"]
+webdav = [
+    "dep:dav-server",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:tokio",
+    "dep:bytes",
+    "dep:futures-util",
+]
 
 [dependencies]
+bytes = { workspace = true, optional = true }
 cryptomator-core = { path = "../cryptomator-core" }
+dav-server = { workspace = true, optional = true }
 fuser = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 libc = { workspace = true }
 libloading = { workspace = true, optional = true }
 log = { workspace = true }
@@ -21,8 +36,11 @@ nix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 cryptomator-core = { path = "../cryptomator-core", features = ["det-rng"] }
+hyper = { workspace = true, features = ["client"] }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }

@@ -8,9 +8,10 @@
 //! platform; only the registry restricts it to Linux, where `fusermount3` exists.
 use crate::api::{Mount, MountBuilder, MountCapability, MountError, MountService, UnmountError};
 use crate::flags::{current_uid_gid, parse_mount_flags, AdapterOptions, MountFlags};
-use crate::fuse::mount::{probe_command, run_unmount_command, FuseMount};
+use crate::fuse::mount::FuseMount;
 use crate::fuse::ops::{VaultOps, VaultOpsConfig};
 use crate::fuse::session::{FuseSessionHandle, Unmounter};
+use crate::process::{probe_command, run_unmount_command};
 use crate::registry::LINUX_FUSE_CLASS;
 use crate::transcoder::{FuseNormalization, NameTranscoder};
 use cryptomator_core::fs::CryptoFs;

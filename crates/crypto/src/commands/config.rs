@@ -27,6 +27,7 @@ pub const CLI_KEYS: &[&str] = &[
     "defaultMounter",
     "logLevel",
     "forceUnmountOnSignalAfterSecs",
+    "webdavBind",
 ];
 
 /// The log levels the daemon understands, in increasing verbosity.
@@ -52,7 +53,8 @@ fn cli_config_path(ctx: &Ctx) -> PathBuf {
 ///
 /// `mountPointsDir` is the **effective** value -- the platform default when nothing is configured
 /// -- because that is what the next `crypto unlock` will use. Without `$HOME` there is no default
-/// to compute, and the raw value (usually `null`) is printed instead.
+/// to compute, and the raw value (usually `null`) is printed instead. `webdavBind` is effective
+/// for the same reason: `127.0.0.1` is what the next WebDAV mount binds.
 pub fn cli_config_json(cli: &CliConfig) -> Value {
     let mount_points_dir = match std::env::var_os("HOME") {
         Some(home) => Some(
@@ -62,11 +64,18 @@ pub fn cli_config_json(cli: &CliConfig) -> Value {
         ),
         None => cli.mount_points_dir.clone(),
     };
+    // A value the parser cannot make sense of is printed verbatim: `config get` has to be able to
+    // show what is in the file, even when the next unlock will refuse it.
+    let webdav_bind = match cli.webdav_bind_addr() {
+        Ok(addr) => Some(addr.to_string()),
+        Err(_) => cli.webdav_bind.clone(),
+    };
     json!({
         "mountPointsDir": mount_points_dir,
         "defaultMounter": cli.default_mounter,
         "logLevel": cli.log_level,
         "forceUnmountOnSignalAfterSecs": cli.force_unmount_on_signal_after_secs,
+        "webdavBind": webdav_bind,
     })
 }
 
@@ -227,6 +236,23 @@ fn set_cli(ctx: &Ctx, key: &str, value: &str) -> Result<u8> {
                         .to_string(),
                 })?;
         }
+        "webdavBind" => {
+            reject_empty(key, value, "pass a loopback IP address, e.g. 127.0.0.1")?;
+            let addr: std::net::IpAddr =
+                value.trim().parse().map_err(|_| AppError::InvalidValue {
+                    key: key.to_string(),
+                    message: format!("expected an IP address, got {value:?}"),
+                })?;
+            // The same rule the daemon applies, checked here so a value that could never work is
+            // never written (`cryptomator_mount::webdav::check_bind_address`).
+            cryptomator_mount::webdav::check_bind_address(addr).map_err(|e| {
+                AppError::InvalidValue {
+                    key: key.to_string(),
+                    message: e.to_string(),
+                }
+            })?;
+            cli.webdav_bind = Some(addr.to_string());
+        }
         // Unreachable: `set` dispatches here only for a key in `CLI_KEYS`.
         _ => return Err(unknown_key(key).into()),
     }
@@ -260,5 +286,20 @@ mod tests {
         assert_eq!(rendered["logLevel"], "info");
         assert_eq!(rendered["forceUnmountOnSignalAfterSecs"], 10);
         assert!(rendered["defaultMounter"].is_null());
+        assert_eq!(
+            rendered["webdavBind"], "127.0.0.1",
+            "the effective address, like mountPointsDir"
+        );
+    }
+
+    /// A value the file carries but the parser refuses is still printed: `config get` shows what
+    /// is there, and the unlock that would use it says why it cannot.
+    #[test]
+    fn an_unparsable_webdav_bind_is_rendered_verbatim() {
+        let cli = CliConfig {
+            webdav_bind: Some("localhost".to_owned()),
+            ..CliConfig::default()
+        };
+        assert_eq!(cli_config_json(&cli)["webdavBind"], "localhost");
     }
 }

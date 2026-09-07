@@ -23,6 +23,30 @@ fn no_arguments_prints_help_and_exits_with_usage_code() {
         .stderr(predicate::str::contains("Usage: crypto"));
 }
 
+/// The alias list `vault set --mounter` prints has to name every alias `unlock --mounter` takes:
+/// a value this help text omits is still stored and still mounted, and the WebDAV ones were
+/// missing.
+#[test]
+fn vault_set_help_lists_every_mounter_alias() {
+    let assertion = Command::cargo_bin("crypto")
+        .unwrap()
+        .args(["vault", "set", "--help"])
+        .assert()
+        .success();
+    let help = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    for alias in [
+        "fuse-t",
+        "macfuse",
+        "fuse",
+        "null",
+        "webdav",
+        "webdav-applescript",
+        "webdav-gio",
+    ] {
+        assert!(help.contains(alias), "`{alias}` is missing from:\n{help}");
+    }
+}
+
 const VALID_KEY: &str = "pathway lift abuse plenty export texture gentleman landscape beyond ceiling around leaf cafe charity border breakdown victory surely computer cat linger restrict infer crowd live computer true written amazed investor boot depth left theory snow whereby terminal weekly reject happiness circuit partial cup ad";
 
 #[test]
@@ -910,6 +934,12 @@ fn password_change_new_password_error_names_the_new_password_flags() {
 
 /// The class name of the mount service that mounts nothing.
 const NULL_MOUNTER: &str = "org.cryptomator.cli.NullMountProvider";
+/// The WebDAV mounter that mounts nothing and only serves the URL.
+const FALLBACK_WEBDAV: &str = "org.cryptomator.frontend.webdav.mount.FallbackMounter";
+/// The macOS WebDAV mounter, which hands the URL to Finder.
+const MAC_APPLESCRIPT: &str = "org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter";
+/// The Linux WebDAV mounter, which hands the URL to `gio`.
+const LINUX_GIO: &str = "org.cryptomator.frontend.webdav.mount.LinuxGioMounter";
 /// Makes the null mounter usable; without it, it is listed but not supported.
 const ENABLE_NULL: &str = "CRYPTO_ENABLE_NULL_MOUNTER";
 
@@ -966,6 +996,36 @@ fn mounters_lists_the_mount_services() {
         .stdout(predicate::str::contains("CAPABILITIES"))
         .stdout(predicate::str::contains("null"))
         .stdout(predicate::str::contains(NULL_MOUNTER));
+}
+
+/// The WebDAV back ends need nothing installed, so the fallback is the one mount service that is
+/// supported on every machine this test can run on -- which is what makes `--mounter webdav`
+/// something a script may rely on. Its OS-integrated sibling is listed beside it.
+#[test]
+fn the_webdav_mounters_are_listed_with_their_aliases() {
+    let sb = Sandbox::new();
+    let all = json_of(&mut sb.crypto(&["--json", "mounters", "--all"]));
+    let fallback = service(&all, FALLBACK_WEBDAV).expect("the fallback mounter is listed");
+    assert_eq!(fallback["alias"], "webdav");
+    assert_eq!(
+        fallback["supported"], true,
+        "the fallback needs no driver: {fallback}"
+    );
+    let (os_class, os_alias) = if cfg!(target_os = "macos") {
+        (MAC_APPLESCRIPT, "webdav-applescript")
+    } else {
+        (LINUX_GIO, "webdav-gio")
+    };
+    let os_mounter = service(&all, os_class).expect("the platform's WebDAV mounter is listed");
+    assert_eq!(os_mounter["alias"], os_alias);
+
+    // Both are listed with their alias in the human table too, which is where a user reads them.
+    sb.crypto(&["mounters", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("webdav"))
+        .stdout(predicate::str::contains(os_alias))
+        .stdout(predicate::str::contains(FALLBACK_WEBDAV));
 }
 
 #[test]
@@ -1046,11 +1106,46 @@ fn config_get_and_set_the_cli_settings() {
         .assert()
         .code(2);
 
+    // `webdavBind`: the effective loopback default without a value, and only a loopback address
+    // is accepted -- the WebDAV server has no authentication.
+    sb.crypto(&["config", "get", "webdavBind"])
+        .assert()
+        .success()
+        .stdout("127.0.0.1\n");
+    sb.crypto(&["config", "set", "webdavBind", "10.0.0.1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("loopback"))
+        .stderr(predicate::str::contains("CRYPTO_WEBDAV_ALLOW_NONLOOPBACK"));
+    sb.crypto(&["config", "set", "webdavBind", "localhost"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("IP address"));
+    sb.crypto(&["config", "set", "webdavBind", "127.0.0.2"])
+        .assert()
+        .success()
+        .stdout("webdavBind=127.0.0.2\n");
+    assert_eq!(cli_json()["webdavBind"], "127.0.0.2");
+    sb.crypto(&["config", "get", "webdavBind"])
+        .assert()
+        .success()
+        .stdout("127.0.0.2\n");
+    // The override the daemon honours is honoured here too, so a value that would work is not
+    // refused at set time.
+    sb.crypto(&["config", "set", "webdavBind", "10.0.0.1"])
+        .env("CRYPTO_WEBDAV_ALLOW_NONLOOPBACK", "1")
+        .assert()
+        .success();
+    sb.crypto(&["config", "set", "webdavBind", "127.0.0.1"])
+        .assert()
+        .success();
+
     // One `config get` shows the settings.json keys and the cli.json keys together.
     let all = json_of(&mut sb.crypto(&["--json", "config", "get"]));
     assert_eq!(all["port"], 42427);
     assert_eq!(all["logLevel"], "debug");
     assert_eq!(all["forceUnmountOnSignalAfterSecs"], 30);
+    assert_eq!(all["webdavBind"], "127.0.0.1");
     assert!(all["defaultMounter"].is_null());
     sb.crypto(&["config", "get"])
         .assert()

@@ -19,6 +19,14 @@ pub const LINUX_FUSE_CLASS: &str = "org.cryptomator.frontend.fuse.mount.LinuxFus
 pub const MAC_FUSE_CLASS: &str = "org.cryptomator.frontend.fuse.mount.MacFuseMountProvider";
 /// `org.cryptomator.frontend.fuse.mount.FuseTMountProvider`.
 pub const FUSE_T_CLASS: &str = "org.cryptomator.frontend.fuse.mount.FuseTMountProvider";
+/// `org.cryptomator.frontend.webdav.mount.FallbackMounter`.
+pub const FALLBACK_WEBDAV_CLASS: &str = "org.cryptomator.frontend.webdav.mount.FallbackMounter";
+/// `org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter`. Ungated, like the other class
+/// names, so a build without the `webdav` feature can still recognise a stored `mounter` setting.
+pub const MAC_APPLESCRIPT_CLASS: &str =
+    "org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter";
+/// `org.cryptomator.frontend.webdav.mount.LinuxGioMounter`.
+pub const LINUX_GIO_CLASS: &str = "org.cryptomator.frontend.webdav.mount.LinuxGioMounter";
 /// The null mounter has no Java counterpart; the name follows the CLI's own package.
 pub const NULL_MOUNTER_CLASS: &str = "org.cryptomator.cli.NullMountProvider";
 
@@ -35,6 +43,11 @@ const ALIASES: &[(&str, &str)] = &[
     ("macfuse", MAC_FUSE_CLASS),
     ("fuse-t", FUSE_T_CLASS),
     ("fuse", LINUX_FUSE_CLASS),
+    // `webdav` is the name scripts use for the plain URL; the two OS-integrated WebDAV mounters
+    // have their own names, so a script can ask for the Finder volume rather than the URL.
+    ("webdav", FALLBACK_WEBDAV_CLASS),
+    ("webdav-applescript", MAC_APPLESCRIPT_CLASS),
+    ("webdav-gio", LINUX_GIO_CLASS),
     ("null", NULL_MOUNTER_CLASS),
 ];
 
@@ -63,7 +76,8 @@ pub fn conflicting_classes(class: &str) -> &'static [&'static str] {
 }
 
 /// Every service this build knows, whether or not it works here: the platform's FUSE services by
-/// descending priority, then the null mounter.
+/// descending priority, then the platform's OS-integrated WebDAV mounter, then the WebDAV
+/// fallback, then the null mounter.
 pub fn all_services() -> Vec<Box<dyn MountService>> {
     let mut services: Vec<Box<dyn MountService>> = Vec::new();
     #[cfg(all(feature = "fuse", target_os = "macos"))]
@@ -75,6 +89,18 @@ pub fn all_services() -> Vec<Box<dyn MountService>> {
     {
         services.push(Box::new(crate::fuse::linux::LinuxFuseMountProvider));
     }
+    // `@Priority(50)`, i.e. below every FUSE back end and above the fallback. Pushed after the
+    // FUSE services and before the sort, which is stable, so an equal priority never overtakes
+    // them.
+    #[cfg(all(feature = "webdav", target_os = "macos"))]
+    services.push(Box::new(crate::webdav::os_mount::MacAppleScriptMounter));
+    #[cfg(all(feature = "webdav", target_os = "linux"))]
+    services.push(Box::new(crate::webdav::os_mount::LinuxGioMounter));
+    // `@Priority(Priority.FALLBACK)`: below every FUSE back end, above nothing but the null
+    // mounter. Pushed before the sort, which is stable, so it stays behind the equally ranked
+    // services that came first.
+    #[cfg(feature = "webdav")]
+    services.push(Box::new(crate::webdav::fallback::FallbackMounter));
     services.sort_by_key(|service| std::cmp::Reverse(service.priority()));
     services.push(Box::new(NullMountProvider::new()));
     services
@@ -429,13 +455,21 @@ mod tests {
             priorities.windows(2).all(|w| w[0] >= w[1]),
             "descending priorities, got {priorities:?}"
         );
+        // Spelled out per feature set rather than as one literal, so that every build this
+        // crate has -- `--no-default-features` included -- pins the whole order.
+        let mut expected: Vec<&str> = Vec::new();
         #[cfg(all(feature = "fuse", target_os = "macos"))]
-        assert_eq!(
-            classes,
-            vec![MAC_FUSE_CLASS, FUSE_T_CLASS, NULL_MOUNTER_CLASS]
-        );
+        expected.extend([MAC_FUSE_CLASS, FUSE_T_CLASS]);
         #[cfg(all(feature = "fuse", target_os = "linux"))]
-        assert_eq!(classes, vec![LINUX_FUSE_CLASS, NULL_MOUNTER_CLASS]);
+        expected.extend([LINUX_FUSE_CLASS]);
+        #[cfg(all(feature = "webdav", target_os = "macos"))]
+        expected.extend([MAC_APPLESCRIPT_CLASS]);
+        #[cfg(all(feature = "webdav", target_os = "linux"))]
+        expected.extend([LINUX_GIO_CLASS]);
+        #[cfg(feature = "webdav")]
+        expected.extend([FALLBACK_WEBDAV_CLASS]);
+        expected.extend([NULL_MOUNTER_CLASS]);
+        assert_eq!(classes, expected);
     }
 
     #[test]
@@ -470,6 +504,12 @@ mod tests {
         assert_eq!(alias_for_class(FUSE_T_CLASS), Some("fuse-t"));
         assert_eq!(alias_for_class(MAC_FUSE_CLASS), Some("macfuse"));
         assert_eq!(alias_for_class(LINUX_FUSE_CLASS), Some("fuse"));
+        assert_eq!(alias_for_class(FALLBACK_WEBDAV_CLASS), Some("webdav"));
+        assert_eq!(
+            alias_for_class(MAC_APPLESCRIPT_CLASS),
+            Some("webdav-applescript")
+        );
+        assert_eq!(alias_for_class(LINUX_GIO_CLASS), Some("webdav-gio"));
         assert_eq!(alias_for_class("org.example.Nope"), None);
     }
 

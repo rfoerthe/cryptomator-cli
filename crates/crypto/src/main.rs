@@ -65,6 +65,15 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         state_dir,
         settings_arg,
     };
+    // Before the command runs, not after it wrote: the `flock` only serialises `crypto` against
+    // `crypto`, and the user should know about the remaining gap while there is still time to
+    // quit the app. stderr, so `--json` output stays machine-readable.
+    if writes_settings(&cli.command) && ctx.store.desktop_app_running() {
+        eprintln!(
+            "warning: the Cryptomator desktop app is running; changes to settings.json may be \
+             overwritten by it"
+        );
+    }
     match cli.command {
         Command::Vault { command } => match command {
             VaultCommand::Create(args) => commands::vault::create(&ctx, args),
@@ -113,6 +122,37 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Events(args) => commands::events::events(&ctx, args),
         Command::Mounters(args) => commands::mounters::mounters(&ctx, args),
         Command::Daemon(args) => commands::daemon::run(&ctx, args),
+    }
+}
+
+/// Whether `command` writes `settings.json`, and therefore whether a running desktop app can lose
+/// its changes to it (or the other way round).
+///
+/// Read-only commands stay silent: nothing they do can be lost, and a warning on every
+/// `crypto status` would train the user to ignore it. `password change` and `recovery-key` are
+/// silent too -- they rewrite the masterkey file inside the vault, which the desktop app does not
+/// hold a competing copy of.
+fn writes_settings(command: &Command) -> bool {
+    match command {
+        // `list` and `info` only read; everything else in `vault` rewrites the vault list.
+        Command::Vault { command } => {
+            !matches!(command, VaultCommand::List | VaultCommand::Info { .. })
+        }
+        // `set` on a `cli.json` key writes only that file, but the warning is about the desktop
+        // app's settings as a whole and the key is not worth a second, quieter rule.
+        Command::Config { command } => matches!(command, ConfigCommand::Set { .. }),
+        // `unlock` persists the probed cleartext file name length of the vault it opens.
+        Command::Unlock(_) => true,
+        Command::Password { .. }
+        | Command::RecoveryKey { .. }
+        | Command::Fs { .. }
+        | Command::Name { .. }
+        | Command::Lock(_)
+        | Command::Status(_)
+        | Command::Stats(_)
+        | Command::Events(_)
+        | Command::Mounters(_)
+        | Command::Daemon(_) => false,
     }
 }
 

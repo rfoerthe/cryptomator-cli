@@ -69,3 +69,60 @@ jobs:
       # The same proof one level up, and the one that matters most on FUSE-T: `crypto unlock` must
       # not answer before the volume is visible.
       - run: CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored
+
+  # The WebDAV end-to-end tests that mount a real volume. `webdav-applescript` asks Finder, through
+  # `osascript -e 'mount volume …'`, so it needs a GUI (window server) session that a hosted runner
+  # may not have -- and macOS may put a "connect to an unencrypted server?" dialog in the way, since
+  # there is no keychain item to suppress it (writing one is M6). Both tests print "skipped: …" and
+  # pass when the mounter is not supported here, so a green job is only meaningful together with the
+  # "mounted at …" line in its log; `continue-on-error` keeps it advisory either way. The
+  # HTTP-level tests (crates/cryptomator-mount/tests/webdav_http.rs) need none of this and run in
+  # the ordinary `test` job above.
+  webdav-e2e-macos:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: CRYPTO_E2E_WEBDAV=1 cargo test -p cryptomator-mount --test webdav_e2e --locked -- --ignored --nocapture
+      # The same proof one level up, through the CLI: `crypto unlock --mounter webdav-applescript`
+      # must answer with a /Volumes path that a write really travels through into the vault.
+      - run: CRYPTO_E2E_WEBDAV=1 cargo test -p crypto --test cli_daemon --locked -- --ignored --nocapture
+
+  # Linux runners have no gvfs session, so `gio mount` cannot work here and `webdav-gio` has no
+  # end-to-end job. What is checked instead is the server itself, over HTTP, exactly as a
+  # `gio`/Nautilus/Finder client would talk to it -- and one level up, through `crypto unlock`.
+  webdav-e2e-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p crypto
+      - name: serve a vault over WebDAV and talk to it with curl
+        run: |
+          # Deliberately no `set -x`: a trace would put the vault password into a public log.
+          set -euo pipefail
+          CRYPTO="$PWD/target/debug/crypto"
+          export HOME="$RUNNER_TEMP/home"
+          export CRYPTO_SETTINGS_PATH="$RUNNER_TEMP/settings.json"
+          export CRYPTO_STATE_DIR="$RUNNER_TEMP/state"
+          mkdir -p "$HOME" "$CRYPTO_STATE_DIR"
+          PW="$RUNNER_TEMP/pw"
+          (umask 077; printf 'ci-password-123' > "$PW")
+          trap '"$CRYPTO" lock --all >/dev/null 2>&1 || true; rm -f "$PW"' EXIT
+          "$CRYPTO" vault create "$RUNNER_TEMP/v" --password-file "$PW"
+          # `--port 0`: any free port, so the job never fights anything else on 42427.
+          URL=$("$CRYPTO" --json unlock v --mounter webdav --port 0 --password-file "$PW" \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["mountpoint"])')
+          echo "serving at $URL"
+          curl -sf -X PROPFIND -H 'Depth: 1' "$URL/" -o /dev/null
+          printf 'hello\n' > "$RUNNER_TEMP/ci.txt"
+          curl -sf -T "$RUNNER_TEMP/ci.txt" "$URL/ci.txt"
+          test "$(curl -sf "$URL/ci.txt")" = hello
+          curl -sf -X MKCOL "$URL/dir" -o /dev/null
+          curl -sf -X DELETE "$URL/dir" -o /dev/null
+          "$CRYPTO" lock v
+          # The bytes went through the server into the vault, not past it.
+          "$CRYPTO" fs cat v /ci.txt --password-file "$PW" | grep -qx hello

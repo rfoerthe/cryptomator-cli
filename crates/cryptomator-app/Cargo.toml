@@ -9,12 +9,15 @@ rust-version.workspace = true
 
 [dependencies]
 cryptomator-core = { path = "../cryptomator-core" }
-cryptomator-mount = { path = "../cryptomator-mount" }
+# The features are named explicitly: a `--no-default-features` build of the mount crate must not
+# silently take the WebDAV back ends (and with them `crypto unlock --mounter webdav`) away here.
+cryptomator-mount = { path = "../cryptomator-mount", features = ["fuse", "webdav"] }
 clap.workspace = true
 data-encoding.workspace = true
 # `std` for `log::set_boxed_logger`, which the daemon installs (see `daemon::logging`).
 log = { workspace = true, features = ["std"] }
-nix = { workspace = true, features = ["process", "signal", "user"] }
+# `fs` for `fcntl::Flock`, the lock around every `settings.json` write.
+nix = { workspace = true, features = ["process", "signal", "user", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

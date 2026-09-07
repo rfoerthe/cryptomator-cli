@@ -173,7 +173,7 @@ impl VaultRegistry {
             return Ok((RuntimeState::Unlocked, info));
         }
         if let Some(mountpoint) = info.as_ref().and_then(|i| i.mountpoint.as_deref()) {
-            if is_mountpoint(Path::new(mountpoint)) {
+            if is_local_path(mountpoint) && is_mountpoint(Path::new(mountpoint)) {
                 return Ok((RuntimeState::StaleMount, info));
             }
         }
@@ -291,6 +291,15 @@ impl VaultRegistry {
             actual: format!("{state}{where_}{hint}"),
         })
     }
+}
+
+/// Whether a run info's `mountpoint` can be looked up in the mount table at all.
+///
+/// Only an absolute path can. A URL is what the WebDAV back ends report, and a crashed WebDAV
+/// daemon leaves nothing to take down -- its server died with it -- so such a mount point is never
+/// a stale mount, only a leftover state file.
+fn is_local_path(mountpoint: &str) -> bool {
+    mountpoint.starts_with('/')
 }
 
 #[cfg(test)]
@@ -511,6 +520,42 @@ mod tests {
             .expect_err("the fs commands refuse a stale mount");
         assert!(matches!(err, AppError::WrongState { .. }), "{err:?}");
         assert!(err.to_string().contains("mounted at /"), "{err}");
+    }
+
+    /// A WebDAV daemon that crashed leaves nothing behind: there is no volume in the mount table,
+    /// so the state files are leftovers and the vault is simply locked again.
+    #[test]
+    fn a_uri_mountpoint_is_never_a_stale_mount() {
+        let f = fixture();
+        let files = f.registry.state_dir().files("AAAAAAAAAAAA");
+        let mut info = run_info(dead_pid(), Some("http://127.0.0.1:42427/AAAAAAAAAAAA"));
+        info.mounter = "org.cryptomator.frontend.webdav.mount.FallbackMounter".to_owned();
+        files.write_info(&info).expect("write info");
+
+        let (state, info) = f.registry.runtime_state("AAAAAAAAAAAA").expect("state");
+        assert_eq!(
+            state,
+            RuntimeState::Locked,
+            "a URL is nothing `crypto lock --force` could take down"
+        );
+        assert!(info.is_none());
+        assert!(!files.info.exists(), "the leftovers are gone");
+
+        // Not STALE_MOUNT, so nothing blocks the next unlock either.
+        let vault = VaultSettingsJson::new("AAAAAAAAAAAA".to_owned(), &f.vault_path);
+        f.registry
+            .require_locked(&vault)
+            .expect("a URI mount point never blocks an unlock");
+    }
+
+    /// The rule behind it, on its own: only an absolute path is ever looked up in the mount table.
+    #[test]
+    fn only_an_absolute_path_is_looked_up_in_the_mount_table() {
+        assert!(is_local_path("/mnt/v"));
+        assert!(is_local_path("/"));
+        assert!(!is_local_path("http://127.0.0.1:42427/AAAAAAAAAAAA"));
+        assert!(!is_local_path("dav://localhost/v"));
+        assert!(!is_local_path(""));
     }
 
     #[test]

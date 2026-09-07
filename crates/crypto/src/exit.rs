@@ -56,6 +56,7 @@ fn app_code(err: &AppError) -> u8 {
         AppError::Io(_)
         | AppError::SettingsCorrupt { .. }
         | AppError::SettingsUnreadable { .. }
+        | AppError::SettingsLocked(_)
         | AppError::NoHomeDirectory => GENERAL,
     }
 }

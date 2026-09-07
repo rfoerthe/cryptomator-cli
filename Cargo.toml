@@ -47,10 +47,34 @@ rpassword = "7.5"
 unicode-normalization = "0.1"
 regex = "1"
 proptest = "1"
-nix = { version = "0.31", features = ["process", "signal", "user", "fs"] }
+nix = { version = "0.31", features = ["process", "signal", "user", "fs", "feature"] }
 libc = "0.2"
 signal-hook = "0.3"
 log = "0.4"
+
+# The WebDAV back end (feature `webdav` of cryptomator-mount): dav-server over a hyper 1.x
+# loopback server, driven by a small current-thread-capable tokio runtime.
+dav-server = { version = "0.11.0", default-features = false }
+hyper = { version = "1.11.1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = [
+    "tokio",
+    "server-graceful",
+    # `http1` is what carries hyper-util's `GracefulConnection` impl for an HTTP/1 connection.
+    "http1",
+] }
+http-body-util = "0.1.5"
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    # `macros` is for `tokio::select!` in the server's accept loop.
+    "macros",
+] }
+bytes = "1.12"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 
 # fuser is vendored under vendor/fuser: FUSE-T on macOS speaks the Linux struct layouts while
 # upstream fuser hard-codes the macFUSE ones. See vendor/fuser/README-VENDORED.md.

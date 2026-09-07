@@ -1107,6 +1107,71 @@ mod tests {
         );
     }
 
+    /// The case `InodeTable::rename` marks `unlinked` for: a file the kernel still holds an inode
+    /// for loses its name to a rename. POSIX says the old file survives for whoever holds it open,
+    /// and that its *name* is gone -- so anything that goes through the name has to say `ENOENT`.
+    #[test]
+    fn a_rename_over_a_held_inode_takes_the_name_away_from_it() {
+        let (_dir, ops) = test_ops(false);
+        let victim = ops
+            .create(
+                1,
+                OsStr::new("victim.txt"),
+                OpenFlags(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL),
+            )
+            .expect("create the victim");
+        assert_eq!(ops.write(victim.fh, 0, b"old").expect("write"), 3);
+        ops.release(victim.fh).expect("release");
+        let survivor = ops
+            .create(
+                1,
+                OsStr::new("survivor.txt"),
+                OpenFlags(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL),
+            )
+            .expect("create the survivor");
+        assert_eq!(ops.write(survivor.fh, 0, b"new!").expect("write"), 4);
+        ops.release(survivor.fh).expect("release");
+        let victim_ino = victim.attr.ino;
+        assert_ne!(victim_ino, survivor.attr.ino);
+
+        ops.rename(
+            1,
+            OsStr::new("survivor.txt"),
+            1,
+            OsStr::new("victim.txt"),
+            false,
+            false,
+        )
+        .expect("rename over the held inode");
+
+        // The kernel still has the victim's inode number and may use it: every path-based
+        // operation on it must fail, and none of them may touch the file that took the name.
+        assert_eq!(ops.getattr(victim_ino, None).unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            ops.setattr(victim_ino, None, Some(0), None, None)
+                .unwrap_err(),
+            Errno::ENOENT,
+            "a truncate through the stale inode must not reach the new occupant"
+        );
+
+        // The survivor is intact under the name it took, and keeps its own inode number.
+        let now = ops
+            .lookup(1, OsStr::new("victim.txt"))
+            .expect("the name resolves to the file that took it");
+        assert_eq!(now.ino, survivor.attr.ino);
+        assert_eq!(now.size, 4);
+        let fh = ops.open(now.ino, OpenFlags(libc::O_RDONLY)).expect("open");
+        assert_eq!(ops.read(fh, 0, 10).expect("read"), b"new!");
+        ops.release(fh).expect("release");
+        ops.setattr(now.ino, None, Some(0), None, None)
+            .expect("the survivor can still be truncated");
+        assert_eq!(ops.getattr(now.ino, None).expect("getattr").size, 0);
+
+        // Forgetting the nameless inode is a no-op, not a panic.
+        ops.forget(victim_ino, 1);
+        assert_eq!(ops.getattr(victim_ino, None).unwrap_err(), Errno::ENOENT);
+    }
+
     #[test]
     fn rmdir_sweeps_apple_double_files_when_configured() {
         for sweep in [false, true] {

@@ -19,6 +19,8 @@ pub const CLI_CONFIG_FILE_NAME: &str = "cli.json";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// How long a shutting-down daemon tries a graceful unmount before forcing it.
 pub const DEFAULT_FORCE_UNMOUNT_AFTER_SECS: u32 = 10;
+/// The address the WebDAV back ends bind to when `cli.json` does not say otherwise.
+pub const DEFAULT_WEBDAV_BIND: &str = "127.0.0.1";
 /// The mode `cli.json` is written with; it names the user's vault mount points.
 const FILE_MODE: u32 = 0o600;
 
@@ -35,6 +37,10 @@ pub struct CliConfig {
     pub log_level: String,
     /// Seconds a daemon waits for a graceful unmount on shutdown before forcing it.
     pub force_unmount_on_signal_after_secs: u32,
+    /// The address the WebDAV server binds to. `None` means [`DEFAULT_WEBDAV_BIND`]. A
+    /// non-loopback address is refused unless `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1`: the server has
+    /// no authentication.
+    pub webdav_bind: Option<String>,
     /// Every other key, preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -47,6 +53,7 @@ impl Default for CliConfig {
             default_mounter: None,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             force_unmount_on_signal_after_secs: DEFAULT_FORCE_UNMOUNT_AFTER_SECS,
+            webdav_bind: None,
             extra: Map::new(),
         }
     }
@@ -134,6 +141,24 @@ impl CliConfig {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
             _ => default_mount_points_dir(platform, home),
         }
+    }
+
+    /// The address the WebDAV server binds to.
+    ///
+    /// # Errors
+    /// [`AppError::InvalidValue`] for a value that is not an IP address. A host name is refused
+    /// on purpose: resolving one could point the server at an interface the user did not mean.
+    pub fn webdav_bind_addr(&self) -> Result<std::net::IpAddr> {
+        let raw = self
+            .webdav_bind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_WEBDAV_BIND);
+        raw.parse().map_err(|_| AppError::InvalidValue {
+            key: "webdavBind".to_owned(),
+            message: format!("expected an IP address, got {raw:?}"),
+        })
     }
 }
 
@@ -250,6 +275,49 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, FILE_MODE, "cli.json is written 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn the_webdav_bind_address_defaults_to_loopback_and_is_parsed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut cli = CliConfig::default();
+        assert_eq!(cli.webdav_bind, None);
+        assert_eq!(
+            cli.webdav_bind_addr().expect("the default"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        cli.webdav_bind = Some("  ".to_owned());
+        assert_eq!(
+            cli.webdav_bind_addr().expect("blank is unset"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        cli.webdav_bind = Some("::1".to_owned());
+        assert_eq!(
+            cli.webdav_bind_addr().expect("ipv6 loopback"),
+            "::1".parse::<IpAddr>().expect("ipv6")
+        );
+        cli.webdav_bind = Some("localhost".to_owned());
+        let err = cli
+            .webdav_bind_addr()
+            .expect_err("a name is not an address");
+        assert!(err.to_string().contains("webdavBind"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_next_to_webdav_bind_still_survives_a_round_trip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("cli.json");
+        std::fs::write(
+            &path,
+            br#"{"webdavBind":"127.0.0.2","somethingElse":{"a":1}}"#,
+        )
+        .expect("write");
+        let cli = CliConfig::load(&path).expect("load");
+        assert_eq!(cli.webdav_bind.as_deref(), Some("127.0.0.2"));
+        cli.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("\"webdavBind\": \"127.0.0.2\""), "{text}");
+        assert!(text.contains("somethingElse"), "{text}");
     }
 
     #[test]
