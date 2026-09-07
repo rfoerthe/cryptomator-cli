@@ -471,6 +471,7 @@ fn handle_request(shared: &Arc<Shared>, request: &mut Request, writer: &mut Unix
             mounter,
             mount_point,
             mount_options,
+            port,
             read_only,
             volume_name,
             max_cleartext_name_length,
@@ -485,9 +486,7 @@ fn handle_request(shared: &Arc<Shared>, request: &mut Request, writer: &mut Unix
                     mount_point: mount_point.as_deref().map(PathBuf::from),
                     mount_options: mount_options.clone(),
                     read_only: *read_only,
-                    // `--port` is not in the unlock request yet; until it is, a loopback mount
-                    // takes the port from `settings.json` or the vault (see `loopback_port`).
-                    port: None,
+                    port: *port,
                     volume_name: volume_name.clone(),
                 },
                 max_cleartext_name_length: *max_cleartext_name_length,
@@ -607,6 +606,13 @@ fn unlock(
             "the daemon is shutting down".to_owned(),
         ));
     }
+    // Before anything is mounted, and inside the unlock so the answer carries the reason: a
+    // `webdavBind` this process cannot use is `MOUNT_FAILED` (exit code 6), not a daemon that
+    // never comes up. `set_bind_address` applies the loopback rule itself
+    // (`CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` overrides it) and is process-wide, which is what the
+    // WebDAV builders read.
+    cryptomator_mount::webdav::set_bind_address(shared.config.cli.webdav_bind_addr()?)
+        .map_err(|e| AppError::MountFailed(e.to_string()))?;
     let vault_id = &shared.config.vault_id;
     let settings = shared.config.store.load()?;
     let vault = settings
@@ -631,7 +637,18 @@ fn unlock(
             other => AppError::MountFailed(other.to_string()),
         })?;
 
-    let read_only = overrides.read_only.unwrap_or(vault.uses_read_only_mode);
+    let request = MountRequest {
+        vault,
+        settings: &settings,
+        cli: &shared.config.cli,
+        home: &shared.config.home,
+        overrides,
+        running_services: running_services(&shared.config.state_dir, vault_id),
+    };
+    // The mounter's own rule, not a second copy of it: for a service whose read-only mode follows
+    // the file system (the WebDAV back ends) this `CryptoFs` is the only thing that makes the
+    // volume read-only, so the two must never disagree (`mounting::read_only`).
+    let read_only = mounting::read_only(&request);
     let fs = Arc::new(CryptoFs::open(
         opened,
         CryptoFsOptions {
@@ -644,15 +661,6 @@ fn unlock(
             events: shared.events.sink(),
         },
     ));
-
-    let request = MountRequest {
-        vault,
-        settings: &settings,
-        cli: &shared.config.cli,
-        home: &shared.config.home,
-        overrides,
-        running_services: running_services(&shared.config.state_dir, vault_id),
-    };
     let handle = match mounting::mount(&request, &shared.config.services, Arc::clone(&fs)) {
         Ok(handle) => handle,
         Err(err) => {
@@ -1758,7 +1766,10 @@ mod tests {
     use cryptomator_core::constants::DEFAULT_KEY_ID;
     use cryptomator_core::{initialize, CipherCombo, OsRng};
     use cryptomator_mount::api::{Mount, MountBuilder, MountCapability, MountError, UnmountError};
-    use cryptomator_mount::registry::{NullMountProvider, NULL_MOUNTER_CLASS, NULL_MOUNT_MARKER};
+    use cryptomator_mount::registry::{
+        NullMountProvider, FALLBACK_WEBDAV_CLASS, NULL_MOUNTER_CLASS, NULL_MOUNT_MARKER,
+    };
+    use cryptomator_mount::FallbackMounter;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
     use tempfile::TempDir;
 
@@ -1938,13 +1949,25 @@ mod tests {
     /// wire format has it. `Request` has a `Drop` impl and therefore no functional-update syntax,
     /// so the whole variant is written out here and the encoded key passed in.
     fn unlock_request_for(mounter: &str, key: &str) -> Request {
+        unlock_request_full(mounter, key, None, None)
+    }
+
+    /// [`unlock_request_for`] with the two fields the WebDAV tests need: a loopback `port` and
+    /// `read_only`.
+    fn unlock_request_full(
+        mounter: &str,
+        key: &str,
+        port: Option<u16>,
+        read_only: Option<bool>,
+    ) -> Request {
         Request::Unlock {
             id: 0,
             key: key.to_owned(),
             mounter: Some(mounter.to_owned()),
             mount_point: None,
             mount_options: Vec::new(),
-            read_only: None,
+            port,
+            read_only,
             volume_name: None,
             max_cleartext_name_length: 220,
         }
@@ -1980,6 +2003,95 @@ mod tests {
             log_file: None,
             notice: None,
         }
+    }
+
+    /// One HTTP request on a loopback address, written and read by hand: the app crate has no HTTP
+    /// client, and a `TcpStream` is all a status line needs. `Connection: close` makes the server
+    /// end the response, so reading to the end terminates.
+    fn http(addr: &str, request: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect to the WebDAV server");
+        stream.set_read_timeout(Some(DEADLINE)).expect("timeout");
+        stream
+            .write_all(request.as_bytes())
+            .expect("write the request");
+        let mut response = Vec::new();
+        // A timeout is not a failure of the test's own I/O: whatever arrived is what is asserted
+        // on, and an empty answer fails the assertion with the status line it did not get.
+        let _ = stream.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// `host:port` of a `http://host:port/path` URL.
+    fn authority(url: &str) -> String {
+        url.trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("an authority")
+            .to_owned()
+    }
+
+    /// A read-only unlock over the WebDAV fallback: nothing in the mount chain enforces it (the
+    /// service has neither `READ_ONLY` nor `MOUNT_FLAGS`), so the `CryptoFs` the daemon opens is
+    /// the only thing that does -- which is why `unlock` and `apply_capabilities` share
+    /// [`mounting::read_only`]. A `PUT` proves it end to end.
+    #[test]
+    fn a_read_only_webdav_unlock_answers_a_put_with_403() {
+        let daemon = Daemon::start_with(
+            vec![Box::new(FallbackMounter)],
+            (DEADLINE, Duration::from_secs(3600)),
+            Duration::from_millis(20),
+            |_| {},
+        );
+        let mut client = daemon.client();
+        // Port 0: any free one. The vault's own `usesReadOnlyMode` is false, so `--read-only` is
+        // the only thing that can make this read-only.
+        let result = client
+            .call(unlock_request_full(
+                FALLBACK_WEBDAV_CLASS,
+                &encoded(KEY),
+                Some(0),
+                Some(true),
+            ))
+            .expect("unlock");
+        let url = result
+            .get("mountpoint")
+            .and_then(serde_json::Value::as_str)
+            .expect("the answer names the URL")
+            .to_owned();
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert!(
+            daemon.files.read_info().expect("run info").read_only,
+            "the run info records the read-only mount"
+        );
+
+        let addr = authority(&url);
+        let path = format!("/{VAULT_ID}");
+        let response = http(
+            &addr,
+            &format!(
+                "PROPFIND {path} HTTP/1.1\r\nHost: {addr}\r\nDepth: 0\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 207"),
+            "the vault is served: {response}"
+        );
+        let response = http(
+            &addr,
+            &format!(
+                "PUT {path}/new.txt HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\nhi"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a read-only vault forbids every write: {response}"
+        );
+
+        client.lock(false).expect("lock");
+        daemon.wait().expect("a clean stop");
     }
 
     #[test]

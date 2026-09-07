@@ -1046,11 +1046,46 @@ fn config_get_and_set_the_cli_settings() {
         .assert()
         .code(2);
 
+    // `webdavBind`: the effective loopback default without a value, and only a loopback address
+    // is accepted -- the WebDAV server has no authentication.
+    sb.crypto(&["config", "get", "webdavBind"])
+        .assert()
+        .success()
+        .stdout("127.0.0.1\n");
+    sb.crypto(&["config", "set", "webdavBind", "10.0.0.1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("loopback"))
+        .stderr(predicate::str::contains("CRYPTO_WEBDAV_ALLOW_NONLOOPBACK"));
+    sb.crypto(&["config", "set", "webdavBind", "localhost"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("IP address"));
+    sb.crypto(&["config", "set", "webdavBind", "127.0.0.2"])
+        .assert()
+        .success()
+        .stdout("webdavBind=127.0.0.2\n");
+    assert_eq!(cli_json()["webdavBind"], "127.0.0.2");
+    sb.crypto(&["config", "get", "webdavBind"])
+        .assert()
+        .success()
+        .stdout("127.0.0.2\n");
+    // The override the daemon honours is honoured here too, so a value that would work is not
+    // refused at set time.
+    sb.crypto(&["config", "set", "webdavBind", "10.0.0.1"])
+        .env("CRYPTO_WEBDAV_ALLOW_NONLOOPBACK", "1")
+        .assert()
+        .success();
+    sb.crypto(&["config", "set", "webdavBind", "127.0.0.1"])
+        .assert()
+        .success();
+
     // One `config get` shows the settings.json keys and the cli.json keys together.
     let all = json_of(&mut sb.crypto(&["--json", "config", "get"]));
     assert_eq!(all["port"], 42427);
     assert_eq!(all["logLevel"], "debug");
     assert_eq!(all["forceUnmountOnSignalAfterSecs"], 30);
+    assert_eq!(all["webdavBind"], "127.0.0.1");
     assert!(all["defaultMounter"].is_null());
     sb.crypto(&["config", "get"])
         .assert()

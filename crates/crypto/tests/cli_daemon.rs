@@ -8,6 +8,7 @@ mod common;
 use common::Sandbox;
 use cryptomator_mount::mounttab::is_mountpoint;
 use serde_json::Value;
+use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -54,10 +55,14 @@ impl std::ops::Deref for Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self
-            .sandbox
-            .crypto_daemon(&["lock", "--all", "--force"])
-            .ok();
+        // The graceful one first: the WebDAV back ends have no `UNMOUNT_FORCED`, so `--force`
+        // alone would be refused for them and leave the daemon running.
+        if self.sandbox.crypto_daemon(&["lock", "--all"]).ok().is_err() {
+            let _ = self
+                .sandbox
+                .crypto_daemon(&["lock", "--all", "--force"])
+                .ok();
+        }
     }
 }
 
@@ -443,6 +448,211 @@ fn unlock_grammar_applies_volume_name_read_only_and_mount_options() {
 
     let info = json(&std::fs::read(fx.state_file(".json")).unwrap());
     assert_eq!(info["readOnly"], true);
+}
+
+/// One HTTP request written and read by hand: this test binary has no HTTP client, and a status
+/// line needs none. `Connection: close` ends the response, so reading to the end terminates.
+fn http(addr: &str, request: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(addr).expect("connect to the WebDAV server");
+    stream.set_read_timeout(Some(DEADLINE)).expect("timeout");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = Vec::new();
+    // A timeout leaves whatever arrived, which the assertion then reports; it never hangs.
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// `host:port` of a `http://host:port/path` URL.
+fn authority(url: &str) -> String {
+    url.trim_start_matches("http://")
+        .split('/')
+        .next()
+        .expect("an authority")
+        .to_owned()
+}
+
+/// The whole WebDAV lifecycle through the CLI, with no operating-system mount anywhere: the
+/// fallback mounter serves a URL, `status` reports it, the server answers real WebDAV, `--reveal`
+/// opens nothing (a browser is not the vault) and `lock` gives the port back.
+#[test]
+fn a_webdav_unlock_serves_a_url_that_status_shows_and_lock_takes_down() {
+    let fx = Fixture::new("w");
+    let revealed = fx.path("revealed.txt");
+    let script = fx.path("reveal.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"{}\"\n",
+            revealed.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = fx
+        .crypto_daemon(&[
+            "--json",
+            "unlock",
+            "w",
+            "--mounter",
+            "webdav",
+            "--port",
+            "0",
+            "--reveal",
+        ])
+        .env("CRYPTO_REVEAL_CMD", &script)
+        .assert()
+        .success()
+        // The hint how to mount the URL is on stderr, so `--json`'s document keeps its shape.
+        .stderr(predicates::str::contains("Connect to Server"))
+        .get_output()
+        .stdout
+        .clone();
+    let result = json(&out);
+    let url = result["mountpoint"].as_str().unwrap().to_owned();
+    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+    assert!(url.ends_with(&format!("/{}", fx.id())), "{url}");
+    assert_eq!(
+        result["mounter"],
+        "org.cryptomator.frontend.webdav.mount.FallbackMounter"
+    );
+
+    // `crypto status` prints the URL in the MOUNTPOINT column, and `--json` carries it verbatim.
+    let status = json_out(&fx, &["--json", "status", "w"]);
+    assert_eq!(status["state"], "UNLOCKED");
+    assert_eq!(status["mountpoint"], url);
+    fx.crypto_daemon(&["status", "w"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(url.as_str()));
+
+    // The server really serves the vault: a PROPFIND is answered, an OPTIONS advertises DAV.
+    let addr = authority(&url);
+    let path = format!("/{}", fx.id());
+    let propfind = http(
+        &addr,
+        &format!(
+            "PROPFIND {path} HTTP/1.1\r\nHost: {addr}\r\nDepth: 0\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(propfind.starts_with("HTTP/1.1 207"), "{propfind}");
+    let options = http(
+        &addr,
+        &format!("OPTIONS {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(options.starts_with("HTTP/1.1 2"), "{options}");
+    assert!(options.to_lowercase().contains("dav:"), "{options}");
+
+    assert!(
+        !revealed.exists(),
+        "a URL is not handed to the file manager, not even through the override"
+    );
+
+    // Nothing of a WebDAV mount is in the mount table, so the fallback has no forced unmount:
+    // `--force` is refused (exit 7) and the plain `lock` is what takes it down.
+    fx.crypto_daemon(&["lock", "w", "--force"])
+        .assert()
+        .code(7)
+        .stderr(predicates::str::contains("does not support forced unmount"));
+    fx.crypto_daemon(&["lock", "w"]).assert().success();
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    wait_until("the port to be free again", || {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    });
+    // The server gives the port back while the daemon is still shutting down, so the state is only
+    // LOCKED once that process is gone -- the same wait every other lock test does.
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
+    assert_eq!(json_out(&fx, &["--json", "status", "w"])["state"], "LOCKED");
+}
+
+/// A port somebody else holds is a failed mount, with both ways out in the message.
+#[test]
+fn a_taken_webdav_port_fails_the_unlock_with_a_hint() {
+    let fx = Fixture::new("t");
+    let taken = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = taken.local_addr().expect("addr").port().to_string();
+    fx.crypto_daemon(&["unlock", "t", "--mounter", "webdav", "--port", &port])
+        .assert()
+        .code(6)
+        .stderr(predicates::str::contains("--port 0"))
+        .stderr(predicates::str::contains(port.as_str()));
+    assert_eq!(json_out(&fx, &["--json", "status", "t"])["state"], "LOCKED");
+}
+
+/// `cli.json`'s `webdavBind` decides which loopback address the daemon serves on -- and a value
+/// the rest of the network could reach is a failed mount, not a served vault.
+#[test]
+fn the_webdav_bind_address_from_cli_json_reaches_the_server() {
+    let fx = Fixture::new("b");
+    let cli_json = |bind: &str| {
+        std::fs::write(
+            fx.path("cli.json"),
+            serde_json::json!({
+                "mountPointsDir": fx.mount_points_dir(),
+                "webdavBind": bind,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+
+    // A hand-edited `cli.json` bypasses `config set`'s check, so the daemon repeats it: exit 6,
+    // and the reason names the key.
+    cli_json("10.0.0.1");
+    fx.crypto_daemon(&["unlock", "b", "--mounter", "webdav", "--port", "0"])
+        .assert()
+        .code(6)
+        .stderr(predicates::str::contains("webdavBind"))
+        .stderr(predicates::str::contains("loopback"));
+    assert_eq!(json_out(&fx, &["--json", "status", "b"])["state"], "LOCKED");
+
+    // And the other half: a configured loopback address is the one the server binds.
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        println!("skipped the positive half: no IPv6 loopback on this machine");
+        return;
+    }
+    cli_json("::1");
+    let result = json_out(
+        &fx,
+        &[
+            "--json",
+            "unlock",
+            "b",
+            "--mounter",
+            "webdav",
+            "--port",
+            "0",
+        ],
+    );
+    let url = result["mountpoint"].as_str().unwrap().to_owned();
+    assert!(url.starts_with("http://[::1]:"), "{url}");
+    let response = http(
+        &authority(&url),
+        &format!(
+            "PROPFIND /{id} HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+            id = fx.id()
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 207"), "{response}");
+    fx.crypto_daemon(&["lock", "b"]).assert().success();
+}
+
+/// `--port` on a mounter that has no loopback port is refused by name, like `--mount-option` on a
+/// mounter that has no mount flags.
+#[test]
+fn a_port_for_a_mounter_without_one_is_refused() {
+    let fx = Fixture::new("p");
+    fx.crypto_daemon(&["unlock", "p", "--mounter", "null", "--port", "1234"])
+        .assert()
+        .code(6)
+        .stderr(predicates::str::contains(NULL_MOUNTER))
+        .stderr(predicates::str::contains("--port"));
+    assert_eq!(json_out(&fx, &["--json", "status", "p"])["state"], "LOCKED");
 }
 
 #[test]

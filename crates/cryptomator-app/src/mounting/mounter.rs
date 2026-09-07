@@ -232,6 +232,21 @@ pub fn loopback_port(req: &MountRequest<'_>) -> u16 {
     }
 }
 
+/// Whether the vault is served read-only: `--read-only` if the command line gave it, else the
+/// vault's `usesReadOnlyMode`.
+///
+/// The daemon needs the very same answer as [`apply_capabilities`]: it opens the `CryptoFs` with
+/// it ([`cryptomator_core::fs::CryptoFsOptions::read_only`]), and for a service whose
+/// [`MountService::read_only_follows_file_system`] says yes -- the WebDAV back ends -- that is the
+/// *only* thing that makes the volume read-only, since neither `set_read_only` nor `-oro` is used
+/// there. Two copies of the rule that drift apart would serve a writable vault to a user who asked
+/// for a read-only one, without an error anywhere, so there is one.
+pub fn read_only(req: &MountRequest<'_>) -> bool {
+    req.overrides
+        .read_only
+        .unwrap_or(req.vault.uses_read_only_mode)
+}
+
 /// Mounts `fs` as the vault's settings and the command line ask for.
 ///
 /// Follows `Mounter.mount`: pick the service, refuse it if it conflicts with one another unlocked
@@ -287,10 +302,22 @@ fn apply_capabilities(
     service: &dyn MountService,
     builder: &mut dyn MountBuilder,
 ) -> Result<()> {
-    let read_only = req
-        .overrides
-        .read_only
-        .unwrap_or(req.vault.uses_read_only_mode);
+    // An override for a capability the service does not advertise is refused rather than silently
+    // dropped, the way `mount_flags` refuses `--mount-option`: a user who asked for a port and
+    // got the configured one has no way of telling.
+    if req.overrides.port.is_some() && !service.has_capability(MountCapability::LoopbackPort) {
+        return Err(AppError::MountFailed(format!(
+            "{} takes no port (--port)",
+            service.java_class_name()
+        )));
+    }
+    if req.overrides.volume_name.is_some() && !service.has_capability(MountCapability::VolumeName) {
+        return Err(AppError::MountFailed(format!(
+            "{} takes no volume name (--volume-name)",
+            service.java_class_name()
+        )));
+    }
+    let read_only = read_only(req);
     let flags = mount_flags(req, service, read_only)?;
     let volume_name = req
         .overrides
@@ -372,12 +399,16 @@ fn mount_flags(
     Ok(flags.join(" "))
 }
 
-/// The mount point the command line or the vault's settings ask for, if any.
-fn chosen_mount_point(req: &MountRequest<'_>) -> Option<PathBuf> {
-    req.overrides
+/// The mount point the command line or the vault's settings ask for, if any, and whether it came
+/// from the command line -- a refusal can then say how to get rid of a stored one.
+fn chosen_mount_point(req: &MountRequest<'_>) -> Option<(PathBuf, bool)> {
+    if let Some(path) = req.overrides.mount_point.clone() {
+        return Some((path, true));
+    }
+    req.vault
         .mount_point
-        .clone()
-        .or_else(|| req.vault.mount_point.as_deref().map(PathBuf::from))
+        .as_deref()
+        .map(|path| (PathBuf::from(path), false))
 }
 
 /// `Mounter.prepareMountPoint`, without the Windows branches.
@@ -398,19 +429,35 @@ fn prepare_mount_point(
     let can_mount_to_system = service.has_capability(MountCapability::MountToSystemChosenPath);
     let can_mount_within_parent =
         service.has_capability(MountCapability::MountWithinExistingParent);
+    let can_mount_as_drive_letter = service.has_capability(MountCapability::MountAsDriveLetter);
     // A service with no mount-point capability at all mounts nowhere in the file system -- the
     // WebDAV fallback hands out a URL. Java's `prepareMountPoint` falls through its whole
-    // `if/else if` chain for it and sets nothing; so does this.
-    if !can_mount_to_dir && !can_mount_to_system && !can_mount_within_parent {
-        if let Some(path) = chosen_mount_point(req) {
+    // `if/else if` chain for it and sets nothing; so does this. `MOUNT_AS_DRIVE_LETTER` is in the
+    // chain too, even though no service of this build (which has no Windows branches) has it.
+    if !can_mount_to_dir
+        && !can_mount_to_system
+        && !can_mount_within_parent
+        && !can_mount_as_drive_letter
+    {
+        if let Some((path, from_command_line)) = chosen_mount_point(req) {
+            // A path the vault carries in `settings.json` cannot be taken back on the command
+            // line, so the refusal says which command clears it.
+            let hint = if from_command_line {
+                String::new()
+            } else {
+                format!(
+                    "; clear it with `crypto vault set {} --no-mount-point`",
+                    req.vault.id
+                )
+            };
             return Err(AppError::MountPointInvalid(
                 path,
-                format!("{} takes no mount point", service.java_class_name()),
+                format!("{} takes no mount point{hint}", service.java_class_name()),
             ));
         }
         return Ok(None);
     }
-    let chosen = chosen_mount_point(req);
+    let chosen = chosen_mount_point(req).map(|(path, _)| path);
 
     if let Some(path) = chosen {
         if path.exists() {
@@ -1399,6 +1446,93 @@ mod tests {
         assert!(err.to_string().contains("takes no mount point"), "{err}");
     }
 
+    /// The read-only rule the daemon shares (`mounting::read_only`): the command line first, the
+    /// vault's `usesReadOnlyMode` second. Both callers ask this one function, so a service whose
+    /// read-only mode comes from the file system cannot end up serving a writable vault.
+    #[test]
+    fn the_read_only_rule_is_the_command_line_then_the_vault() {
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = PathBuf::from("/home/u");
+        let ask = |uses_read_only: bool, override_: Option<bool>| {
+            let mut vault = vault();
+            vault.uses_read_only_mode = uses_read_only;
+            let req = MountRequest {
+                running_services: Vec::new(),
+                vault: &vault,
+                settings: &settings,
+                cli: &cli,
+                home: &home,
+                overrides: MountOverrides {
+                    read_only: override_,
+                    ..MountOverrides::default()
+                },
+            };
+            read_only(&req)
+        };
+        assert!(!ask(false, None), "neither says so");
+        assert!(ask(true, None), "the vault's usesReadOnlyMode");
+        assert!(ask(false, Some(true)), "--read-only wins over the vault");
+        assert!(
+            !ask(true, Some(false)),
+            "an explicit false wins over the vault too"
+        );
+    }
+
+    /// Ruling on the Task 7 review: an override for a capability the service does not have is an
+    /// error, not something silently dropped -- `--mount-option` has always been refused that way.
+    #[test]
+    fn a_port_and_a_volume_name_are_refused_by_a_service_that_has_neither() {
+        const NEITHER: &[MountCapability] = &[MountCapability::MountToExistingDir];
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let vault = vault();
+        let mount_with = |overrides: MountOverrides| {
+            let (_vault_dir, fs) = test_fs();
+            let mut service = FakeService::new("org.example.Plain", true);
+            service.capabilities = NEITHER;
+            let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+            let req = MountRequest {
+                running_services: Vec::new(),
+                vault: &vault,
+                settings: &settings,
+                cli: &cli,
+                home: home.path(),
+                overrides,
+            };
+            mount(&req, &services, fs).map(|handle| {
+                handle.close().expect("close");
+            })
+        };
+        let err = mount_with(MountOverrides {
+            port: Some(8080),
+            ..MountOverrides::default()
+        })
+        .expect_err("--port needs LOOPBACK_PORT");
+        assert!(matches!(err, AppError::MountFailed(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("org.example.Plain") && err.to_string().contains("--port"),
+            "the message names the service and the flag: {err}"
+        );
+
+        let err = mount_with(MountOverrides {
+            volume_name: Some("Secret".to_owned()),
+            ..MountOverrides::default()
+        })
+        .expect_err("--volume-name needs VOLUME_NAME");
+        assert!(matches!(err, AppError::MountFailed(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("org.example.Plain")
+                && err.to_string().contains("--volume-name"),
+            "{err}"
+        );
+
+        // Without either override the very same service mounts: only what the user asked for and
+        // cannot get is refused, never the vault's own settings.
+        mount_with(MountOverrides::default()).expect("nothing was overridden");
+    }
+
     /// The real [`FallbackMounter`], the service every one of the three call sites above exists
     /// for. It binds a loopback port, so every test below asks for port 0 or for a port that was
     /// free moments ago, and none of them mounts anything into the file system.
@@ -1576,5 +1710,40 @@ mod tests {
             other => panic!("expected MountPointInvalid, got {other:?}"),
         }
         // The refusal comes before anything is bound, so no server is left behind.
+    }
+
+    /// The same refusal for a mount point that came from `settings.json` -- a vault that used to
+    /// be mounted with FUSE. The command line cannot take that one back, so the message says what
+    /// does (ruling on the Task 7 review).
+    #[test]
+    fn a_stored_mount_point_is_refused_with_the_command_that_clears_it() {
+        let (_vault_dir, fs) = test_fs();
+        let stored = tempfile::tempdir().expect("mount point");
+        let mut vault = vault();
+        vault.mount_point = Some(stored.path().display().to_string());
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FallbackMounter)];
+        let req = webdav_request(
+            &vault,
+            &settings,
+            &cli,
+            home.path(),
+            MountOverrides {
+                port: Some(0),
+                ..MountOverrides::default()
+            },
+        );
+        let err = mount(&req, &services, fs).expect_err("a URL has no mount point");
+        let AppError::MountPointInvalid(ref path, ref reason) = err else {
+            panic!("expected MountPointInvalid, got {err:?}")
+        };
+        assert_eq!(path, stored.path());
+        assert_eq!(
+            reason,
+            "org.cryptomator.frontend.webdav.mount.FallbackMounter takes no mount point; \
+             clear it with `crypto vault set AAAAAAAAAAAA --no-mount-point`"
+        );
     }
 }

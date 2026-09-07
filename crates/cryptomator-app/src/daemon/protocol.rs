@@ -71,6 +71,10 @@ pub enum Request {
         mount_point: Option<String>,
         /// Extra options handed to the mount service verbatim.
         mount_options: Vec<String>,
+        /// The TCP port of a loopback (WebDAV) mount, or `None` for the configured one. Absent in
+        /// a request from an older client, which is why it carries `#[serde(default)]`.
+        #[serde(default)]
+        port: Option<u16>,
         /// `None` means "whatever the vault's settings say".
         read_only: Option<bool>,
         /// The volume name to show in the file manager.
@@ -152,6 +156,7 @@ impl fmt::Debug for Request {
                 mounter,
                 mount_point,
                 mount_options,
+                port,
                 read_only,
                 volume_name,
                 max_cleartext_name_length,
@@ -162,6 +167,7 @@ impl fmt::Debug for Request {
                 .field("mounter", mounter)
                 .field("mount_point", mount_point)
                 .field("mount_options", mount_options)
+                .field("port", port)
                 .field("read_only", read_only)
                 .field("volume_name", volume_name)
                 .field("max_cleartext_name_length", max_cleartext_name_length)
@@ -503,6 +509,7 @@ mod tests {
             mounter: None,
             mount_point: Some("/mnt/v".to_owned()),
             mount_options: vec!["ro".to_owned()],
+            port: Some(0),
             read_only: Some(true),
             volume_name: None,
             max_cleartext_name_length: 220,
@@ -511,10 +518,45 @@ mod tests {
             json(&request),
             concat!(
                 "{\"op\":\"unlock\",\"id\":1,\"key\":\"a2V5\",\"mounter\":null,",
-                "\"mountPoint\":\"/mnt/v\",\"mountOptions\":[\"ro\"],\"readOnly\":true,",
-                "\"volumeName\":null,\"maxCleartextNameLength\":220}\n"
+                "\"mountPoint\":\"/mnt/v\",\"mountOptions\":[\"ro\"],\"port\":0,",
+                "\"readOnly\":true,\"volumeName\":null,\"maxCleartextNameLength\":220}\n"
             )
         );
+    }
+
+    /// A client of the previous protocol version sends no `port`; it must still unlock.
+    #[test]
+    fn an_unlock_without_a_port_decodes_with_none() {
+        let line = concat!(
+            "{\"op\":\"unlock\",\"id\":5,\"key\":\"a2V5\",\"mounter\":\"fuse\",",
+            "\"mountPoint\":\"/mnt/v\",\"mountOptions\":[],\"readOnly\":false,",
+            "\"volumeName\":\"V\",\"maxCleartextNameLength\":220}\n"
+        );
+        let mut input = Cursor::new(line.as_bytes().to_vec());
+        let request = read_request(&mut input)
+            .expect("decodes")
+            .expect("one request");
+        match &request {
+            Request::Unlock { port, .. } => assert_eq!(*port, None),
+            other => panic!("expected an unlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unlock_with_a_port_decodes_it() {
+        let line = concat!(
+            "{\"op\":\"unlock\",\"id\":6,\"key\":\"a2V5\",\"mounter\":null,",
+            "\"mountPoint\":null,\"mountOptions\":[],\"port\":42427,\"readOnly\":null,",
+            "\"volumeName\":null,\"maxCleartextNameLength\":220}\n"
+        );
+        let mut input = Cursor::new(line.as_bytes().to_vec());
+        let request = read_request(&mut input)
+            .expect("decodes")
+            .expect("one request");
+        match &request {
+            Request::Unlock { port, .. } => assert_eq!(*port, Some(42427)),
+            other => panic!("expected an unlock, got {other:?}"),
+        }
     }
 
     #[test]
@@ -525,6 +567,7 @@ mod tests {
             mounter: None,
             mount_point: None,
             mount_options: Vec::new(),
+            port: None,
             read_only: None,
             volume_name: None,
             max_cleartext_name_length: 220,

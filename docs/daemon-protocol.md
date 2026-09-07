@@ -49,7 +49,7 @@ per connection and chosen by the client (`DaemonClient` counts up from 1).
 
 | `op` | Fields besides `id` | Answer |
 |---|---|---|
-| `unlock` | `key`, `mounter`, `mountPoint`, `mountOptions`, `readOnly`, `volumeName`, `maxCleartextNameLength` | `{"mountpoint": "<path>"}` |
+| `unlock` | `key`, `mounter`, `mountPoint`, `mountOptions`, `port`, `readOnly`, `volumeName`, `maxCleartextNameLength` | `{"mountpoint": "<path or url>"}` |
 | `status` | — | [`StatusResult`](#status) |
 | `stats` | — | [`StatsResult`](#stats) |
 | `lock` | `force` | `null` |
@@ -64,7 +64,7 @@ Sent **once**, by the process that spawned the daemon, before anything is mounte
 request before the first `unlock` is answered with `NOT_UNLOCKED`.
 
 ```json
-{"op":"unlock","id":1,"key":"<base64 of the 64 raw key bytes>","mounter":"org.cryptomator.frontend.fuse.mount.FuseTMountProvider","mountPoint":"/Users/me/mnt/secret","mountOptions":["-ovolname=Secret"],"readOnly":null,"volumeName":"Secret","maxCleartextNameLength":220}
+{"op":"unlock","id":1,"key":"<base64 of the 64 raw key bytes>","mounter":"org.cryptomator.frontend.fuse.mount.FuseTMountProvider","mountPoint":"/Users/me/mnt/secret","mountOptions":["-ovolname=Secret"],"port":null,"readOnly":null,"volumeName":"Secret","maxCleartextNameLength":220}
 ```
 
 - `key` — base64 of the 64 raw key bytes (the unwrapped masterkey). See
@@ -73,6 +73,11 @@ request before the first `unlock` is answered with `NOT_UNLOCKED`.
 - `mountPoint` — an **absolute** path, or `null` for the configured default. The daemon's working
   directory is `/`, so a relative path would mean something different to it than to the shell.
 - `mountOptions` — extra flags, handed to the mount service verbatim (`-o…`, `-r`).
+- `port` — the TCP port for a loopback (WebDAV) mount, `0` for any free one, or `null` for the
+  configured one (`vault.port` when the vault names a mount service, else `settings.port`).
+  Absent in a request from an older client, which reads as `null`. A `port` for a mount service
+  without the `LOOPBACK_PORT` capability is `MOUNT_FAILED`, like a `mountOptions` for one without
+  `MOUNT_FLAGS`.
 - `readOnly` — `true`/`false`, or `null` for "whatever the vault's `usesReadOnlyMode` says".
 - `volumeName` — the name the operating system shows, or `null`.
 - `maxCleartextNameLength` — the longest cleartext file name this vault accepts; the parent process
@@ -87,6 +92,15 @@ mount failure, with the mount released before the answer:
 
 ```json
 {"id":1,"ok":true,"result":{"mountpoint":"/Users/me/mnt/secret"}}
+```
+
+A WebDAV mount answers with a **URL** (`http://127.0.0.1:<port>/<volume id>`) instead of a path,
+and skips the mount-table wait: nothing of it appears in the mount table
+(`MountService::appears_in_mount_table`). The same string is what the run info and
+[`StatusResult`](#status) carry as `mountpoint`, so a caller has to expect either shape.
+
+```json
+{"id":1,"ok":true,"result":{"mountpoint":"http://127.0.0.1:42427/UARWQsp1etRW"}}
 ```
 
 A failure is `MOUNT_FAILED`, and the daemon stops itself afterwards.
@@ -248,7 +262,8 @@ therefore ask, in this order:
    not yet a socket.
 4. Otherwise the daemon is gone. Is the run info's `mountpoint` still in the mount table? Yes →
    **`STALE_MOUNT`**; `crypto lock <VAULT> --force` takes it down by mount point, through the mount
-   service the run info names, and removes the leftover files.
+   service the run info names, and removes the leftover files. A `mountpoint` that is not an
+   absolute path is never a stale mount: it is a WebDAV URL, and that server died with its daemon.
 5. Nothing mounted either → any leftover files are removed on the spot and the vault falls back to
    its on-disk state (`LOCKED`, `MISSING`, …).
 

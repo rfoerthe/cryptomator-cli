@@ -84,7 +84,7 @@ pub struct UnlockArgs {
     // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
     #[arg(allow_hyphen_values = true)]
     pub vault: String,
-    /// Mounter alias (fuse-t, macfuse, fuse, null) or Java class name
+    /// Mounter alias (fuse-t, macfuse, fuse, webdav, webdav-applescript, webdav-gio, null) or Java class name
     #[arg(long, value_name = "MOUNTER")]
     pub mounter: Option<String>,
     /// Where to mount (default: the vault's mountPoint, else <mountPointsDir>/<name>)
@@ -100,6 +100,9 @@ pub struct UnlockArgs {
         require_equals = true
     )]
     pub mount_option: Vec<String>,
+    /// TCP port for loopback mounters (WebDAV); 0 picks any free port
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
     /// Mount read-only, whatever the vault's usesReadOnlyMode says
     #[arg(long)]
     pub read_only: bool,
@@ -272,7 +275,8 @@ pub enum ConfigCommand {
     /// Print one or all settings
     Get {
         /// settings.json: mountService | port | useKeychain | keychainProvider | debugMode;
-        /// cli.json: mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs
+        /// cli.json: mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs |
+        /// webdavBind
         key: Option<String>,
     },
     /// Change a setting
