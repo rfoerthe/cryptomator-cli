@@ -319,13 +319,32 @@ pub fn all_providers() -> Vec<Box<dyn Keychain>> {
     if let Some(fake) = fake::FakeKeychain::from_env() {
         return vec![Box::new(fake)];
     }
-    let mut providers: Vec<Box<dyn Keychain>> = Vec::new();
-    #[cfg(target_os = "macos")]
-    providers.push(Box::new(macos::MacKeychain::new()));
-    // The Linux and KDE back ends arrive in task 4.
-    providers.extend(std::iter::empty());
+    let mut providers = platform_providers();
     providers.sort_by_key(|provider| std::cmp::Reverse(provider.priority()));
     providers
+}
+
+/// The back ends this build has, unsorted -- [`all_providers`] orders them.
+#[cfg(target_os = "macos")]
+fn platform_providers() -> Vec<Box<dyn Keychain>> {
+    vec![Box::new(macos::MacKeychain::new())]
+}
+
+/// Both Secret Service variants and the KWallet stub. Written in priority order for the reader;
+/// [`all_providers`] is what actually orders them.
+#[cfg(target_os = "linux")]
+fn platform_providers() -> Vec<Box<dyn Keychain>> {
+    vec![
+        Box::new(linux::SecretServiceKeychain::gnome_keyring()),
+        Box::new(linux::SecretServiceKeychain::secret_service()),
+        Box::new(kde::KdeWalletKeychain::new()),
+    ]
+}
+
+/// Nothing: the CLI builds on other systems, it just has no keychain there (bar the fake).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_providers() -> Vec<Box<dyn Keychain>> {
+    Vec::new()
 }
 
 /// `KeychainModule.provideKeychainAccessProvider`: nothing when `useKeychain` is off, otherwise
@@ -640,12 +659,30 @@ mod tests {
             priorities.windows(2).all(|w| w[0] >= w[1]),
             "{priorities:?}"
         );
-        // The Linux back ends arrive in task 4; on macOS the registry is already populated.
         #[cfg(target_os = "macos")]
         {
             assert!(!priorities.is_empty());
             assert_eq!(priorities, vec![macos::MAC_PRIORITY]);
             assert_eq!(providers[0].java_class_name(), MAC_SYSTEM_CLASS);
+        }
+        // GNOME Keyring, then the generic Secret Service, then the KWallet stub -- which is last
+        // because it never works and must never be the automatic choice.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(!priorities.is_empty());
+            assert_eq!(
+                priorities,
+                vec![
+                    linux::GNOME_KEYRING_PRIORITY,
+                    linux::SECRET_SERVICE_PRIORITY,
+                    kde::KDE_PRIORITY,
+                ]
+            );
+            let classes: Vec<&str> = providers.iter().map(|p| p.java_class_name()).collect();
+            assert_eq!(
+                classes,
+                vec![GNOME_KEYRING_CLASS, SECRET_SERVICE_CLASS, KDE_WALLET_CLASS]
+            );
         }
     }
 

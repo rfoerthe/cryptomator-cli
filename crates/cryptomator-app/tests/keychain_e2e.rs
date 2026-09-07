@@ -153,6 +153,9 @@ fn the_real_keychain_behaves_like_the_fake_one() {
     // answers would time out too.
     #[cfg(target_os = "macos")]
     a_foreign_entry(&service);
+    // The Linux counterpart: the attribute shape both variants have to agree on.
+    #[cfg(target_os = "linux")]
+    linux_attributes();
 }
 
 /// Store, load, change, delete -- on items this binary created itself, so nothing should prompt.
@@ -487,4 +490,107 @@ fn a_foreign_entry(service: &str) {
     {
         cleanup.keys.clear();
     }
+}
+
+/// The proof that Linux items really have the shape `integrations-linux` writes -- the one thing
+/// that could not be read from Java source on the development machine (no `integrations-linux`
+/// jar in `~/.m2`). It writes with the GNOME variant and reads back with the Secret Service one,
+/// which only works if both agree on the collection, the label and the `Vault` attribute.
+///
+/// A phase of the test above rather than a test of its own, like the macOS ones: the file's rule
+/// is one test with ordered phases, and here it also means the round trip has already proven the
+/// basics before the attribute shape is put to the question.
+///
+/// Run it under a session bus of its own, so nothing touches the developer's real keyring:
+/// `dbus-run-session -- sh -c 'eval "$(printf "" | gnome-keyring-daemon --unlock --components=secrets)"; \
+///  CRYPTO_E2E_KEYCHAIN=1 cargo test -p cryptomator-app --test keychain_e2e -- --ignored --nocapture'`
+#[cfg(target_os = "linux")]
+fn linux_attributes() {
+    use cryptomator_app::keychain::linux::{
+        SecretServiceKeychain, NAME_ATTRIBUTE, VAULT_ATTRIBUTE,
+    };
+
+    let gnome = SecretServiceKeychain::gnome_keyring();
+    if !gnome.is_supported() {
+        eprintln!("skipped: no secret service on the session bus");
+        return;
+    }
+    // The service name is only the item *label* here -- items are addressed by the `Vault`
+    // attribute -- so the isolation this phase relies on is the key, which carries the pid.
+    let key = format!("crypto-e2e-{}-attributes", std::process::id());
+    let mut cleanup = Cleanup {
+        provider: Arc::new(SecretServiceKeychain::gnome_keyring()),
+        keys: vec![key.clone()],
+    };
+
+    let k = key.clone();
+    if attempt("store (gnome variant)", move || {
+        SecretServiceKeychain::gnome_keyring().store(&k, Some("Secret"), "e2e-linux-1")
+    })
+    .is_none()
+    {
+        return;
+    }
+    // Written by the GNOME variant, found by the Secret Service one: same collection, same
+    // `Vault` attribute.
+    let k = key.clone();
+    let Some(loaded) = attempt("load (secret service variant)", move || {
+        SecretServiceKeychain::secret_service().load(&k)
+    }) else {
+        return;
+    };
+    assert_eq!(loaded.as_deref().map(String::as_str), Some("e2e-linux-1"));
+
+    // And the Secret Service variant adds `Name`, which the search must still ignore.
+    let k = key.clone();
+    if attempt("store (secret service variant)", move || {
+        SecretServiceKeychain::secret_service().store(&k, Some("Renamed"), "e2e-linux-2")
+    })
+    .is_none()
+    {
+        return;
+    }
+    let k = key.clone();
+    let Some(loaded) = attempt("load after rename", move || {
+        SecretServiceKeychain::gnome_keyring().load(&k)
+    }) else {
+        return;
+    };
+    assert_eq!(
+        loaded.as_deref().map(String::as_str),
+        Some("e2e-linux-2"),
+        "a renamed vault keeps its passphrase: the lookup uses {VAULT_ATTRIBUTE}, not {NAME_ATTRIBUTE}"
+    );
+
+    // `change` is a noop for a vault that has no item.
+    let unknown = format!("{key}-unknown");
+    let Some(changed) = attempt("change without an item", move || {
+        SecretServiceKeychain::gnome_keyring().change(&unknown, None, "never-stored")
+    }) else {
+        return;
+    };
+    assert!(!changed, "changing a vault that has no item is a noop");
+
+    let k = key.clone();
+    let Some(deleted) = attempt("delete", move || {
+        SecretServiceKeychain::gnome_keyring().delete(&k)
+    }) else {
+        return;
+    };
+    assert!(deleted, "there was something to delete");
+    // One item per vault: the rename must not have left the first item behind, so a second
+    // delete -- through the other variant, which searches by `Vault` all the same -- finds
+    // nothing.
+    let k = key.clone();
+    let Some(deleted_again) = attempt("delete again", move || {
+        SecretServiceKeychain::secret_service().delete(&k)
+    }) else {
+        return;
+    };
+    assert!(
+        !deleted_again,
+        "storing under a new display name must replace the item, not add a second one"
+    );
+    cleanup.keys.clear();
+    eprintln!("linux attributes: ok");
 }

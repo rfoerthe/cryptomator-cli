@@ -28,6 +28,11 @@ unicode-normalization.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
 
+# The Secret Service back ends (`keychain::linux`). Linux only: on macOS the crate would only pull
+# zbus and a D-Bus session bus that is not there.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
