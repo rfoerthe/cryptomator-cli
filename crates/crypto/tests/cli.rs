@@ -910,6 +910,12 @@ fn password_change_new_password_error_names_the_new_password_flags() {
 
 /// The class name of the mount service that mounts nothing.
 const NULL_MOUNTER: &str = "org.cryptomator.cli.NullMountProvider";
+/// The WebDAV mounter that mounts nothing and only serves the URL.
+const FALLBACK_WEBDAV: &str = "org.cryptomator.frontend.webdav.mount.FallbackMounter";
+/// The macOS WebDAV mounter, which hands the URL to Finder.
+const MAC_APPLESCRIPT: &str = "org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter";
+/// The Linux WebDAV mounter, which hands the URL to `gio`.
+const LINUX_GIO: &str = "org.cryptomator.frontend.webdav.mount.LinuxGioMounter";
 /// Makes the null mounter usable; without it, it is listed but not supported.
 const ENABLE_NULL: &str = "CRYPTO_ENABLE_NULL_MOUNTER";
 
@@ -966,6 +972,36 @@ fn mounters_lists_the_mount_services() {
         .stdout(predicate::str::contains("CAPABILITIES"))
         .stdout(predicate::str::contains("null"))
         .stdout(predicate::str::contains(NULL_MOUNTER));
+}
+
+/// The WebDAV back ends need nothing installed, so the fallback is the one mount service that is
+/// supported on every machine this test can run on -- which is what makes `--mounter webdav`
+/// something a script may rely on. Its OS-integrated sibling is listed beside it.
+#[test]
+fn the_webdav_mounters_are_listed_with_their_aliases() {
+    let sb = Sandbox::new();
+    let all = json_of(&mut sb.crypto(&["--json", "mounters", "--all"]));
+    let fallback = service(&all, FALLBACK_WEBDAV).expect("the fallback mounter is listed");
+    assert_eq!(fallback["alias"], "webdav");
+    assert_eq!(
+        fallback["supported"], true,
+        "the fallback needs no driver: {fallback}"
+    );
+    let (os_class, os_alias) = if cfg!(target_os = "macos") {
+        (MAC_APPLESCRIPT, "webdav-applescript")
+    } else {
+        (LINUX_GIO, "webdav-gio")
+    };
+    let os_mounter = service(&all, os_class).expect("the platform's WebDAV mounter is listed");
+    assert_eq!(os_mounter["alias"], os_alias);
+
+    // Both are listed with their alias in the human table too, which is where a user reads them.
+    sb.crypto(&["mounters", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("webdav"))
+        .stdout(predicate::str::contains(os_alias))
+        .stdout(predicate::str::contains(FALLBACK_WEBDAV));
 }
 
 #[test]

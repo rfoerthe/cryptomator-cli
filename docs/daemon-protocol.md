@@ -77,7 +77,10 @@ request before the first `unlock` is answered with `NOT_UNLOCKED`.
   configured one (`vault.port` when the vault names a mount service, else `settings.port`).
   Absent in a request from an older client, which reads as `null`. A `port` for a mount service
   without the `LOOPBACK_PORT` capability is `MOUNT_FAILED`, like a `mountOptions` for one without
-  `MOUNT_FLAGS`.
+  `MOUNT_FLAGS`. The address such a server binds is `cli.json`'s `webdavBind` (`127.0.0.1` by
+  default, loopback only); the daemon reads it only after it has chosen a service that has the
+  capability, so an unusable value is `MOUNT_FAILED` (naming the key) for a WebDAV unlock and has
+  no effect at all on a FUSE one.
 - `readOnly` — `true`/`false`, or `null` for "whatever the vault's `usesReadOnlyMode` says".
 - `volumeName` — the name the operating system shows, or `null`.
 - `maxCleartextNameLength` — the longest cleartext file name this vault accepts; the parent process

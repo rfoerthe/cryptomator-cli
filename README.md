@@ -202,9 +202,9 @@ environment or a file. The protocol between the two is documented in
   loopback interface and `unlock` answers with a **URL** (`http://127.0.0.1:<port>/<vault id>`)
   instead of a path — in `--json`'s `mountpoint`, in the `MOUNTPOINT` column of `crypto status`,
   and in the run info. Mounting that URL is a separate step, and the unlock prints a one-line hint
-  for it on standard error (Finder → Go → Connect to Server; `gio mount <url>` or the file
-  manager's "Connect to Server" on Linux). `--reveal` opens nothing for a URL — a browser is not
-  the vault. The port follows `--port`, else the vault's `port` when the vault names a mount
+  for it on standard error (Finder → Go → Connect to Server; `gio mount dav://<host>/<id>` — the
+  WebDAV scheme, not the HTTP one — or the file manager's "Connect to Server" on Linux).
+  `--reveal` opens nothing for a URL — a browser is not the vault. The port follows `--port`, else the vault's `port` when the vault names a mount
   service, else `settings.json`'s `port` (42427); a port that is taken fails the unlock (exit `6`)
   with `--port 0` and `crypto vault set` as the ways out. The bind address is `cli.json`'s
   [`webdavBind`](#clijson), loopback only. Because nothing is in the system mount table, the
@@ -393,7 +393,7 @@ is written 0600. `crypto config get|set` reads and writes both files in one flat
 | `defaultMounter` | Mount service for vaults that name none; an alias is stored as the Java class name, `default` clears it | unset (the best available service) |
 | `logLevel` | Verbosity of the daemon log: `error`, `warn`, `info`, `debug`, `trace` | `info` |
 | `forceUnmountOnSignalAfterSecs` | How long a daemon waits after a failed graceful unmount, on `lock`/shutdown/signal, before forcing it | `10` |
-| `webdavBind` | The address the WebDAV server binds to. Only a loopback address is accepted — the server has no authentication; `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` overrides that, at your own risk | `127.0.0.1` |
+| `webdavBind` | The address the WebDAV server binds to. Only a loopback address is accepted — the server has no authentication; `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` overrides that, at your own risk. It is read only by a mounter that binds a port (the WebDAV ones), so an unusable value fails a WebDAV unlock with exit `6` naming the key and leaves a FUSE unlock of the same daemon alone | `127.0.0.1` |
 
     crypto config set mountPointsDir ~/mnt     # relative paths resolve against the shell's cwd
     crypto config set defaultMounter fuse-t

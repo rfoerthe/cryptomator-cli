@@ -255,9 +255,11 @@ pub fn read_only(req: &MountRequest<'_>) -> bool {
 /// prepare the mount point and mount.
 ///
 /// # Errors
-/// [`AppError::MountFailed`] if no service fits, if the chosen one conflicts with a running one
-/// or if the mount itself fails, and [`AppError::MountPointInvalid`] if the chosen mount point
-/// cannot be used.
+/// [`AppError::MountFailed`] if no service fits, if the chosen one conflicts with a running one,
+/// if `--port` or `--volume-name` was given for a service that advertises no `LOOPBACK_PORT` /
+/// `VOLUME_NAME` capability (an override for a capability the service does not have is refused,
+/// not dropped -- see [`apply_capabilities`]) or if the mount itself fails, and
+/// [`AppError::MountPointInvalid`] if the chosen mount point cannot be used.
 pub fn mount(
     req: &MountRequest<'_>,
     services: &[Box<dyn MountService>],

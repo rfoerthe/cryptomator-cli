@@ -22,6 +22,8 @@ const POLL: Duration = Duration::from_millis(20);
 const NULL_MOUNTER: &str = "org.cryptomator.cli.NullMountProvider";
 /// The file a null mount leaves behind in its mount point.
 const MARKER: &str = ".crypto-null-mount";
+/// What the WebDAV tests write through the server and read back out of the locked vault.
+const PUT_BODY: &str = "hello webdav";
 
 /// A sandbox with one created vault, whose daemons are stopped when the test ends -- also when it
 /// panics half way through, so a failed assertion never leaves a mounted volume behind.
@@ -452,6 +454,11 @@ fn unlock_grammar_applies_volume_name_read_only_and_mount_options() {
 
 /// One HTTP request written and read by hand: this test binary has no HTTP client, and a status
 /// line needs none. `Connection: close` ends the response, so reading to the end terminates.
+///
+/// Byte-identical to `http` in `crates/cryptomator-app/src/daemon/server.rs`'s test module, and
+/// deliberately so: the two live in different crates, and a `#[cfg(test)]` helper cannot be
+/// shared across a crate boundary without turning it into a published API. Change one, change
+/// the other.
 fn http(addr: &str, request: &str) -> String {
     use std::io::{Read, Write};
     let mut stream = TcpStream::connect(addr).expect("connect to the WebDAV server");
@@ -463,7 +470,8 @@ fn http(addr: &str, request: &str) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
-/// `host:port` of a `http://host:port/path` URL.
+/// `host:port` of a `http://host:port/path` URL. The twin of `authority` in
+/// `crates/cryptomator-app/src/daemon/server.rs`'s test module -- see the note on [`http`].
 fn authority(url: &str) -> String {
     url.trim_start_matches("http://")
         .split('/')
@@ -544,6 +552,19 @@ fn a_webdav_unlock_serves_a_url_that_status_shows_and_lock_takes_down() {
     );
     assert!(options.starts_with("HTTP/1.1 2"), "{options}");
     assert!(options.to_lowercase().contains("dav:"), "{options}");
+    // … and a write really lands in the vault: this is the whole point of serving it.
+    let put = http(
+        &addr,
+        &format!(
+            "PUT {path}/note.txt HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\n\
+             Content-Length: {len}\r\nConnection: close\r\n\r\n{PUT_BODY}",
+            len = PUT_BODY.len()
+        ),
+    );
+    assert!(
+        put.starts_with("HTTP/1.1 201") || put.starts_with("HTTP/1.1 204"),
+        "{put}"
+    );
 
     assert!(
         !revealed.exists(),
@@ -558,15 +579,37 @@ fn a_webdav_unlock_serves_a_url_that_status_shows_and_lock_takes_down() {
         .stderr(predicates::str::contains("does not support forced unmount"));
     fx.crypto_daemon(&["lock", "w"]).assert().success();
     let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    // The listener is *kept* until the end of the test: a bind that is dropped again right away
+    // would also succeed if the kernel had handed the port to somebody else in the meantime.
+    // Holding it means nothing else has it while everything below is asserted.
+    let mut freed = None;
     wait_until("the port to be free again", || {
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        freed = std::net::TcpListener::bind(("127.0.0.1", port)).ok();
+        freed.is_some()
     });
+    let held = freed.expect("the port is ours now");
     // The server gives the port back while the daemon is still shutting down, so the state is only
     // LOCKED once that process is gone -- the same wait every other lock test does.
     wait_until("the daemon to clean up its state files", || {
         !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
     });
     assert_eq!(json_out(&fx, &["--json", "status", "w"])["state"], "LOCKED");
+
+    // What the WebDAV client wrote is in the vault, readable with no mount at all.
+    let listed = json_out(&fx, &["--json", "fs", "ls", "w", "/"]).to_string();
+    assert!(
+        listed.contains("note.txt"),
+        "the PUT reached the vault: {listed}"
+    );
+    let read = fx
+        .crypto_daemon(&["fs", "cat", "w", "/note.txt"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8_lossy(&read), PUT_BODY);
+    drop(held);
 }
 
 /// A port somebody else holds is a failed mount, with both ways out in the message.
@@ -578,13 +621,18 @@ fn a_taken_webdav_port_fails_the_unlock_with_a_hint() {
     fx.crypto_daemon(&["unlock", "t", "--mounter", "webdav", "--port", &port])
         .assert()
         .code(6)
+        .stderr(predicates::str::contains("already in use"))
         .stderr(predicates::str::contains("--port 0"))
+        .stderr(predicates::str::contains("crypto vault set"))
         .stderr(predicates::str::contains(port.as_str()));
     assert_eq!(json_out(&fx, &["--json", "status", "t"])["state"], "LOCKED");
 }
 
 /// `cli.json`'s `webdavBind` decides which loopback address the daemon serves on -- and a value
 /// the rest of the network could reach is a failed mount, not a served vault.
+///
+/// Its scope is a mount that binds a socket: a mounter without a loopback port never reads the
+/// key, so a broken `webdavBind` does not stop a FUSE (here: null) unlock of the same daemon.
 #[test]
 fn the_webdav_bind_address_from_cli_json_reaches_the_server() {
     let fx = Fixture::new("b");
@@ -609,6 +657,20 @@ fn the_webdav_bind_address_from_cli_json_reaches_the_server() {
         .stderr(predicates::str::contains("webdavBind"))
         .stderr(predicates::str::contains("loopback"));
     assert_eq!(json_out(&fx, &["--json", "status", "b"])["state"], "LOCKED");
+
+    // The very same `cli.json`, a mounter that binds nothing: the key is not its business, so the
+    // unlock goes through. A typo in `webdavBind` must not take FUSE down with it.
+    fx.crypto_daemon(&["unlock", "b", "--mounter", "null"])
+        .assert()
+        .success();
+    assert_eq!(
+        json_out(&fx, &["--json", "status", "b"])["state"],
+        "UNLOCKED"
+    );
+    fx.crypto_daemon(&["lock", "b"]).assert().success();
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
 
     // And the other half: a configured loopback address is the one the server binds.
     if std::net::TcpListener::bind("[::1]:0").is_err() {
@@ -1174,6 +1236,8 @@ fn a_follow_stream_ends_with_code_0_when_the_vault_is_locked() {
 
 /// Set to `1` to allow the ignored test below to mount a real file system on this machine.
 const E2E_ENV: &str = "CRYPTO_E2E_MOUNT";
+/// Set to `1` to allow the ignored WebDAV test below to mount a real volume on this machine.
+const E2E_WEBDAV_ENV: &str = "CRYPTO_E2E_WEBDAV";
 /// What the test writes through the mount, and reads back out of the vault afterwards.
 const E2E_CONTENT: &str = "written the instant unlock returned\n";
 
@@ -1291,6 +1355,108 @@ fn a_file_written_the_moment_unlock_returns_is_in_the_vault() {
         "the volume is gone after the lock"
     );
     fx.crypto_daemon(&["fs", "cat", "e", "/visible.txt"])
+        .assert()
+        .success()
+        .stdout(E2E_CONTENT);
+}
+
+/// The alias of the OS-integrated WebDAV mounter of this platform: the one that does not stop at
+/// the URL but hands it to Finder / `gio` and gives back a directory.
+const OS_WEBDAV_ALIAS: &str = if cfg!(target_os = "macos") {
+    "webdav-applescript"
+} else {
+    "webdav-gio"
+};
+
+/// Whether `alias` is listed as supported by `crypto mounters` on this machine.
+fn mounter_is_supported(fixture: &Fixture, alias: &str) -> bool {
+    let out = fixture
+        .crypto(&["--json", "mounters", "--all"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    json(&out).as_array().is_some_and(|services| {
+        services
+            .iter()
+            .any(|s| s["alias"] == alias && s["supported"] == true)
+    })
+}
+
+/// The other half of the WebDAV story, the one no other test can reach: not the URL, but the
+/// volume the operating system makes of it. `webdav-applescript` asks Finder to mount the
+/// server's URL, so the answer is a `/Volumes/…` path -- a directory the shell can write into,
+/// with the bytes travelling through the daemon's own WebDAV server into the vault.
+///
+/// It mounts for real and is therefore ignored twice over: `cargo test` skips it, and even
+/// `--ignored` only runs it when `CRYPTO_E2E_WEBDAV=1` says this machine may be mounted on.
+///
+/// ```text
+/// CRYPTO_E2E_WEBDAV=1 cargo test -p crypto --test cli_daemon --locked -- --ignored
+/// ```
+///
+/// Every exit path locks: the happy one explicitly, a panicking one through [`Fixture::drop`].
+/// A volume that outlives even that is a real `/Volumes/…` entry, so the test never leaves the
+/// unmount to chance -- it is the very last thing it does.
+#[test]
+#[ignore = "mounts a real WebDAV volume; needs CRYPTO_E2E_WEBDAV=1"]
+fn an_os_webdav_mount_carries_a_write_through_the_server_into_the_vault() {
+    if std::env::var(E2E_WEBDAV_ENV).as_deref() != Ok("1") {
+        println!("skipped: {E2E_WEBDAV_ENV} is not set to 1");
+        return;
+    }
+    let fx = Fixture::new("wv");
+    if !mounter_is_supported(&fx, OS_WEBDAV_ALIAS) {
+        println!("skipped: {OS_WEBDAV_ALIAS} is not supported here");
+        return;
+    }
+    // Port 0, so the test never fights the desktop app or a second run for 42427.
+    let result = json(
+        &fx.crypto_daemon(&[
+            "--json",
+            "unlock",
+            "wv",
+            "--mounter",
+            OS_WEBDAV_ALIAS,
+            "--port",
+            "0",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone(),
+    );
+    let mountpoint = mountpoint_of(&result);
+    println!("mounted at {}", mountpoint.display());
+    assert!(
+        mountpoint.is_absolute(),
+        "an OS WebDAV mount answers with a directory, not with a URL: {}",
+        mountpoint.display()
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            mountpoint.starts_with("/Volumes/"),
+            "Finder mounts into /Volumes: {}",
+            mountpoint.display()
+        );
+    }
+    assert!(
+        is_mountpoint(&mountpoint),
+        "the unlock answered before the volume was in the mount table"
+    );
+
+    // Through the volume, through the operating system's WebDAV client, through the daemon's own
+    // server and into the vault.
+    std::fs::write(mountpoint.join("dav.txt"), E2E_CONTENT).expect("write through the volume");
+
+    fx.crypto_daemon(&["lock", "wv"]).assert().success();
+    assert!(
+        !is_mountpoint(&mountpoint),
+        "the volume is gone after the lock"
+    );
+    fx.crypto_daemon(&["fs", "cat", "wv", "/dav.txt"])
         .assert()
         .success()
         .stdout(E2E_CONTENT);

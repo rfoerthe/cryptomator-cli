@@ -52,7 +52,7 @@ use cryptomator_core::fs::{
     CryptoFs, CryptoFsOptions, FilesystemEvent, StatsSnapshot, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
 };
 use cryptomator_core::{open_vault_with_key, CoreError, Masterkey};
-use cryptomator_mount::api::{MountService, Mountpoint};
+use cryptomator_mount::api::{MountCapability, MountService, Mountpoint};
 use data_encoding::BASE64;
 use std::collections::{HashMap, VecDeque};
 use std::fs::Permissions;
@@ -590,7 +590,8 @@ fn decode_key(encoded: &str) -> std::result::Result<Zeroizing<[u8; 64]>, &'stati
 ///
 /// # Errors
 /// [`AppError::MountFailed`] for a key that does not match the vault (message
-/// `vault key does not match`), for a vault that is not in `settings.json` and for anything the
+/// `vault key does not match`), for a vault that is not in `settings.json`, for a `webdavBind`
+/// that a loopback-port service cannot use (and only for such a service) and for anything the
 /// mounter refuses, plus whatever [`SettingsStore::load`] and writing the run info report.
 fn unlock(
     shared: &Arc<Shared>,
@@ -606,13 +607,6 @@ fn unlock(
             "the daemon is shutting down".to_owned(),
         ));
     }
-    // Before anything is mounted, and inside the unlock so the answer carries the reason: a
-    // `webdavBind` this process cannot use is `MOUNT_FAILED` (exit code 6), not a daemon that
-    // never comes up. `set_bind_address` applies the loopback rule itself
-    // (`CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` overrides it) and is process-wide, which is what the
-    // WebDAV builders read.
-    cryptomator_mount::webdav::set_bind_address(shared.config.cli.webdav_bind_addr()?)
-        .map_err(|e| AppError::MountFailed(e.to_string()))?;
     let vault_id = &shared.config.vault_id;
     let settings = shared.config.store.load()?;
     let vault = settings
@@ -645,6 +639,25 @@ fn unlock(
         overrides,
         running_services: running_services(&shared.config.state_dir, vault_id),
     };
+    // Only a service that binds a loopback socket reads `cli.json`'s `webdavBind`, so only for
+    // one does the value have to be usable: `choose_service` first, then the address -- a typo'd
+    // `webdavBind` must not fail a FUSE unlock that never looks at it. Still before anything is
+    // mounted and inside the unlock, so the refusal travels back as `MOUNT_FAILED` (exit code 6)
+    // rather than as a daemon that never comes up. `set_bind_address` applies the loopback rule
+    // itself (`CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` overrides it) and refuses before it writes.
+    //
+    // What it writes is process-global (`cryptomator_mount::webdav::BIND_ADDRESS`), which is fine
+    // in production -- one daemon process serves one vault. The tests of this crate, however,
+    // share one process: no two of them may vary `webdav_bind` concurrently, because nothing
+    // would serialize them (the mount crate's `ENV_LOCK` is crate-private). Every app test
+    // therefore leaves `CliConfig::webdav_bind` unset; the `cli.json` value is exercised from
+    // `crates/crypto/tests/cli_daemon.rs`, where each daemon is its own process.
+    if mounting::choose_service(&request, &shared.config.services)?
+        .has_capability(MountCapability::LoopbackPort)
+    {
+        cryptomator_mount::webdav::set_bind_address(shared.config.cli.webdav_bind_addr()?)
+            .map_err(|e| AppError::MountFailed(e.to_string()))?;
+    }
     // The mounter's own rule, not a second copy of it: for a service whose read-only mode follows
     // the file system (the WebDAV back ends) this `CryptoFs` is the only thing that makes the
     // volume read-only, so the two must never disagree (`mounting::read_only`).
@@ -2008,6 +2021,10 @@ mod tests {
     /// One HTTP request on a loopback address, written and read by hand: the app crate has no HTTP
     /// client, and a `TcpStream` is all a status line needs. `Connection: close` makes the server
     /// end the response, so reading to the end terminates.
+    ///
+    /// Byte-identical to `http` in `crates/crypto/tests/cli_daemon.rs`, and deliberately so: the
+    /// two live in different crates, and a `#[cfg(test)]` helper cannot be shared across a crate
+    /// boundary without turning it into a published API. Change one, change the other.
     fn http(addr: &str, request: &str) -> String {
         use std::io::{Read, Write};
         let mut stream = std::net::TcpStream::connect(addr).expect("connect to the WebDAV server");
@@ -2022,7 +2039,8 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    /// `host:port` of a `http://host:port/path` URL.
+    /// `host:port` of a `http://host:port/path` URL. The twin of `authority` in
+    /// `crates/crypto/tests/cli_daemon.rs` -- see the note on [`http`].
     fn authority(url: &str) -> String {
         url.trim_start_matches("http://")
             .split('/')
@@ -2035,8 +2053,11 @@ mod tests {
     /// service has neither `READ_ONLY` nor `MOUNT_FLAGS`), so the `CryptoFs` the daemon opens is
     /// the only thing that does -- which is why `unlock` and `apply_capabilities` share
     /// [`mounting::read_only`]. A `PUT` proves it end to end.
+    ///
+    /// The very same `PUT` against a writable unlock is the control: without it a server that
+    /// stopped implementing `PUT` at all would still read as "read-only works".
     #[test]
-    fn a_read_only_webdav_unlock_answers_a_put_with_403() {
+    fn a_read_only_webdav_unlock_answers_a_put_with_403_while_a_writable_one_stores_it() {
         let daemon = Daemon::start_with(
             vec![Box::new(FallbackMounter)],
             (DEADLINE, Duration::from_secs(3600)),
@@ -2092,6 +2113,48 @@ mod tests {
 
         client.lock(false).expect("lock");
         daemon.wait().expect("a clean stop");
+
+        // The control: the same request, the same mounter, `read_only` false -- the write goes
+        // through, so the 403 above is the read-only rule and not a missing `PUT`.
+        let writable = Daemon::start_with(
+            vec![Box::new(FallbackMounter)],
+            (DEADLINE, Duration::from_secs(3600)),
+            Duration::from_millis(20),
+            |_| {},
+        );
+        let mut client = writable.client();
+        let result = client
+            .call(unlock_request_full(
+                FALLBACK_WEBDAV_CLASS,
+                &encoded(KEY),
+                Some(0),
+                Some(false),
+            ))
+            .expect("unlock");
+        let url = result
+            .get("mountpoint")
+            .and_then(serde_json::Value::as_str)
+            .expect("the answer names the URL")
+            .to_owned();
+        assert!(
+            !writable.files.read_info().expect("run info").read_only,
+            "the run info records the writable mount"
+        );
+        let addr = authority(&url);
+        let response = http(
+            &addr,
+            &format!(
+                "PUT /{VAULT_ID}/new.txt HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\nhi"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 201") || response.starts_with("HTTP/1.1 204"),
+            "a writable vault stores the file: {response}"
+        );
+
+        client.lock(false).expect("lock");
+        writable.wait().expect("a clean stop");
     }
 
     #[test]

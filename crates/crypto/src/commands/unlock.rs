@@ -333,7 +333,12 @@ fn url_hint(url: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("Mount it in Finder: Go -> Connect to Server, then enter {url}")
     } else {
-        format!("Mount it with `gio mount {url}`, or in the file manager: Other Locations -> Connect to Server")
+        // `gio` wants the WebDAV scheme, not the HTTP one: `gio mount http://…` is a download,
+        // `gio mount dav://…` is the volume. The file manager's dialog takes either.
+        format!(
+            "Mount it with `gio mount {}`, or in the file manager: Other Locations -> Connect to Server",
+            url.replacen("http://", "dav://", 1)
+        )
     }
 }
 
@@ -520,6 +525,7 @@ mod tests {
         assert!(is_url("dav://127.0.0.1:42427/AAAAAAAAAAAA"));
         assert!(!is_url("/mnt/v"), "a mount point is always absolute");
         assert!(!is_url("/mnt/http://weird"), "still a path");
+        assert!(!is_url(""), "no mount point at all is no URL either");
         // Not even the test override opens a URL: a browser is not the vault.
         assert_eq!(
             reveal_command(
@@ -535,6 +541,13 @@ mod tests {
             "{hint}"
         );
         assert!(hint.contains("Connect to Server"), "{hint}");
+        if !cfg!(target_os = "macos") {
+            // `gio` takes the WebDAV scheme, not the HTTP one.
+            assert!(
+                hint.contains("dav://127.0.0.1:42427/AAAAAAAAAAAA"),
+                "{hint}"
+            );
+        }
     }
 
     #[test]
