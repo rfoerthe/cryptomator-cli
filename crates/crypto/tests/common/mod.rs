@@ -114,6 +114,40 @@ impl Sandbox {
     pub fn crypto_daemon_relative(&self, args: &[&str]) -> Command {
         Command::from_std(self.crypto_daemon_cmd_relative(args))
     }
+    /// The file the fake keychain lives in. It holds passphrases in the clear, so its *name* says
+    /// nothing about them.
+    pub fn keychain_file(&self) -> PathBuf {
+        self.path("keychain.json")
+    }
+    /// [`Sandbox::crypto`] with the fake keychain switched on, so no test ever reaches the real
+    /// one. `$CRYPTO_PASSWORD` is removed: it outranks the keychain in the source order, so a test
+    /// of the keychain has to be without it.
+    pub fn crypto_keychain(&self, args: &[&str]) -> Command {
+        let mut cmd = self.crypto(args);
+        cmd.env_remove("CRYPTO_PASSWORD")
+            .env("CRYPTO_KEYCHAIN_FAKE", self.keychain_file());
+        cmd
+    }
+    /// [`Sandbox::crypto_daemon`] with the fake keychain switched on and `$CRYPTO_PASSWORD` gone.
+    pub fn crypto_daemon_keychain(&self, args: &[&str]) -> Command {
+        let mut cmd = self.crypto_daemon(args);
+        cmd.env_remove("CRYPTO_PASSWORD")
+            .env("CRYPTO_KEYCHAIN_FAKE", self.keychain_file());
+        cmd
+    }
+    /// What the fake keychain currently holds; an empty object when nothing was stored.
+    pub fn fake_keychain_json(&self) -> serde_json::Value {
+        match std::fs::read(self.keychain_file()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            Err(_) => serde_json::json!({}),
+        }
+    }
+    /// Writes `passphrase` into the fake keychain under `key`, the way `password store` will.
+    pub fn seed_keychain(&self, key: &str, display_name: &str, passphrase: &str) {
+        let mut store = self.fake_keychain_json();
+        store[key] = serde_json::json!({ "password": passphrase, "displayName": display_name });
+        std::fs::write(self.keychain_file(), store.to_string()).unwrap();
+    }
     /// Copies a fixture vault into the sandbox and registers it under its name.
     pub fn add_fixture(&self, name: &str) -> PathBuf {
         let vault = self.path(name);

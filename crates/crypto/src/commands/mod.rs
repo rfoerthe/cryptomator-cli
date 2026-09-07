@@ -16,11 +16,14 @@ pub mod vault;
 use crate::output::Output;
 use anyhow::Result;
 use cryptomator_app::settings::{resolve_vault_index, SettingsStore, VaultSettingsJson};
-use cryptomator_app::{AppError, ErrorBody, RuntimeState, StateDir, VaultInfo, VaultRegistry};
+use cryptomator_app::{
+    AppError, ErrorBody, Keychain, KeychainError, KeychainSource, RuntimeState, StateDir,
+    VaultInfo, VaultRegistry,
+};
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
 pub struct Ctx {
@@ -31,13 +34,123 @@ pub struct Ctx {
     /// The `--settings` path exactly as it was given, so a spawned daemon can be handed the same
     /// one. `None` means "resolve it from the environment", which the child does the same way.
     pub settings_arg: Option<PathBuf>,
+    /// `--no-keychain`: the keychain is off for this run, whatever `useKeychain` says.
+    pub no_keychain: bool,
+    /// Memoised [`Ctx::keychain`]. Choosing a provider probes every candidate
+    /// (`KEYCHAIN_PROBE_TIMEOUT` each), so a command that asks twice must not pay twice.
+    keychain: OnceLock<Option<Arc<dyn Keychain>>>,
 }
 
 impl Ctx {
+    pub fn new(
+        store: SettingsStore,
+        out: Output,
+        state_dir: StateDir,
+        settings_arg: Option<PathBuf>,
+        no_keychain: bool,
+    ) -> Self {
+        Self {
+            store,
+            out,
+            state_dir,
+            settings_arg,
+            no_keychain,
+            keychain: OnceLock::new(),
+        }
+    }
+
     /// The vaults of `settings.json` together with what the state directory says about them.
     pub fn registry(&self) -> VaultRegistry {
         VaultRegistry::new(self.store.clone(), self.state_dir.clone())
     }
+
+    /// The keychain provider for this run, or `None` when there is none to use: `--no-keychain`,
+    /// `useKeychain = false`, or no supported provider on this machine.
+    ///
+    /// This is `KeychainModule.provideKeychainAccessProvider` plus the CLI's own switch. The
+    /// answer is computed once and kept: the probe behind it costs a timeout budget per candidate.
+    ///
+    /// `Arc`, not `Box`: [`keychain_call`] moves a clone of the provider onto a worker thread it
+    /// may stop waiting for, so the provider has to outlive the call that gave up on it.
+    ///
+    /// # Errors
+    /// Whatever reading `settings.json` reports.
+    pub fn keychain(&self) -> Result<Option<Arc<dyn Keychain>>> {
+        if let Some(cached) = self.keychain.get() {
+            return Ok(cached.clone());
+        }
+        let resolved = if self.no_keychain {
+            None
+        } else {
+            cryptomator_app::keychain::for_settings(&self.store.load()?).map(Arc::from)
+        };
+        Ok(self.keychain.get_or_init(|| resolved).clone())
+    }
+
+    /// Like [`Ctx::keychain`], but "there is none" is a failure (exit code 8). For the commands
+    /// whose whole purpose is the keychain: `password store`, `password forget`, `keychain test`.
+    ///
+    /// # Errors
+    /// [`AppError::Keychain`] with [`KeychainError::Unsupported`] when no provider is in use.
+    // The commands that need it -- `password store`, `password forget`, `keychain test` -- are
+    // tasks 6 and 7; this is the API they are written against.
+    #[allow(dead_code)]
+    pub fn keychain_required(&self) -> Result<Arc<dyn Keychain>> {
+        match self.keychain()? {
+            Some(keychain) => Ok(keychain),
+            None => Err(AppError::Keychain(KeychainError::Unsupported {
+                provider: "keychain".to_string(),
+                hint: if self.no_keychain {
+                    "--no-keychain is in effect".to_string()
+                } else {
+                    "no supported provider; check `crypto config get keychainProvider` and \
+                     `crypto keychain test`, or set useKeychain to true"
+                        .to_string()
+                },
+            })
+            .into()),
+        }
+    }
+}
+
+/// The key and display name a vault's keychain entry is written under: the id (what the desktop
+/// app uses) and the display name (which Java passes as `displayName` and which only the Secret
+/// Service backend stores).
+pub fn vault_key_and_name(vault: &VaultSettingsJson) -> (&str, Option<&str>) {
+    (&vault.id, vault.display_name.as_deref())
+}
+
+/// The keychain step of the passphrase resolution for `vault`, or `None` when there is no keychain
+/// to consult -- which is what makes `--password-keychain` an error and the implicit step a no-op.
+pub fn keychain_source<'a>(
+    keychain: Option<&Arc<dyn Keychain>>,
+    vault: &'a VaultSettingsJson,
+) -> Option<KeychainSource<'a>> {
+    let (key, display_name) = vault_key_and_name(vault);
+    keychain.map(|keychain| KeychainSource {
+        keychain: Arc::clone(keychain),
+        key,
+        vault_label: display_name.unwrap_or(key),
+    })
+}
+
+/// Runs one keychain call under [`cryptomator_app::KEYCHAIN_TIMEOUT`].
+///
+/// The provider is owned (`Arc<dyn Keychain>`), so it can be moved to the worker thread that the
+/// timeout wrapper gives up on. Every keychain access from a command goes through here -- that is
+/// what keeps a stuck macOS ACL dialog from freezing the CLI.
+///
+/// # Errors
+/// [`AppError::Keychain`] (exit code 8) for whatever the provider reported, including a timeout.
+// The passphrase source reaches the same wrapper through `cryptomator_app::keychain::call`; the
+// `store`/`delete`/`change` callers are tasks 6 and 7.
+#[allow(dead_code)]
+pub fn keychain_call<T, F>(keychain: &Arc<dyn Keychain>, op: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn Keychain) -> cryptomator_app::KeychainResult<T> + Send + 'static,
+{
+    Ok(cryptomator_app::keychain::call(keychain, op).map_err(AppError::Keychain)?)
 }
 
 /// Resolves a vault reference and requires a daemon to be serving it, returning the vault and the
@@ -139,6 +252,29 @@ pub fn locked_vault_path(ctx: &Ctx, reference: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_keychain_key_is_the_id_and_the_label_falls_back_to_it() {
+        let keychain: Arc<dyn Keychain> = Arc::new(
+            cryptomator_app::keychain::fake::FakeKeychain::at(std::path::Path::new("/dev/null")),
+        );
+        let mut vault = VaultSettingsJson::new(
+            "vault-id".to_string(),
+            std::path::Path::new("/vaults/My Vault"),
+        );
+        assert_eq!(vault_key_and_name(&vault), ("vault-id", Some("My Vault")));
+        let source = keychain_source(Some(&keychain), &vault).expect("a source");
+        assert_eq!(source.key, "vault-id");
+        assert_eq!(source.vault_label, "My Vault");
+
+        // A vault without a display name is named by its id in the "nothing stored" message.
+        vault.display_name = None;
+        let source = keychain_source(Some(&keychain), &vault).expect("a source");
+        assert_eq!(source.vault_label, "vault-id");
+
+        // No keychain, no source -- which is what turns `--password-keychain` into an error.
+        assert!(keychain_source(None, &vault).is_none());
+    }
 
     #[test]
     fn stream_ended_matches_a_gone_daemon() {

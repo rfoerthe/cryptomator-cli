@@ -59,12 +59,13 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Some(path) => StateDir::at(path),
         None => StateDir::from_env_or_default()?,
     };
-    let ctx = Ctx {
+    let ctx = Ctx::new(
         store,
-        out: Output { json: cli.json },
+        Output { json: cli.json },
         state_dir,
         settings_arg,
-    };
+        cli.no_keychain,
+    );
     // Before the command runs, not after it wrote: the `flock` only serialises `crypto` against
     // `crypto`, and the user should know about the remaining gap while there is still time to
     // quit the app. stderr, so `--json` output stays machine-readable.

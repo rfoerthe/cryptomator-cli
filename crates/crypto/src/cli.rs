@@ -24,6 +24,9 @@ pub struct Cli {
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
+    /// Never touch the keychain, whatever settings.json says
+    #[arg(long, global = true)]
+    pub no_keychain: bool,
     #[command(subcommand)]
     pub command: Command,
 }

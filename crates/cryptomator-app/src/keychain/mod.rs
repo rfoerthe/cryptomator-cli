@@ -12,7 +12,7 @@
 //! timeout of its own, so the only way out is a worker thread the caller stops waiting for.
 use crate::error::AppError;
 use std::fmt;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -247,6 +247,26 @@ where
             message: "the keychain worker stopped unexpectedly".to_string(),
         }),
     }
+}
+
+/// One call on an owned provider, under [`KEYCHAIN_TIMEOUT`].
+///
+/// This is *the* way a keychain is used outside this module: `Arc`, not `&dyn`, because
+/// [`with_timeout`] hands the work to a thread it may stop waiting for, so the provider has to
+/// outlive the call that gave up on it. `crypto::commands::keychain_call` is the thin `AppError`
+/// wrapper around this, and [`crate::password::read_passphrase_with_keychain`] uses it directly --
+/// between them, no CLI code ever calls a [`Keychain`] method without a timeout around it.
+///
+/// # Errors
+/// Whatever the operation reports, or [`KeychainError::TimedOut`] when it does not answer in time.
+pub fn call<T, F>(keychain: &Arc<dyn Keychain>, op: F) -> KeychainResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn Keychain) -> KeychainResult<T> + Send + 'static,
+{
+    let provider = keychain.display_name();
+    let keychain = Arc::clone(keychain);
+    with_timeout(provider, move || op(keychain.as_ref()))
 }
 
 /// How long a support probe may take before the provider counts as unusable.

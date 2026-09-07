@@ -31,8 +31,8 @@ pub use mounting::{
 };
 pub use password::{
     min_password_length, normalize_passphrase, read_new_passphrase,
-    read_new_passphrase_no_env_fallback, read_passphrase, read_secret_file, NewPasswordArgs,
-    PasswordArgs, PasswordIo, SystemIo,
+    read_new_passphrase_no_env_fallback, read_passphrase, read_passphrase_with_keychain,
+    read_secret_file, KeychainSource, NewPasswordArgs, PasswordArgs, PasswordIo, SystemIo,
 };
 pub use platform::Platform;
 pub use registry::{RuntimeState, VaultInfo, VaultRegistry};

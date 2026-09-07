@@ -1,11 +1,11 @@
 //! `crypto recovery-key show|reset-password`
 use crate::cli::{ResetPasswordArgs, ShowArgs};
-use crate::commands::{locked_vault_path, Ctx};
+use crate::commands::{keychain_source, locked_vault, locked_vault_path, Ctx};
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::{
-    min_password_length, read_new_passphrase, read_passphrase, read_secret_file, AppError,
-    PasswordArgs, PasswordIo, SystemIo,
+    min_password_length, read_new_passphrase, read_passphrase_with_keychain, read_secret_file,
+    AppError, PasswordArgs, PasswordIo, SystemIo,
 };
 use cryptomator_core::recovery::{
     create_recovery_key, decode_recovery_key, reset_password, WordEncoder,
@@ -15,12 +15,18 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
-    let path = locked_vault_path(ctx, &args.vault)?;
+    let (vault, path) = locked_vault(ctx, &args.vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?
         .require_masterkey_file()?;
-    let passphrase = read_passphrase(&args.password, "Password: ", &mut SystemIo)?;
+    let keychain = ctx.keychain()?;
+    let passphrase = read_passphrase_with_keychain(
+        &args.password,
+        "Password: ",
+        keychain_source(keychain.as_ref(), &vault),
+        &mut SystemIo,
+    )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;
     let key = create_recovery_key(&WordEncoder::new(), opened.masterkey.raw());
     if ctx.out.json {

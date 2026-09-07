@@ -3,11 +3,11 @@ use crate::cli::{
     FsCommand, FsGetArgs, FsLsArgs, FsMkdirArgs, FsMvArgs, FsPathArgs, FsPutArgs, FsRmArgs,
     FsTreeArgs,
 };
-use crate::commands::{locked_vault, Ctx};
+use crate::commands::{keychain_source, locked_vault, Ctx};
 use crate::exit;
 use crate::output::{epoch_seconds, format_timestamp};
 use anyhow::{Context, Result};
-use cryptomator_app::{read_passphrase, AppError, PasswordArgs, SystemIo};
+use cryptomator_app::{read_passphrase_with_keychain, AppError, PasswordArgs, SystemIo};
 use cryptomator_core::fs::{
     CleartextPath, CryptoFs, CryptoFsOptions, EventSink, FileAttributes,
     DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
@@ -61,7 +61,13 @@ pub fn open_fs(
         }
         .into());
     }
-    let passphrase = read_passphrase(password, "Password: ", &mut SystemIo)?;
+    let keychain = ctx.keychain()?;
+    let passphrase = read_passphrase_with_keychain(
+        password,
+        "Password: ",
+        keychain_source(keychain.as_ref(), &vault),
+        &mut SystemIo,
+    )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;
     // `maxCleartextFilenameLength` is -1 ("probe on unlock") by default; anything unusable falls
     // back to the cryptofs default instead of rejecting every name.

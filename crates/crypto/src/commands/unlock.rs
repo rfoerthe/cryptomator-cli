@@ -4,12 +4,13 @@
 //! file: the parent derives it with scrypt, spawns the daemon detached and sends the key as the
 //! first request over the daemon's 0600 control socket.
 use crate::cli::UnlockArgs;
-use crate::commands::{daemon, locked_vault, Ctx};
+use crate::commands::{daemon, keychain_source, locked_vault, Ctx};
 use crate::exit;
 use anyhow::{anyhow, Context, Result};
 use cryptomator_app::settings::{VaultSettingsJson, WhenUnlocked};
 use cryptomator_app::{
-    read_passphrase, resolve_mounter, AppError, DaemonClient, Request, SystemIo, VaultStateFiles,
+    read_passphrase_with_keychain, resolve_mounter, AppError, DaemonClient, Request, SystemIo,
+    VaultStateFiles,
 };
 use cryptomator_core::fs::{
     determine_supported_cleartext_file_name_length, DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
@@ -65,7 +66,15 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
         .require_masterkey_file()?;
 
     let read_only = args.read_only || vault.uses_read_only_mode;
-    let passphrase = read_passphrase(&args.password, "Password: ", &mut SystemIo)?;
+    // The keychain is the parent process's business only: the daemon gets the derived key and
+    // never talks to a keyring (see `docs/daemon-protocol.md`).
+    let keychain = ctx.keychain()?;
+    let passphrase = read_passphrase_with_keychain(
+        &args.password,
+        "Password: ",
+        keychain_source(keychain.as_ref(), &vault),
+        &mut SystemIo,
+    )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;
     drop(passphrase);
     let max_cleartext_name_length = name_length(ctx, &vault, &path, read_only)?;

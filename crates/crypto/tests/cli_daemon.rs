@@ -1567,3 +1567,62 @@ fn a_running_desktop_app_is_warned_about_before_settings_are_written() {
         "no app, no warning"
     );
 }
+
+/// The keychain as a passphrase source, end to end: the implicit step, the switch that takes it
+/// away, and the explicit flag that refuses to fall back.
+///
+/// Everything runs against the file-backed fake keychain (`$CRYPTO_KEYCHAIN_FAKE`), which takes
+/// over the whole provider registry, so nothing here can reach the machine's real one.
+#[test]
+fn a_stored_passphrase_unlocks_a_vault_without_any_other_source() {
+    let fx = Fixture::new("v");
+    let id = fx.id();
+    // Seed the fake keychain the way `password store` will (task 6).
+    fx.seed_keychain(&id, "v", common::PW);
+
+    // No --password-* flag, no $CRYPTO_PASSWORD, no terminal: only the keychain can answer.
+    fx.crypto_daemon_keychain(&["unlock", "v", "--mounter", "null"])
+        .assert()
+        .success();
+    fx.crypto_daemon_keychain(&["lock", "v"]).assert().success();
+
+    // --no-keychain takes that source away again, and without a terminal there is nothing left.
+    fx.crypto_daemon_keychain(&["--no-keychain", "unlock", "v", "--mounter", "null"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--password-stdin"));
+
+    // So does useKeychain=false, which is what the desktop app writes when the user turns the
+    // keychain off. `config set` needs a settings write, not a password.
+    fx.crypto(&["config", "set", "useKeychain", "false"])
+        .assert()
+        .success();
+    fx.crypto_daemon_keychain(&["unlock", "v", "--mounter", "null"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--password-stdin"));
+    // ... and the explicit flag is exit 8 rather than exit 2, because the source the user insisted
+    // on is the one that is gone.
+    fx.crypto_daemon_keychain(&["unlock", "v", "--mounter", "null", "--password-keychain"])
+        .assert()
+        .code(8)
+        .stderr(predicates::str::contains("useKeychain"));
+    fx.crypto(&["config", "set", "useKeychain", "true"])
+        .assert()
+        .success();
+
+    // And an explicit --password-keychain for a vault with no entry is exit 8 too.
+    fx.crypto(&["vault", "create", fx.path("w").to_str().unwrap()])
+        .assert()
+        .success();
+    fx.crypto_daemon_keychain(&["unlock", "w", "--mounter", "null", "--password-keychain"])
+        .assert()
+        .code(8)
+        .stderr(predicates::str::contains("no passphrase is stored"));
+
+    // Nothing wrote to the keychain: `unlock` only reads it.
+    assert_eq!(
+        fx.fake_keychain_json(),
+        serde_json::json!({ &id: { "password": common::PW, "displayName": "v" } })
+    );
+}

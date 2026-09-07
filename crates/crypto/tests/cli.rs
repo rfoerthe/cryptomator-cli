@@ -1159,3 +1159,60 @@ fn config_get_and_set_the_cli_settings() {
         .code(2)
         .stderr(predicate::str::contains("logLevel"));
 }
+
+/// The keychain serves every command that reads an *existing* vault password, not just `unlock`.
+///
+/// `fs`/`name` go through `open_fs`, `password change` reads only its *current* password from it,
+/// and `recovery-key show` reads the one password it needs. All of it against the file-backed fake
+/// keychain, so the machine's real one is never touched.
+#[test]
+fn the_keychain_serves_fs_recovery_key_and_the_old_password_of_a_change() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    let id = sb.vault_id(0);
+    sb.seed_keychain(&id, "v", common::PW);
+
+    // No password source of any kind on the command line or in the environment.
+    sb.crypto_keychain(&["fs", "ls", "v"]).assert().success();
+    sb.crypto_keychain(&["recovery-key", "show", "v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+
+    // `password change` takes the *current* password from the keychain; the new one must still
+    // come from somewhere the user chose.
+    sb.crypto_keychain(&["password", "change", "v", "--new-password-env", "NP"])
+        .env("NP", "brand-new-passphrase")
+        .assert()
+        .success();
+    // The stored entry is not rewritten here -- that is `password store`'s job -- so the old
+    // password is still what the keychain holds, and the next read fails on it.
+    assert_eq!(
+        sb.fake_keychain_json()[&id]["password"].as_str(),
+        Some(common::PW)
+    );
+    sb.crypto_keychain(&["fs", "ls", "v"]).assert().code(4);
+
+    // Explicitly asking for a keychain entry that is not there names the vault by its display
+    // name, and never falls back to a prompt.
+    sb.crypto(&["vault", "create", sb.path("w").to_str().unwrap()])
+        .assert()
+        .success();
+    sb.crypto_keychain(&["fs", "ls", "w", "--password-keychain"])
+        .assert()
+        .code(8)
+        .stderr(predicate::str::contains("no passphrase is stored for w"));
+
+    // A new password never comes from the keychain, whatever the flag says.
+    sb.crypto_keychain(&[
+        "vault",
+        "create",
+        sb.path("x").to_str().unwrap(),
+        "--password-keychain",
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("--password-keychain"));
+}
