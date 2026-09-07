@@ -19,6 +19,15 @@ pub const LINUX_FUSE_CLASS: &str = "org.cryptomator.frontend.fuse.mount.LinuxFus
 pub const MAC_FUSE_CLASS: &str = "org.cryptomator.frontend.fuse.mount.MacFuseMountProvider";
 /// `org.cryptomator.frontend.fuse.mount.FuseTMountProvider`.
 pub const FUSE_T_CLASS: &str = "org.cryptomator.frontend.fuse.mount.FuseTMountProvider";
+/// `org.cryptomator.frontend.webdav.mount.FallbackMounter`.
+pub const FALLBACK_WEBDAV_CLASS: &str = "org.cryptomator.frontend.webdav.mount.FallbackMounter";
+/// `org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter`. Task 6 registers the service;
+/// the name is here so a build without it can still recognise it in a stored `mounter` setting.
+pub const MAC_APPLESCRIPT_CLASS: &str =
+    "org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter";
+/// `org.cryptomator.frontend.webdav.mount.LinuxGioMounter`. Same as
+/// [`MAC_APPLESCRIPT_CLASS`]: the constant exists before the service does.
+pub const LINUX_GIO_CLASS: &str = "org.cryptomator.frontend.webdav.mount.LinuxGioMounter";
 /// The null mounter has no Java counterpart; the name follows the CLI's own package.
 pub const NULL_MOUNTER_CLASS: &str = "org.cryptomator.cli.NullMountProvider";
 
@@ -35,6 +44,9 @@ const ALIASES: &[(&str, &str)] = &[
     ("macfuse", MAC_FUSE_CLASS),
     ("fuse-t", FUSE_T_CLASS),
     ("fuse", LINUX_FUSE_CLASS),
+    // `webdav` is the name scripts use; the two OS-integrated WebDAV mounters get their own
+    // aliases in task 6, together with the services themselves.
+    ("webdav", FALLBACK_WEBDAV_CLASS),
     ("null", NULL_MOUNTER_CLASS),
 ];
 
@@ -63,7 +75,7 @@ pub fn conflicting_classes(class: &str) -> &'static [&'static str] {
 }
 
 /// Every service this build knows, whether or not it works here: the platform's FUSE services by
-/// descending priority, then the null mounter.
+/// descending priority, then the WebDAV fallback, then the null mounter.
 pub fn all_services() -> Vec<Box<dyn MountService>> {
     let mut services: Vec<Box<dyn MountService>> = Vec::new();
     #[cfg(all(feature = "fuse", target_os = "macos"))]
@@ -75,6 +87,11 @@ pub fn all_services() -> Vec<Box<dyn MountService>> {
     {
         services.push(Box::new(crate::fuse::linux::LinuxFuseMountProvider));
     }
+    // `@Priority(Priority.FALLBACK)`: below every FUSE back end, above nothing but the null
+    // mounter. Pushed before the sort, which is stable, so it stays behind the equally ranked
+    // services that came first.
+    #[cfg(feature = "webdav")]
+    services.push(Box::new(crate::webdav::fallback::FallbackMounter));
     services.sort_by_key(|service| std::cmp::Reverse(service.priority()));
     services.push(Box::new(NullMountProvider::new()));
     services
@@ -429,13 +446,17 @@ mod tests {
             priorities.windows(2).all(|w| w[0] >= w[1]),
             "descending priorities, got {priorities:?}"
         );
+        // Spelled out per feature set rather than as one literal, so that every build this
+        // crate has -- `--no-default-features` included -- pins the whole order.
+        let mut expected: Vec<&str> = Vec::new();
         #[cfg(all(feature = "fuse", target_os = "macos"))]
-        assert_eq!(
-            classes,
-            vec![MAC_FUSE_CLASS, FUSE_T_CLASS, NULL_MOUNTER_CLASS]
-        );
+        expected.extend([MAC_FUSE_CLASS, FUSE_T_CLASS]);
         #[cfg(all(feature = "fuse", target_os = "linux"))]
-        assert_eq!(classes, vec![LINUX_FUSE_CLASS, NULL_MOUNTER_CLASS]);
+        expected.extend([LINUX_FUSE_CLASS]);
+        #[cfg(feature = "webdav")]
+        expected.extend([FALLBACK_WEBDAV_CLASS]);
+        expected.extend([NULL_MOUNTER_CLASS]);
+        assert_eq!(classes, expected);
     }
 
     #[test]
@@ -470,6 +491,7 @@ mod tests {
         assert_eq!(alias_for_class(FUSE_T_CLASS), Some("fuse-t"));
         assert_eq!(alias_for_class(MAC_FUSE_CLASS), Some("macfuse"));
         assert_eq!(alias_for_class(LINUX_FUSE_CLASS), Some("fuse"));
+        assert_eq!(alias_for_class(FALLBACK_WEBDAV_CLASS), Some("webdav"));
         assert_eq!(alias_for_class("org.example.Nope"), None);
     }
 

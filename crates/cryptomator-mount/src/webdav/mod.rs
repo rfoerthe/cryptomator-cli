@@ -14,6 +14,7 @@ pub mod fs;
 pub mod os_mount;
 pub mod server;
 
+pub use fallback::{FallbackMount, FallbackMounter, WebDavMountBuilder};
 pub use fs::{fs_error, CryptoDavEntry, CryptoDavFile, CryptoDavFs, CryptoDavMeta};
 pub use server::{
     probe_context_root, strip_prefix_for, WebDavServerConfig, WebDavServerError,

@@ -54,11 +54,16 @@ fn runtime() -> tokio::runtime::Runtime {
 /// Port 0 throughout: a fixed port would collide with whatever else this machine is running, and
 /// with the other tests in this file, which cargo runs in parallel threads of one process.
 fn server(fs: Arc<CryptoFs>) -> WebDavServerHandle {
+    server_at(fs, CTX)
+}
+
+/// The same, under `context_path`.
+fn server_at(fs: Arc<CryptoFs>, context_path: &str) -> WebDavServerHandle {
     WebDavServerHandle::start(WebDavServerConfig {
         fs: CryptoDavFs::new(fs),
         bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
         port: 0,
-        context_path: CTX.to_owned(),
+        context_path: context_path.to_owned(),
     })
     .expect("the server starts on an ephemeral port")
 }
@@ -123,6 +128,38 @@ fn the_server_reports_the_port_it_actually_bound_and_the_root_uri() {
     assert!(handle.is_running());
 }
 
+/// A volume id of `""` normalises to `/`, which is a reachable configuration -- and the one that
+/// `strip_prefix` must be *empty* for, or `DavPath` mis-parses every request path.
+#[test]
+fn a_root_context_path_serves_the_vault_at_the_server_root() {
+    let (_dir, fs) = test_fs();
+    let handle = server_at(Arc::clone(&fs), "/");
+    let addr = handle.local_addr();
+    assert_eq!(
+        handle.root_uri(),
+        format!("http://127.0.0.1:{}/", handle.port())
+    );
+    runtime().block_on(async move {
+        let (status, _, body) = send(addr, "PROPFIND", "/", &[("depth", "0")], b"").await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        assert!(
+            body.contains("<D:href>/</D:href>"),
+            "the root's own href is a bare slash: {body}"
+        );
+
+        let (status, _, _) = send(addr, "PUT", "/x.txt", &[], b"at the root").await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _, body) = send(addr, "GET", "/x.txt", &[], b"").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "at the root");
+    });
+    assert_eq!(
+        fs.read_file(&CleartextPath::parse("/x.txt"))
+            .expect("read back"),
+        b"at the root"
+    );
+}
+
 #[test]
 fn propfind_lists_the_vault_at_depth_zero_and_one() {
     let (_dir, fs) = test_fs();
@@ -184,6 +221,15 @@ fn put_get_and_a_ranged_get_move_bytes_through_the_vault() {
             headers.get("content-range").and_then(|v| v.to_str().ok()),
             Some("bytes 3-6/10")
         );
+
+        // A client asks HEAD before it downloads; it must get the size and no body.
+        let (status, headers, body) = send(addr, "HEAD", &format!("{CTX}/put.bin"), &[], b"").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("10")
+        );
+        assert!(body.is_empty(), "a HEAD has no body: {body:?}");
     });
     assert_eq!(
         fs.read_file(&CleartextPath::parse("/put.bin"))
@@ -201,6 +247,16 @@ fn mkcol_move_copy_and_delete_reach_the_vault() {
     runtime().block_on(async move {
         let (status, _, _) = send(addr, "MKCOL", &format!("{CTX}/coll"), &[], b"").await;
         assert_eq!(status, StatusCode::CREATED);
+        // RFC 4918 9.3.1: the collection is already there, and its parent is not.
+        let (status, _, _) = send(addr, "MKCOL", &format!("{CTX}/coll"), &[], b"").await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MKCOL on an existing collection"
+        );
+        let (status, _, _) = send(addr, "MKCOL", &format!("{CTX}/nope/deep"), &[], b"").await;
+        assert_eq!(status, StatusCode::CONFLICT, "MKCOL without a parent");
+
         let (status, _, _) = send(addr, "PUT", &format!("{CTX}/coll/a.txt"), &[], b"body").await;
         assert!(status.is_success(), "{status}");
 
@@ -214,6 +270,22 @@ fn mkcol_move_copy_and_delete_reach_the_vault() {
         )
         .await;
         assert!(status.is_success(), "{status}");
+
+        // `Overwrite: F` onto a target that exists is a precondition failure, not a clobber.
+        let destination = format!("{root}/coll/a.txt");
+        let (status, _, _) = send(
+            addr,
+            "MOVE",
+            &format!("{CTX}/coll/b.txt"),
+            &[("destination", &destination), ("overwrite", "F")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "Overwrite: F protects the target"
+        );
 
         let destination = format!("{root}/moved.txt");
         let (status, _, _) = send(
@@ -366,6 +438,20 @@ fn dropping_the_handle_stops_the_server() {
 /// How much of the announced body the two half-sent PUTs below start with.
 const PARTIAL_BODY: usize = 256 * 1024;
 
+/// Waits until the accept loop is provably closed: a *brand new* connection no longer gets a
+/// status line, because `stop()` dropped the listener before it started draining. That is the
+/// signal the drain test needs -- and it is an assertion in itself, where a fixed sleep was not.
+fn wait_until_not_accepting(addr: SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while probe_context_root(addr, CTX, Duration::ZERO) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the accept loop never closed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Waits until the server has opened `path`, i.e. until the PUT really is in flight.
 fn wait_until_open(fs: &CryptoFs, path: &CleartextPath) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -407,7 +493,7 @@ fn stopping_drains_a_request_that_is_still_in_flight() {
         let mut handle = handle;
         handle.stop().expect("stop");
     });
-    std::thread::sleep(Duration::from_millis(200));
+    wait_until_not_accepting(addr);
 
     stream
         .write_all(&vec![b'b'; PARTIAL_BODY])

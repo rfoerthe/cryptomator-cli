@@ -190,6 +190,17 @@ pub trait MountService: Send + Sync {
     fn appears_in_mount_table(&self) -> bool {
         true
     }
+    /// Whether a read-only mount of this service comes from the file system rather than from a
+    /// mount option.
+    ///
+    /// The WebDAV back ends serve the very `CryptoFs` the daemon opened: a vault opened read-only
+    /// answers every write with `EROFS`, which the adapter turns into `403 Forbidden`. They
+    /// therefore need no [`MountCapability::ReadOnly`] and no `-oro` to honour `--read-only`, and
+    /// [`MountService::capabilities`] stays identical to Java's. Every FUSE back end leaves this at
+    /// `false`: there the kernel has to be told.
+    fn read_only_follows_file_system(&self) -> bool {
+        false
+    }
     /// The mount flags used when the user does not supply any.
     fn default_mount_flags(&self) -> String;
     /// The port used when the user does not supply one (network mounts only).
@@ -360,6 +371,14 @@ mod tests {
             .unmount_path(Path::new("/mnt/Vault"), false)
             .expect_err("the default implementation refuses");
         assert!(matches!(err, UnmountError::Failed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn read_only_follows_the_file_system_only_where_a_service_says_so() {
+        assert!(
+            !DummyService.read_only_follows_file_system(),
+            "a FUSE back end mounts read-only itself or not at all"
+        );
     }
 
     #[test]

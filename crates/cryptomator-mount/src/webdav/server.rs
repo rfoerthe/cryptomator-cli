@@ -15,7 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 const WORKER_THREADS: usize = 2;
 /// The blocking pool every `CryptoFs` call runs on.
 const MAX_BLOCKING_THREADS: usize = 64;
+/// How many bytes of a status line the health probe is willing to read before it gives up.
+const MAX_STATUS_LINE: u64 = 4096;
 
 /// What a server needs to know before it starts.
 #[derive(Debug)]
@@ -92,8 +94,10 @@ impl From<WebDavServerError> for MountError {
 
 /// The prefix `dav-server` strips off a request path.
 ///
-/// A context path of `/` (an empty volume id) must become the empty prefix: `strip_prefix("/")`
-/// would take the leading slash off every request and leave a relative path behind.
+/// A context path of `/` (an empty volume id) becomes the *empty* prefix, which is what a root
+/// servlet context is in Java too. `dav-server` 0.11.0's `DavPath::set_prefix` happens to
+/// normalise `"/"` to the same zero-length prefix (`davpath.rs:180-197`), so the two are
+/// equivalent today; this keeps them equivalent by construction rather than by that coincidence.
 pub fn strip_prefix_for(context_path: &str) -> &str {
     if context_path == "/" {
         ""
@@ -113,6 +117,11 @@ pub struct WebDavServerHandle {
 
 impl WebDavServerHandle {
     /// Binds, starts serving and returns once the server answers on its context path.
+    ///
+    /// **Blocking.** It polls the health probe on the calling thread for up to [`HEALTH_TIMEOUT`],
+    /// and on the (rare) thread-spawn failure it drops the freshly built `Runtime` there too --
+    /// which panics inside a runtime. Call it from a plain thread, never from an async context;
+    /// wrap it in `spawn_blocking` if the caller has a runtime.
     ///
     /// The listener is bound on *this* thread with `std::net::TcpListener`, before the runtime is
     /// built: that way `EADDRINUSE` is a synchronous [`WebDavServerError::AddressInUse`] instead
@@ -213,12 +222,23 @@ impl WebDavServerHandle {
         )
     }
 
-    /// Whether the serving thread is still there.
+    /// Whether the serving thread is still there *and* still running.
+    ///
+    /// A thread that ended on its own -- `serve` bails out when tokio refuses the listener --
+    /// leaves the handle behind, so the mere presence of the join handle would keep answering
+    /// `true` for a server that is long gone.
     pub fn is_running(&self) -> bool {
-        self.worker.is_some()
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
     }
 
     /// Stops the server and returns once it is gone.
+    ///
+    /// **Blocking**, for up to 65 s in the worst case (5 s drain + 60 s blocking pool), and
+    /// [`Drop`](Self::drop) runs it too. Call it from a plain thread, never from an async context:
+    /// it joins the serving thread, and a daemon that stops a mount from inside its own runtime
+    /// would block a worker for the whole drain.
     ///
     /// Three steps, in this order: the accept loop is signalled so no new connection is taken; the
     /// open ones get 5 s to finish their request; then the runtime is torn down with 60 s for the
@@ -280,6 +300,10 @@ async fn serve(
                     }
                 };
                 let handler = handler.clone();
+                // Deliberately unbounded: no connection cap, no idle-read timeout, one task per
+                // socket. The listener is loopback-only (`check_bind_address`) and unauthenticated
+                // by design, so the only process that can pile sockets up here already runs as the
+                // user whose vault this is. Back-pressure comes from `MAX_BLOCKING_THREADS`.
                 let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                     let handler = handler.clone();
                     async move {
@@ -303,6 +327,10 @@ async fn serve(
             _ = stopped.as_mut() => break,
         }
     }
+    // Before the drain, not after it: while the listener lives, the kernel keeps completing
+    // handshakes from its backlog and those clients would get a reset instead of a plain
+    // `ECONNREFUSED`.
+    drop(listener);
     if tokio::time::timeout(DRAIN_TIMEOUT, graceful.shutdown())
         .await
         .is_err()
@@ -354,7 +382,12 @@ fn probe_once(addr: SocketAddr, context_path: &str) -> bool {
         return false;
     }
     let mut status = String::new();
-    if BufReader::new(stream).read_line(&mut status).is_err() {
+    // Bounded: on the way down the port may already belong to somebody else, and whoever answers
+    // is not obliged to ever send a newline.
+    if BufReader::new(stream.take(MAX_STATUS_LINE))
+        .read_line(&mut status)
+        .is_err()
+    {
         return false;
     }
     healthy_status(&status)
@@ -426,6 +459,26 @@ mod tests {
         assert_eq!(
             crate::webdav::bind_address(),
             IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    /// A serving thread that ended on its own -- `serve()` bails out when tokio refuses the
+    /// listener -- leaves its join handle behind; the handle must not keep claiming to be up.
+    #[test]
+    fn a_serving_thread_that_ended_on_its_own_is_not_running() {
+        let worker = std::thread::spawn(|| {});
+        while !worker.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let handle = WebDavServerHandle {
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4711),
+            context_path: "/v".to_owned(),
+            shutdown: None,
+            worker: Some(worker),
+        };
+        assert!(
+            !handle.is_running(),
+            "the thread is gone, whatever the join handle says"
         );
     }
 

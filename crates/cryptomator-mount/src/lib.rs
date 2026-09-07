@@ -45,4 +45,10 @@ pub use registry::{
     NullMountProvider, ENABLE_NULL_MOUNTER_ENV, FUSE_T_CLASS, LINUX_FUSE_CLASS, MAC_FUSE_CLASS,
     NULL_MOUNTER_CLASS, NULL_MOUNT_BUSY_ENV, NULL_MOUNT_MARKER,
 };
+// The class names of the WebDAV services travel with the feature that provides them; a build
+// without `webdav` reaches them through `registry::` if it really wants to compare a setting.
+#[cfg(feature = "webdav")]
+pub use registry::{FALLBACK_WEBDAV_CLASS, LINUX_GIO_CLASS, MAC_APPLESCRIPT_CLASS};
 pub use transcoder::{FuseNormalization, NameTranscoder};
+#[cfg(feature = "webdav")]
+pub use webdav::{FallbackMount, FallbackMounter, WebDavMountBuilder};
