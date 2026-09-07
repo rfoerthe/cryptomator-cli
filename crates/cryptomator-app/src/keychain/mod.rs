@@ -226,6 +226,110 @@ where
     }
 }
 
+/// How long a support probe may take before the provider counts as unusable.
+///
+/// `is_supported()` is documented as "must not throw and must fail fast", but on Linux it is a
+/// D-Bus round trip and on macOS it can wake `securityd`, so it is not actually guaranteed to
+/// answer. The registry therefore probes through [`with_timeout_for`] with a much shorter budget
+/// than a real call gets: choosing a provider must not cost the user 30 seconds per candidate.
+pub const KEYCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The provider class a settings value is served from.
+///
+/// Ruling 6: `TouchIdKeychainAccess` and `MacSystemKeychainAccess` address the *same* generic
+/// password items (same service, same account); only `requireOsAuthentication` differs, and the
+/// CLI cannot set that. So a `settings.json` that names the Touch-ID provider is served from the
+/// macOS backend -- reading and deleting work, and newly written items simply have no Touch-ID
+/// access control.
+pub fn canonical_provider_class(class_name: &str) -> &str {
+    if class_name == MAC_TOUCH_ID_CLASS {
+        MAC_SYSTEM_CLASS
+    } else {
+        class_name
+    }
+}
+
+/// The Java class name `settings.keychainProvider` asks for, after alias resolution
+/// ([`resolve_keychain_provider`]) and [`canonical_provider_class`].
+///
+/// An unusable value is *not* an error here: `KeychainModule.provideKeychainAccessProvider` falls
+/// back to the highest-priority supported provider for anything it does not recognise, and so do
+/// we. `crypto config set keychainProvider` is the place that rejects nonsense.
+fn wanted_provider_class(settings: &crate::settings::SettingsJson) -> String {
+    let resolved = resolve_keychain_provider(&settings.keychain_provider)
+        .unwrap_or_else(|_| settings.keychain_provider.clone());
+    canonical_provider_class(&resolved).to_string()
+}
+
+/// `provider` if it says it is supported within [`KEYCHAIN_PROBE_TIMEOUT`], otherwise `None`.
+///
+/// The provider is moved into the worker and handed back with the answer, because the worker
+/// outlives a timed-out call: a probe that hangs takes its provider with it rather than leaving
+/// the caller with a borrow into a thread nobody can stop.
+fn supported_or_skipped(provider: Box<dyn Keychain>) -> Option<Box<dyn Keychain>> {
+    let name = provider.display_name();
+    match with_timeout_for(name, KEYCHAIN_PROBE_TIMEOUT, move || {
+        let supported = provider.is_supported();
+        Ok((provider, supported))
+    }) {
+        Ok((provider, true)) => Some(provider),
+        Ok((_, false)) => None,
+        // A probe that times out counts as unsupported: the alternative is hanging the CLI on a
+        // backend that cannot even answer whether it exists.
+        Err(err) => {
+            log::warn!("skipping keychain provider {name}: {err}");
+            None
+        }
+    }
+}
+
+/// Every provider this build knows, highest [`Keychain::priority`] first.
+///
+/// While `$CRYPTO_KEYCHAIN_FAKE` is set this is exactly one entry -- the fake -- so no test can
+/// reach the user's real keychain (ruling 8). The fake also carries the highest priority, so it
+/// would win any selection even if a future caller mixed it with the real ones.
+///
+/// The list is *not* filtered by [`Keychain::is_supported`]: that probe belongs to the choice
+/// ([`for_settings`], which makes it through [`KEYCHAIN_PROBE_TIMEOUT`]), while `crypto keychain
+/// test` wants to report on the unsupported ones too.
+pub fn all_providers() -> Vec<Box<dyn Keychain>> {
+    if let Some(fake) = fake::FakeKeychain::from_env() {
+        return vec![Box::new(fake)];
+    }
+    let mut providers: Vec<Box<dyn Keychain>> = Vec::new();
+    // The macOS backend arrives in task 3, the Linux and KDE ones in task 4.
+    providers.extend(std::iter::empty());
+    providers.sort_by_key(|provider| std::cmp::Reverse(provider.priority()));
+    providers
+}
+
+/// `KeychainModule.provideKeychainAccessProvider`: nothing when `useKeychain` is off, otherwise
+/// the supported provider whose Java class name matches, otherwise the highest-priority supported
+/// one.
+///
+/// Every `is_supported()` call here goes through [`KEYCHAIN_PROBE_TIMEOUT`]; a provider that does
+/// not answer is skipped with a warning.
+pub fn for_settings(settings: &crate::settings::SettingsJson) -> Option<Box<dyn Keychain>> {
+    if !settings.use_keychain {
+        return None;
+    }
+    let wanted = wanted_provider_class(settings);
+    let mut fallback: Option<Box<dyn Keychain>> = None;
+    for provider in all_providers() {
+        let Some(provider) = supported_or_skipped(provider) else {
+            continue;
+        };
+        if provider.java_class_name() == wanted {
+            return Some(provider);
+        }
+        // `all_providers` is sorted, so the first survivor is the highest-priority one.
+        if fallback.is_none() {
+            fallback = Some(provider);
+        }
+    }
+    fallback
+}
+
 #[cfg(test)]
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -398,6 +502,94 @@ mod tests {
         // `store` is the one call with no answer to check, so the dummy counts it.
         dummy.store("known", Some("V"), "pw").unwrap();
         assert_eq!(dummy.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_fake_takes_over_the_whole_registry_when_it_is_switched_on() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var(fake::FAKE_ENV, dir.path().join("kc.json"));
+        let providers = all_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].java_class_name(), fake::FAKE_CLASS);
+        std::env::remove_var(fake::FAKE_ENV);
+    }
+
+    #[test]
+    fn for_settings_follows_the_desktop_apps_keychain_module() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(fake::FAKE_UNSUPPORTED_ENV);
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::env::set_var(fake::FAKE_ENV, dir.path().join("kc.json"));
+
+        // useKeychain == false is Javas `return null`.
+        let mut settings = crate::settings::SettingsJson {
+            use_keychain: false,
+            ..Default::default()
+        };
+        assert!(for_settings(&settings).is_none());
+
+        // A provider nobody supports falls back to the first supported one.
+        settings.use_keychain = true;
+        settings.keychain_provider = KDE_WALLET_CLASS.to_string();
+        assert_eq!(
+            for_settings(&settings).expect("fallback").java_class_name(),
+            fake::FAKE_CLASS
+        );
+
+        // And the matching one wins when it is there.
+        settings.keychain_provider = fake::FAKE_CLASS.to_string();
+        assert_eq!(
+            for_settings(&settings).expect("exact").java_class_name(),
+            fake::FAKE_CLASS
+        );
+
+        // Nothing supported at all is `None`, not the unsupported provider.
+        std::env::set_var(fake::FAKE_UNSUPPORTED_ENV, "1");
+        assert!(for_settings(&settings).is_none());
+        std::env::remove_var(fake::FAKE_UNSUPPORTED_ENV);
+        std::env::remove_var(fake::FAKE_ENV);
+    }
+
+    #[test]
+    fn touch_id_in_the_settings_resolves_to_the_macos_backend() {
+        // Ruling 6: the two Java providers write the same generic-password items, so the CLI
+        // serves `TouchIdKeychainAccess` from the macOS backend instead of refusing it.
+        assert_eq!(
+            canonical_provider_class(MAC_TOUCH_ID_CLASS),
+            MAC_SYSTEM_CLASS
+        );
+        assert_eq!(canonical_provider_class(MAC_SYSTEM_CLASS), MAC_SYSTEM_CLASS);
+        assert_eq!(canonical_provider_class(KDE_WALLET_CLASS), KDE_WALLET_CLASS);
+    }
+
+    #[test]
+    fn a_settings_value_may_be_an_alias_and_is_canonicalised() {
+        let mut settings = crate::settings::SettingsJson {
+            keychain_provider: "touchid".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(wanted_provider_class(&settings), MAC_SYSTEM_CLASS);
+        settings.keychain_provider = MAC_TOUCH_ID_CLASS.to_string();
+        assert_eq!(wanted_provider_class(&settings), MAC_SYSTEM_CLASS);
+        settings.keychain_provider = "kwallet".to_string();
+        assert_eq!(wanted_provider_class(&settings), KDE_WALLET_CLASS);
+        // Something the CLI does not know is carried through and simply matches nothing.
+        settings.keychain_provider = "nonsense".to_string();
+        assert_eq!(wanted_provider_class(&settings), "nonsense");
+    }
+
+    #[test]
+    fn providers_are_ordered_by_priority_descending() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(fake::FAKE_ENV);
+        let priorities: Vec<u32> = all_providers().iter().map(|p| p.priority()).collect();
+        // Backends arrive in tasks 3 (macOS) and 4 (Linux); until then the registry is empty
+        // outside the fake, and only the ordering itself is under test.
+        assert!(
+            priorities.windows(2).all(|w| w[0] >= w[1]),
+            "{priorities:?}"
+        );
     }
 
     fn err_hint_mentions_dialog(err: &KeychainError) -> bool {
