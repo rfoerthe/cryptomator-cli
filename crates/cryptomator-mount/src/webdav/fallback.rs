@@ -154,11 +154,18 @@ impl MountBuilder for WebDavMountBuilder {
         Ok(())
     }
 
-    /// Accepted by every WebDAV builder, used only by the AppleScript one -- exactly like Java,
-    /// where `AbstractMountBuilder` inherits the no-op and `MacAppleScriptMounter` overrides it.
-    /// A service that does not advertise `VOLUME_NAME` never has this called by
-    /// `mounting::mounter`.
+    /// Only the AppleScript builder takes a volume name, exactly like Java: `AbstractMountBuilder`
+    /// does *not* override `setVolumeName`, so the `MountBuilder` interface default throws, and
+    /// only `MacAppleScriptMounter.MountBuilderImpl` overrides it -- which is the same builder
+    /// that appends the name to the context path. `append_volume_name` therefore decides both.
+    ///
+    /// # Errors
+    /// [`crate::api::unsupported()`] for a service that does not advertise
+    /// [`MountCapability::VolumeName`].
     fn set_volume_name(&mut self, name: &str) -> Result<(), MountError> {
+        if !self.append_volume_name {
+            return Err(crate::api::unsupported());
+        }
         self.volume_name = Some(name.to_owned());
         Ok(())
     }
@@ -187,6 +194,10 @@ impl MountBuilder for WebDavMountBuilder {
 
 /// A mount that is nothing but the running server: the user reaches the vault at
 /// [`Mountpoint::Uri`] and mounts it in Finder, Nautilus or `curl` himself.
+///
+/// **Dropping or closing it blocks**, for up to 65 s in the worst case: both run
+/// [`WebDavServerHandle::stop`], which drains the open requests and waits for the deferred
+/// flushes. Never drop or close one from an async context; use `spawn_blocking`.
 #[derive(Debug)]
 pub struct FallbackMount {
     uri: String,
@@ -231,6 +242,8 @@ impl Mount for FallbackMount {
         self.stop()
     }
 
+    /// **Blocking**, up to 65 s -- see the type's own documentation and
+    /// [`WebDavServerHandle::stop`].
     fn close(mut self: Box<Self>) -> Result<(), UnmountError> {
         self.stop()
     }
@@ -239,7 +252,9 @@ impl Mount for FallbackMount {
 #[cfg(all(test, feature = "webdav"))]
 mod tests {
     use super::*;
-    use crate::registry::{alias_for_class, all_services, service_infos, FALLBACK_WEBDAV_CLASS};
+    use crate::registry::{
+        alias_for_class, all_services, service_by_class, service_infos, FALLBACK_WEBDAV_CLASS,
+    };
     use crate::testing::{env_lock, test_fs};
     use crate::webdav::server::probe_context_root;
     use std::net::SocketAddr;
@@ -309,8 +324,10 @@ mod tests {
         let mut builder = FallbackMounter.for_file_system(fs);
         builder.set_loopback_port(4711).expect("LOOPBACK_PORT");
         builder.set_volume_id("id").expect("VOLUME_ID");
-        // Not advertised, but inherited from `AbstractMountBuilder` so task 6 can override it.
-        builder.set_volume_name("Secret").expect("a no-op setter");
+        assert!(
+            builder.set_volume_name("Secret").is_err(),
+            "the fallback does not advertise VOLUME_NAME, and Java's interface default throws"
+        );
         assert!(builder
             .set_mountpoint(std::path::Path::new("/mnt"))
             .is_err());
@@ -328,7 +345,10 @@ mod tests {
         let mut plain = WebDavMountBuilder::new(Arc::clone(&fs), 0, false, finish);
         assert_eq!(plain.context_path(), "/", "no volume id: the server root");
         plain.set_volume_id("id").expect("VOLUME_ID");
-        plain.set_volume_name("My Vault").expect("VOLUME_NAME");
+        assert!(
+            plain.set_volume_name("My Vault").is_err(),
+            "a builder that does not append the name does not take one either"
+        );
         assert_eq!(plain.context_path(), "/id");
         assert!(format!("{plain:?}").contains("/id"), "{plain:?}");
 
@@ -400,6 +420,11 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var(crate::registry::ENABLE_NULL_MOUNTER_ENV);
         assert_eq!(alias_for_class(FALLBACK_WEBDAV_CLASS), Some("webdav"));
+        assert_eq!(
+            service_by_class(FALLBACK_WEBDAV_CLASS).map(|s| s.display_name()),
+            Some("WebDAV (HTTP Address)"),
+            "a stored `mounter` setting naming the class finds the service"
+        );
         let services = all_services();
         let classes: Vec<&str> = services.iter().map(|s| s.java_class_name()).collect();
         let fallback = classes

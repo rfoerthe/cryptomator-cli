@@ -11,7 +11,19 @@ use anyhow::Result;
 use cryptomator_mount::api::ServiceInfo;
 use cryptomator_mount::registry;
 
-const HEADER: &str = "ALIAS     CLASS                                                         SUPPORTED  CAPABILITIES";
+/// The width of the alias column: the longest alias the registry hands out is
+/// `webdav-applescript`. The header is built with the same width, so the two cannot drift apart.
+const ALIAS_WIDTH: usize = 18;
+
+/// The table header.
+fn header() -> String {
+    row("ALIAS", "CLASS", "SUPPORTED", "CAPABILITIES")
+}
+
+/// One line of the table, header and services alike.
+fn row(alias: &str, class: &str, supported: &str, capabilities: &str) -> String {
+    format!("{alias:<ALIAS_WIDTH$}  {class:<60}  {supported:<9}  {capabilities}")
+}
 
 pub fn mounters(ctx: &Ctx, args: MountersArgs) -> Result<u8> {
     let services = registry::service_infos(args.all);
@@ -27,14 +39,13 @@ fn render(services: &[ServiceInfo]) -> String {
                 this build knows."
             .to_string();
     }
-    let mut lines = vec![HEADER.to_string()];
+    let mut lines = vec![header()];
     for service in services {
-        lines.push(format!(
-            "{:<8}  {:<60}  {:<9}  {}",
+        lines.push(row(
             service.alias.as_deref().unwrap_or("-"),
-            service.class_name,
+            &service.class_name,
             if service.supported { "yes" } else { "no" },
-            service.capabilities.join(","),
+            &service.capabilities.join(","),
         ));
     }
     lines.join("\n")
@@ -62,7 +73,7 @@ mod tests {
 
         let rendered = render(&[info(Some("fuse-t"), true), info(None, false)]);
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines[0], HEADER);
+        assert_eq!(lines[0], header());
         assert!(lines[1].starts_with("fuse-t"), "{}", lines[1]);
         assert!(lines[1].contains("org.example.Mounter"), "{}", lines[1]);
         assert!(lines[1].contains("yes"), "{}", lines[1]);
@@ -74,5 +85,26 @@ mod tests {
         // A service without a short name still lines up.
         assert!(lines[2].starts_with("-  "), "{}", lines[2]);
         assert!(lines[2].contains(" no "), "{}", lines[2]);
+        // Every column starts where the header says it does.
+        for line in &lines[1..] {
+            assert_eq!(
+                line.find("org.example.Mounter"),
+                lines[0].find("CLASS"),
+                "{line}"
+            );
+        }
+    }
+
+    /// The alias column has to be wide enough for the longest alias the registry knows, or the
+    /// table shifts by a column for exactly that row.
+    #[test]
+    fn no_alias_is_wider_than_its_column() {
+        for service in registry::service_infos(true) {
+            let Some(alias) = service.alias else { continue };
+            assert!(
+                alias.len() <= ALIAS_WIDTH,
+                "{alias} does not fit into {ALIAS_WIDTH} columns"
+            );
+        }
     }
 }
