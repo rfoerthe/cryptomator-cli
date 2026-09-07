@@ -458,6 +458,7 @@ dependencies = [
  "cryptomator-mount",
  "data-encoding",
  "libc",
+ "log",
  "predicates",
  "serde_json",
  "sha2",

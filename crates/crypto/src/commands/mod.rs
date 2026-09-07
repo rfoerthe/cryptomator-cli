@@ -110,9 +110,6 @@ impl Ctx {
     ///
     /// # Errors
     /// [`AppError::Keychain`] with [`KeychainError::Unsupported`] when no provider is in use.
-    // The commands that need it -- `password store`, `password forget`, `keychain test` -- are
-    // tasks 6 and 7; this is the API they are written against.
-    #[allow(dead_code)]
     pub fn keychain_required(&self) -> Result<Arc<dyn Keychain>> {
         match self.keychain()? {
             Some(keychain) => Ok(keychain),
@@ -161,8 +158,7 @@ pub fn keychain_source<'a>(
 /// # Errors
 /// [`AppError::Keychain`] (exit code 8) for whatever the provider reported, including a timeout.
 // The passphrase source reaches the same wrapper through `cryptomator_app::keychain::call`; the
-// `store`/`delete`/`change` callers are tasks 6 and 7.
-#[allow(dead_code)]
+// `store`/`delete`/`change` callers are the `crypto password store|forget|change` commands.
 pub fn keychain_call<T, F>(keychain: &Arc<dyn Keychain>, op: F) -> Result<T>
 where
     T: Send + 'static,
@@ -261,10 +257,6 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
     // locked in the runtime sense too; `crypto lock --force` is the way out of a stale mount.
     ctx.registry().require_locked(&vault)?;
     Ok((vault, path))
-}
-
-pub fn locked_vault_path(ctx: &Ctx, reference: &str) -> Result<PathBuf> {
-    locked_vault(ctx, reference).map(|(_, path)| path)
 }
 
 #[cfg(test)]

@@ -326,6 +326,25 @@ pub struct AddArgs {
 pub enum PasswordCommand {
     /// Change the password of a vault (writes a .bkup of the old masterkey file)
     Change(ChangePasswordArgs),
+    /// Verify a password and save it in the keychain
+    Store(StorePasswordArgs),
+    /// Remove a vault's password from the keychain
+    Forget {
+        /// Vault id, display name or path
+        // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+        #[arg(allow_hyphen_values = true)]
+        vault: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct StorePasswordArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
 }
 
 #[derive(Args, Debug)]

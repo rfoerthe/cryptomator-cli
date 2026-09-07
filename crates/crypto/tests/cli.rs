@@ -1187,13 +1187,13 @@ fn the_keychain_serves_fs_recovery_key_and_the_old_password_of_a_change() {
         .env("NP", "brand-new-passphrase")
         .assert()
         .success();
-    // The stored entry is not rewritten here -- that is `password store`'s job -- so the old
-    // password is still what the keychain holds, and the next read fails on it.
+    // The stored entry follows the change (`KeychainManager.changePassphrase`), so the keychain
+    // keeps working as a password source instead of silently failing every later unlock.
     assert_eq!(
         sb.fake_keychain_json()[&id]["password"].as_str(),
-        Some(common::PW)
+        Some("brand-new-passphrase")
     );
-    sb.crypto_keychain(&["fs", "ls", "v"]).assert().code(4);
+    sb.crypto_keychain(&["fs", "ls", "v"]).assert().success();
 
     // Explicitly asking for a keychain entry that is not there names the vault by its display
     // name, and never falls back to a prompt.
@@ -1215,4 +1215,171 @@ fn the_keychain_serves_fs_recovery_key_and_the_old_password_of_a_change() {
     .assert()
     .code(2)
     .stderr(predicate::str::contains("--password-keychain"));
+}
+
+#[test]
+fn password_store_verifies_before_it_saves_and_forget_removes_again() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    let id = sb.vault_id(0);
+
+    // A wrong passphrase is never stored: exit 4, and the keychain stays empty.
+    sb.crypto_keychain(&["password", "store", "v", "--password-stdin"])
+        .write_stdin("wrong-password-here\n")
+        .assert()
+        .code(4);
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+
+    // The right one is verified and then stored, with the display name next to it.
+    sb.crypto_keychain(&["password", "store", "v", "--password-stdin"])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Password stored for v"));
+    let stored = sb.fake_keychain_json();
+    assert_eq!(stored[&id]["password"], common::PW);
+    assert_eq!(stored[&id]["displayName"], "v");
+
+    // `--json` says what happened without ever printing the passphrase.
+    let out = sb
+        .crypto_keychain(&["--json", "password", "store", "v", "--password-stdin"])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf-8");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(json["id"], id.as_str());
+    assert_eq!(json["stored"], true);
+    assert!(
+        !stdout.contains(common::PW),
+        "the passphrase never reaches stdout"
+    );
+
+    // The stored password is enough to open the vault with no other source.
+    sb.crypto_keychain(&["fs", "ls", "v"]).assert().success();
+
+    // forget removes it and says so; a second forget says there was nothing.
+    sb.crypto_keychain(&["--json", "password", "forget", "v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"forgotten\": true"));
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+    sb.crypto_keychain(&["password", "forget", "v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No stored password for v"));
+    sb.crypto_keychain(&["--json", "password", "forget", "v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"forgotten\": false"));
+}
+
+#[test]
+fn password_store_without_a_keychain_is_exit_eight() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    // --no-keychain: the command has no reason to exist in this run.
+    sb.crypto_keychain(&[
+        "--no-keychain",
+        "password",
+        "store",
+        "v",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .code(8)
+    .stderr(predicate::str::contains("--no-keychain"));
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+
+    // useKeychain = false is the same answer, with a different reason -- for `forget` too.
+    sb.crypto(&["config", "set", "useKeychain", "false"])
+        .assert()
+        .success();
+    sb.crypto_keychain(&["password", "store", "v", "--password-stdin"])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .code(8)
+        .stderr(predicate::str::contains("useKeychain"));
+    sb.crypto_keychain(&["password", "forget", "v"])
+        .assert()
+        .code(8)
+        .stderr(predicate::str::contains("useKeychain"));
+}
+
+#[test]
+fn password_change_without_a_stored_passphrase_touches_nothing() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    sb.crypto_keychain(&[
+        "password",
+        "change",
+        "v",
+        "--password-stdin",
+        "--new-password-env",
+        "NEW_PW",
+    ])
+    .env("NEW_PW", "brand-new-password")
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .success()
+    // Nothing was stored, so nothing is claimed to have been updated.
+    .stdout(predicate::str::contains("keychain").not());
+    assert_eq!(
+        sb.fake_keychain_json(),
+        serde_json::json!({}),
+        "changePassphrase is a noop when there is no item"
+    );
+}
+
+#[test]
+fn recovery_key_reset_password_carries_a_stored_passphrase_along() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto(&[
+            "--json",
+            "vault",
+            "create",
+            sb.path("v").to_str().unwrap(),
+            "--show-recovery-key",
+        ])
+        .assert()
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let recovery_key = json["recoveryKey"]
+        .as_str()
+        .expect("recovery key")
+        .to_string();
+    let id = sb.vault_id(0);
+    sb.crypto_keychain(&["password", "store", "v", "--password-stdin"])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success();
+
+    sb.crypto_keychain(&[
+        "recovery-key",
+        "reset-password",
+        "v",
+        "--recovery-key-stdin",
+        "--new-password-env",
+        "NEW_PW",
+    ])
+    .env("NEW_PW", "reset-password-123")
+    .write_stdin(format!("{recovery_key}\n"))
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("keychain"));
+    assert_eq!(
+        sb.fake_keychain_json()[&id]["password"],
+        "reset-password-123",
+        "a stale keychain entry would break every later unlock silently"
+    );
+    // And the new one really opens the vault, straight out of the keychain.
+    sb.crypto_keychain(&["fs", "ls", "v"]).assert().success();
 }

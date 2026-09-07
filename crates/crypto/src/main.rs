@@ -84,9 +84,11 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             VaultCommand::Info { vault } => commands::vault::info(&ctx, &vault),
             VaultCommand::Set(args) => commands::vault::set(&ctx, args),
         },
-        Command::Password {
-            command: PasswordCommand::Change(args),
-        } => commands::password::change(&ctx, args),
+        Command::Password { command } => match command {
+            PasswordCommand::Change(args) => commands::password::change(&ctx, args),
+            PasswordCommand::Store(args) => commands::password::store(&ctx, args),
+            PasswordCommand::Forget { vault } => commands::password::forget(&ctx, &vault),
+        },
         Command::RecoveryKey { command } => match command {
             RecoveryKeyCommand::Show(args) => commands::recovery::show(&ctx, args),
             RecoveryKeyCommand::ResetPassword(args) => {
