@@ -6,6 +6,12 @@
 //! delete the real `"Cryptomator"` items the desktop app owns. Everything created is deleted
 //! again through a guard that also runs when a test panics.
 //!
+//! That service-name isolation is a macOS story, though (Minor 6): there, an item is addressed by
+//! its service, so `crypto-e2e-<pid>` alone keeps two concurrent runs apart. On Linux an item is
+//! addressed by its `Vault` attribute instead -- the service name is only the item *label* -- so
+//! every *key* used here carries the pid too, not just `$CRYPTO_KEYCHAIN_SERVICE`; see
+//! `round_trip`'s key and `linux_attributes`'s.
+//!
 //! Every call goes through `with_timeout_for`, so a macOS ACL dialog nobody answers ends a phase
 //! with a printed "skipped:" instead of hanging the suite (spike B, observation 5: the API itself
 //! has no timeout).
@@ -160,7 +166,10 @@ fn the_real_keychain_behaves_like_the_fake_one() {
 
 /// Store, load, change, delete -- on items this binary created itself, so nothing should prompt.
 fn round_trip(provider: &Arc<dyn Keychain>) -> bool {
-    let key = "round-trip".to_string();
+    // Pid-scoped (Minor 6): on Linux the item is found by this key alone, not by
+    // `$CRYPTO_KEYCHAIN_SERVICE`, so a fixed key would let two concurrent runs on one machine
+    // share -- and stomp on -- the same item.
+    let key = format!("crypto-e2e-{}-round-trip", std::process::id());
     let mut cleanup = Cleanup {
         provider: Arc::clone(provider),
         keys: vec![key.clone()],
@@ -492,10 +501,14 @@ fn a_foreign_entry(service: &str) {
     }
 }
 
-/// The proof that Linux items really have the shape `integrations-linux` writes -- the one thing
-/// that could not be read from Java source on the development machine (no `integrations-linux`
-/// jar in `~/.m2`). It writes with the GNOME variant and reads back with the Secret Service one,
-/// which only works if both agree on the collection, the label and the `Vault` attribute.
+/// Proof that the two Linux variants agree with each other -- *not* proof that either matches
+/// what `integrations-linux` actually writes (Important 2, ruling): that jar is not on the
+/// development machine (no `~/.m2/repository/org/cryptomator/integrations-linux/`), so this
+/// phase can only write with the GNOME variant and read back with the Secret Service one, which
+/// passes as long as both agree on the collection, the label and the `Vault` attribute. It would
+/// pass unchanged if that shared attribute were misnamed, the label wrong or the content type
+/// something other than `text/plain` -- none of that is read back and asserted on here.
+/// Task 10: CI asserts the raw attribute names via `secret-tool`.
 ///
 /// A phase of the test above rather than a test of its own, like the macOS ones: the file's rule
 /// is one test with ordered phases, and here it also means the round trip has already proven the

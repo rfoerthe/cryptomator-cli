@@ -16,8 +16,11 @@
 //!
 //! **Provenance:** `~/.m2/repository/org/cryptomator/integrations-linux/` does not exist on the
 //! development machine, so this table comes from the design spec rather than from read Java
-//! source. `crates/cryptomator-app/tests/keychain_e2e.rs` checks it against a live gnome-keyring,
-//! and until that has run on Linux the shape is unverified.
+//! source. `crates/cryptomator-app/tests/keychain_e2e.rs` runs both variants against a live
+//! gnome-keyring, but only proves that *they* agree with each other on the collection, the label
+//! and the `Vault` attribute -- it does not read back the raw attribute names, the label or the
+//! content type, so this table itself stays unverified against the real `integrations-linux`
+//! output until something does. Task 10: CI asserts the raw attribute names via `secret-tool`.
 //!
 //! Blocking on purpose: `secret_service::blocking` drives zbus's blocking API, and with the
 //! `tokio` feature `zbus::block_on` builds its own runtime in a `OnceLock`. That works outside a
@@ -34,7 +37,7 @@ use super::{
     service_name, Keychain, KeychainError, KeychainResult, GNOME_KEYRING_CLASS,
     SECRET_SERVICE_CLASS,
 };
-use secret_service::blocking::{Collection, SecretService};
+use secret_service::blocking::{Collection, Item, SecretService};
 use secret_service::{EncryptionType, Error as SsError};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
@@ -63,6 +66,12 @@ const GNOME_KEYRING_DISPLAY_NAME: &str = "GNOME Keyring (secret service)";
 const UNAVAILABLE_HINT: &str = "no secret service is running on the session bus; start \
                                 gnome-keyring (or another Secret Service provider), or set \
                                 useKeychain to false";
+/// What a Secret Service that answers but has no usable collection means for the user, and what
+/// to do about it (Minor 7): the bus is there, but neither the alias it calls `default` nor the
+/// `login` fallback resolves to a collection this backend could ever write to.
+const NO_COLLECTION_HINT: &str = "the secret service has no default collection and none aliased \
+                                  'login'; create one with your keyring's own tool, or set \
+                                  useKeychain to false";
 /// A prompt the user dismissed, or one that could not be shown at all.
 const PROMPT_HINT: &str = "answer the keyring dialog instead of dismissing it, or unlock the \
                            keyring before running crypto";
@@ -155,6 +164,44 @@ impl SecretServiceKeychain {
         }
     }
 
+    /// The `SsError` -> [`KeychainError`] mapping for a *connect* attempt (Important 1), as
+    /// opposed to a later call on an already-open session.
+    ///
+    /// [`Self::map`]'s `Unavailable` arm is nearly unreachable in practice: secret-service 5.2.0
+    /// only produces it for `InterfaceNotFound`, `Address(_)` or `InputOutput(NotFound)`
+    /// (`secret-service::util::handle_conn_error`), but a dead or absent session-bus socket
+    /// surfaces from zbus 5.19 as `zbus::Error::Connection`, and a live bus with nothing owning
+    /// `org.freedesktop.secrets` fails inside `Session::new_blocking`'s `OpenSession` call, which
+    /// comes back as a bare `SsError::Zbus`/`ZbusFdo` wrapping whatever zbus itself produced.
+    /// None of those are the backend's fault or the user's to retry -- they all mean "no Secret
+    /// Service to talk to here" -- so all three become the same [`KeychainError::Unsupported`].
+    fn map_connect_error(&self, err: SsError) -> KeychainError {
+        match err {
+            SsError::Unavailable | SsError::Zbus(_) | SsError::ZbusFdo(_) => {
+                KeychainError::Unsupported {
+                    provider: self.display_name().to_string(),
+                    hint: UNAVAILABLE_HINT.to_string(),
+                }
+            }
+            other => self.map(other),
+        }
+    }
+
+    /// The `SsError` -> [`KeychainError`] mapping for [`Self::collection`]'s `login` fallback
+    /// (Minor 7): a service that answers but names neither a `default` collection nor one aliased
+    /// `login` cannot ever be written to by this backend, which is what
+    /// [`KeychainError::Unsupported`] is for -- not the generic [`KeychainError::Backend`] that
+    /// [`Self::map`] gives a bare `NoResult`.
+    fn map_missing_collection(&self, err: SsError) -> KeychainError {
+        match err {
+            SsError::NoResult => KeychainError::Unsupported {
+                provider: self.display_name().to_string(),
+                hint: NO_COLLECTION_HINT.to_string(),
+            },
+            other => self.map(other),
+        }
+    }
+
     /// Runs `f` against a fresh session-bus connection and drops it again; see the module docs for
     /// why the connection cannot live in `self`.
     fn with_connection<R>(
@@ -162,7 +209,8 @@ impl SecretServiceKeychain {
         f: impl FnOnce(&SecretService<'_>) -> KeychainResult<R>,
     ) -> KeychainResult<R> {
         // `Dh`: the secret travels encrypted over the bus, like every other Secret Service client.
-        let service = SecretService::connect(EncryptionType::Dh).map_err(|err| self.map(err))?;
+        let service = SecretService::connect(EncryptionType::Dh)
+            .map_err(|err| self.map_connect_error(err))?;
         f(&service)
     }
 
@@ -173,7 +221,7 @@ impl SecretServiceKeychain {
             Ok(collection) => Ok(collection),
             Err(SsError::NoResult) => service
                 .get_collection_by_alias(LOGIN_COLLECTION_ALIAS)
-                .map_err(|err| self.map(err)),
+                .map_err(|err| self.map_missing_collection(err)),
             Err(err) => Err(self.map(err)),
         }
     }
@@ -188,6 +236,44 @@ impl SecretServiceKeychain {
         let collection = self.collection(service)?;
         collection.ensure_unlocked().map_err(|err| self.map(err))?;
         Ok(collection)
+    }
+
+    /// Which of `items` [`Self::write`] should delete after creating `created` -- everything else
+    /// in the search result -- or `None` when `created` is not even *in* `items` (Minor 3).
+    ///
+    /// That last case must skip the cleanup rather than run it: a naive `!= created` filter would
+    /// then treat every result as stale, including whichever one actually holds the passphrase
+    /// just written, and delete it while still reporting success. Generic and free of any D-Bus
+    /// type on purpose, so it can be tested without a live connection -- `Item`'s own equality
+    /// (`secret-service-5.2.0/src/blocking/item.rs:142-147`) is exactly `PartialEq` on its D-Bus
+    /// path, so a plain `PartialEq` bound here exercises the same logic.
+    fn superseded<'a, T: PartialEq>(items: &'a [T], created: &T) -> Option<Vec<&'a T>> {
+        if items.iter().any(|item| item == created) {
+            Some(items.iter().filter(|item| *item != created).collect())
+        } else {
+            None
+        }
+    }
+
+    /// The "delete what we can, then report" rule behind [`Keychain::delete`] (Minor 4): every
+    /// outcome is tried, folded into whether *anything* was removed and what the *first* failure
+    /// was, independent of any D-Bus type so it can be tested without a live connection.
+    fn fold_delete_results<E>(
+        results: impl IntoIterator<Item = Result<(), E>>,
+    ) -> (bool, Option<E>) {
+        let mut deleted_any = false;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(()) => deleted_any = true,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        (deleted_any, first_error)
     }
 
     /// `CreateItem` with `replace = true`, plus the cleanup that keeps "one item per vault" true.
@@ -218,18 +304,24 @@ impl SecretServiceKeychain {
             )
             .map_err(|err| self.map(err))?;
         match collection.search_items(self.search_attributes(key).into_iter().collect()) {
-            Ok(items) => {
-                for stale in items.iter().filter(|item| **item != created) {
-                    if let Err(err) = stale.delete() {
-                        // Neither branch can carry the passphrase: `map` only ever sees the
-                        // Secret Service's own words, and the vault id is not part of them.
-                        log::warn!(
-                            "could not remove a superseded keychain item: {}",
-                            self.map(err)
-                        );
+            Ok(items) => match Self::superseded(&items, &created) {
+                Some(stale) => {
+                    for item in stale {
+                        if let Err(err) = item.delete() {
+                            // Neither branch can carry the passphrase: `map` only ever sees the
+                            // Secret Service's own words, and the vault id is not part of them.
+                            log::warn!(
+                                "could not remove a superseded keychain item: {}",
+                                self.map(err)
+                            );
+                        }
                     }
                 }
-            }
+                None => log::warn!(
+                    "the item just written was not among the search results for its own \
+                     attributes; skipping cleanup of superseded keychain items"
+                ),
+            },
             Err(err) => log::warn!(
                 "could not look for superseded keychain items: {}",
                 self.map(err)
@@ -267,8 +359,16 @@ impl Keychain for SecretServiceKeychain {
     /// There is no timeout here on purpose -- the registry probes this through
     /// [`crate::keychain::KEYCHAIN_PROBE_TIMEOUT`], and a second one inside would only make the
     /// budget harder to reason about.
+    ///
+    /// Blocking on purpose, like everything else in this module (see the module docs): this goes
+    /// through [`Self::with_connection`], whose `connect` drives zbus's blocking API via
+    /// `zbus::block_on`, which *panics* if called from inside a tokio runtime (Minor 5). Nothing
+    /// here builds one, but nothing here guards against it either -- today's callers are the
+    /// registry's own worker thread ([`crate::keychain::with_timeout`]) and, directly, the E2E
+    /// test's main thread. A future async call site must route through `with_timeout` (or a
+    /// worker thread of its own) rather than call this directly.
     fn is_supported(&self) -> bool {
-        SecretService::connect(EncryptionType::Dh).is_ok()
+        self.with_connection(|_| Ok(())).is_ok()
     }
 
     /// Whether the collection this backend writes to is locked. Anything that stops us from even
@@ -320,11 +420,14 @@ impl Keychain for SecretServiceKeychain {
                 return Ok(false);
             }
             // Several items for one vault should not happen ([`Self::write`] cleans them up), but
-            // a keyring that has them from an older version must end up empty, not half empty.
-            for item in &items {
-                item.delete().map_err(|err| self.map(err))?;
+            // a keyring that has them from an older version must end up empty, not half empty
+            // (Minor 4): one locked item must not stop the rest from being removed.
+            let (deleted_any, first_error) =
+                Self::fold_delete_results(items.iter().map(Item::delete));
+            match first_error {
+                Some(err) => Err(self.map(err)),
+                None => Ok(deleted_any),
             }
-            Ok(true)
         })
     }
 
@@ -472,5 +575,107 @@ mod tests {
             None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
         }
         assert!(!supported);
+    }
+
+    #[test]
+    fn connect_errors_map_to_unsupported() {
+        // Important 1: a dead/absent socket surfaces from secret-service 5.2.0 as
+        // `SsError::Zbus(zbus::Error::Connection(..))`, not `SsError::Unavailable` -- the same
+        // shape `is_supported_is_false_without_a_session_bus` produces, just inspected here
+        // through the connect mapper instead of the `bool` `is_supported` collapses it to.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        std::env::set_var(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/crypto-test",
+        );
+        // `SecretService` has no `Debug` impl, so `expect_err`/`unwrap_err` cannot be used here.
+        let err = match SecretService::connect(EncryptionType::Dh) {
+            Err(err) => err,
+            Ok(_) => panic!("no session bus is listening on that path"),
+        };
+        match previous {
+            Some(value) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value),
+            None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+        }
+        assert!(
+            matches!(err, SsError::Zbus(_)),
+            "if secret-service starts mapping this to Unavailable itself, this assertion (and \
+             the finding it documents) needs revisiting, not deleting"
+        );
+        let gnome = SecretServiceKeychain::gnome_keyring();
+        match gnome.map_connect_error(err) {
+            KeychainError::Unsupported { hint, .. } => assert_eq!(hint, UNAVAILABLE_HINT),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_error_mapper_delegates_non_connect_errors() {
+        // A locked collection or a dismissed prompt during connect (the session handshake can
+        // itself prompt) must still surface as their own `KeychainError`, not get swallowed into
+        // `Unsupported`.
+        let gnome = SecretServiceKeychain::gnome_keyring();
+        assert!(matches!(
+            gnome.map_connect_error(SsError::Locked),
+            KeychainError::Locked { .. }
+        ));
+        assert!(matches!(
+            gnome.map_connect_error(SsError::Prompt),
+            KeychainError::AccessDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_collection_is_unsupported() {
+        // Minor 7: when neither the default nor the `login` collection resolves, the caller must
+        // get an actionable `Unsupported`, not the generic `Backend` that `map` gives a bare
+        // `NoResult`.
+        let gnome = SecretServiceKeychain::gnome_keyring();
+        match gnome.map_missing_collection(SsError::NoResult) {
+            KeychainError::Unsupported { hint, .. } => assert_eq!(hint, NO_COLLECTION_HINT),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        // Anything else about the `login` lookup still goes through the general mapping.
+        assert!(matches!(
+            gnome.map_missing_collection(SsError::Locked),
+            KeychainError::Locked { .. }
+        ));
+    }
+
+    #[test]
+    fn superseded_skips_cleanup_when_the_created_item_is_missing() {
+        // Minor 3: if the search result does not even contain what was just created, a naive
+        // `!= created` filter would treat every item in it as stale -- including, potentially,
+        // the one that holds the passphrase just written. `superseded` must refuse to pick
+        // anything in that case rather than delete on a guess.
+        assert_eq!(SecretServiceKeychain::superseded(&[1, 2, 3], &4), None);
+        assert_eq!(
+            SecretServiceKeychain::superseded(&[1, 2, 3], &2),
+            Some(vec![&1, &3])
+        );
+        // Exactly one result, and it is the one just created: nothing to clean up, but that is a
+        // *found and empty* answer, not the *not found* one above.
+        assert_eq!(SecretServiceKeychain::superseded(&[5], &5), Some(vec![]));
+    }
+
+    #[test]
+    fn fold_delete_results_tries_everything_and_keeps_the_first_error() {
+        // Minor 4: one failing item must not stop the rest from being deleted, and the caller
+        // must still learn that something went wrong -- but only the first failure, not the last.
+        let (deleted_any, first_error) =
+            SecretServiceKeychain::fold_delete_results([Ok(()), Err("first"), Err("second")]);
+        assert!(deleted_any, "the succeeding delete must still count");
+        assert_eq!(first_error, Some("first"));
+
+        let (deleted_any, first_error) =
+            SecretServiceKeychain::fold_delete_results([Ok::<(), &str>(()), Ok(())]);
+        assert!(deleted_any);
+        assert_eq!(first_error, None);
+
+        let (deleted_any, first_error) =
+            SecretServiceKeychain::fold_delete_results([Err("only"), Err("second")]);
+        assert!(!deleted_any);
+        assert_eq!(first_error, Some("only"));
     }
 }
