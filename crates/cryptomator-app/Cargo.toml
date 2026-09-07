@@ -30,3 +30,8 @@ security-framework.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# The keychain E2E seeds an item under the *legacy* service name, which carries a NUL byte: only
+# `SecKeychainAddGenericPassword`, which takes a length-delimited byte range, can express it.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework.workspace = true

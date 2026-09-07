@@ -105,8 +105,14 @@ pub enum KeychainError {
     Locked { provider: String },
     /// The backend refused the call: the user cancelled the prompt, authentication failed, or the
     /// session may not show a prompt at all. Distinct from [`Self::Backend`] because it is the one
-    /// failure the user can do something about without filing a bug.
-    AccessDenied { provider: String, message: String },
+    /// failure the user can do something about without filing a bug -- `hint` is *what*, and it
+    /// depends on the refusal: a prompt that was cancelled can be approved on the next run, a
+    /// session that may not show one at all never will be.
+    AccessDenied {
+        provider: String,
+        message: String,
+        hint: String,
+    },
     /// The call did not answer within `after` -- on macOS almost always an ACL dialog nobody is
     /// looking at. `after` is the budget the call actually had, which is [`KEYCHAIN_TIMEOUT`] for
     /// a real call and [`KEYCHAIN_PROBE_TIMEOUT`] for a support probe.
@@ -124,10 +130,13 @@ impl fmt::Display for KeychainError {
             Self::Locked { provider } => {
                 write!(f, "{provider} is locked; unlock the keyring and try again")
             }
-            Self::AccessDenied { provider, message } => write!(
-                f,
-                "{provider} denied access: {message}; approve the keychain prompt (\"Always Allow\") and try again"
-            ),
+            // The hint comes from the backend, because only it knows which refusal this was; see
+            // `macos::access_denied_hint`.
+            Self::AccessDenied {
+                provider,
+                message,
+                hint,
+            } => write!(f, "{provider} denied access: {message}; {hint}"),
             // The wording the README documents. It deliberately does not name the provider: what
             // the user has to act on is the dialog, and callers that want the provider in their
             // message have [`KeychainError::provider`]. The number is the budget this very call
