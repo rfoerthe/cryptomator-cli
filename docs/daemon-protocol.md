@@ -279,5 +279,6 @@ The daemon is plain `std`: a `UnixListener` polled in an accept loop, one thread
 one thread for the stats sampler (one second), one for the auto-lock tick, and the FUSE session on
 its own thread. Waiting is always `Condvar::wait_timeout` with a 100 ms cap — the condvar makes an
 internal stop immediate, the cap bounds how long a flag that a signal handler can only *set* stays
-unnoticed. There is no busy loop and no async runtime. tokio arrives with WebDAV in M5, which needs
-one for hyper; until then it would be a dependency without a job.
+unnoticed. There is no busy loop and no async runtime in the daemon itself. tokio exists in the
+process only while a WebDAV mount does: the runtime belongs to the WebDAV server that the `Mount`
+owns, hyper runs on it, and stopping the mount drops it.

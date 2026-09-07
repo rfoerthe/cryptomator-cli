@@ -3,10 +3,10 @@
 `crypto` is a Rust command line client for [Cryptomator](https://cryptomator.org) vaults (vault format 8)
 for macOS and Linux. It shares the desktop app's `settings.json` and keychain entries.
 
-Status: early development. Vault format 8 read and write, mount-less access, and FUSE mounting with
-a per-vault daemon work; WebDAV, the keychain, `crypto health`, restore and migration do not exist
-yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the design and
-`docs/daemon-protocol.md` for the daemon's wire protocol.
+Status: early development. Vault format 8 read and write, mount-less access, FUSE mounting with a
+per-vault daemon and a loopback WebDAV server work; the keychain, `crypto health`, restore and
+migration do not exist yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the
+design and `docs/daemon-protocol.md` for the daemon's wire protocol.
 
 ## Build
 
@@ -37,7 +37,7 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
-| `unlock` | Mounts a vault in a background daemon | `crypto unlock Secret --mounter fuse-t` |
+| `unlock` | Mounts a vault in a background daemon (FUSE, or WebDAV with `--port <PORT>`) | `crypto unlock Secret --mounter fuse-t` |
 | `lock` | Unmounts a vault and stops its daemon | `crypto lock Secret --force` |
 | `status` | Lists the registered vaults with their runtime state and mount point | `crypto status --json` |
 | `stats` | Throughput and cache counters of an unlocked vault | `crypto stats Secret --follow` |
@@ -82,7 +82,7 @@ input.
 | `3` | the vault reference names no registered vault, or more than one |
 | `4` | wrong password, invalid recovery key, a new password below the minimum length |
 | `5` | wrong vault state: already unlocked, not unlocked, needs migration, read-only, or an `fs`/`name`/`password change`/`recovery-key show`/`recovery-key reset-password` command on a vault that is not `LOCKED` |
-| `6` | the mount failed — a mount point that cannot be used, a mounter that refused, a conflicting mount service, or a daemon that stopped answering while it mounted |
+| `6` | the mount failed — a mount point that cannot be used, a mounter that refused, a conflicting mount service, a WebDAV port that is already in use, or a daemon that stopped answering while it mounted |
 | `7` | the unmount failed; a volume still in use needs `crypto lock … --force` |
 | `9` | a Hub vault, which this build cannot open |
 | `10` | the vault's daemon cannot be reached |
@@ -94,14 +94,15 @@ returned today.
 ## Mounting
 
 A mounted vault looks like an ordinary directory: `crypto unlock` hands the vault to a FUSE back
-end, and everything below the mount point is encrypted on the way in and decrypted on the way out.
+end — or, without one, to a loopback WebDAV server (see [WebDAV](#webdav)) — and everything below
+the mount point is encrypted on the way in and decrypted on the way out.
 `crypto mounters` says what this build can use and what works on this machine.
 
 ### Prerequisites
 
 `crypto` does not ship a file system driver. For a real file-system mount one has to be installed;
-without one, `--mounter webdav` still serves the vault over loopback HTTP (see
-[Unlocking and locking](#unlocking-and-locking)) and needs nothing at all:
+`--mounter webdav` needs none, because it serves the vault over loopback HTTP instead (see
+[WebDAV](#webdav)):
 
 | Platform | Back end | Install | `--mounter` |
 |---|---|---|---|
@@ -176,6 +177,10 @@ claim they work:
 3. **Coexistence with the Cryptomator desktop app**: the app and `crypto` share `settings.json`, and
    the app rewrites the whole file from memory when it exits. Unlocking a vault in one and looking
    at it in the other, in both orders, is not covered by any test.
+4. **`--mounter webdav-gio` on a real GNOME desktop.** Its unit tests cover the command line it
+   builds and the gvfs path it derives, but no machine this port was tested on had a gvfs session,
+   and hosted CI runners have none either. The macOS side (`webdav-applescript`) and the server
+   itself are covered end to end.
 
 ### Unlocking and locking
 
@@ -202,16 +207,10 @@ environment or a file. The protocol between the two is documented in
   loopback interface and `unlock` answers with a **URL** (`http://127.0.0.1:<port>/<vault id>`)
   instead of a path — in `--json`'s `mountpoint`, in the `MOUNTPOINT` column of `crypto status`,
   and in the run info. Mounting that URL is a separate step, and the unlock prints a one-line hint
-  for it on standard error (Finder → Go → Connect to Server; `gio mount dav://<host>/<id>` — the
-  WebDAV scheme, not the HTTP one — or the file manager's "Connect to Server" on Linux).
-  `--reveal` opens nothing for a URL — a browser is not the vault. The port follows `--port`, else the vault's `port` when the vault names a mount
-  service, else `settings.json`'s `port` (42427); a port that is taken fails the unlock (exit `6`)
-  with `--port 0` and `crypto vault set` as the ways out. The bind address is `cli.json`'s
-  [`webdavBind`](#clijson), loopback only. Because nothing is in the system mount table, the
-  fallback mounter has no forced unmount: `crypto lock <VAULT> --force` on it is refused with exit
-  `7` ("does not support forced unmount") — lock it without `--force`. A daemon of a WebDAV mount
-  that was killed leaves no volume behind either, so its vault is `LOCKED` again, never
-  `STALE_MOUNT`.
+  for it on standard error; `--reveal` opens nothing for a URL, because a browser is not the vault.
+  `--mounter webdav-applescript` (macOS) and `--mounter webdav-gio` (Linux) do the mounting too and
+  answer with the path of the volume. [WebDAV](#webdav) has the whole story: the port rule, the
+  bind address, what `crypto lock --force` can and cannot do, and the limitations.
 - **`--foreground`** serves the vault in this process instead of detaching; Ctrl-C locks it again.
   The same daemon, the same protocol, the same teardown — only the process is yours, and the wait
   before a forced unmount is announced on your standard error instead of only in the log.
@@ -277,6 +276,93 @@ daemon's log. A volume that survives even the forced unmount (or a mounter witho
 at all) makes the daemon exit `7` and **keep its run info**, so `crypto status` reports
 `STALE_MOUNT` and `crypto lock <VAULT> --force` can address the volume it left behind. `SIGKILL`
 skips all of this by definition and leaves exactly that stale mount behind.
+
+### WebDAV
+
+`crypto` does not need a FUSE driver at all. The three WebDAV mount services serve the vault over
+**HTTP on the loopback interface** from inside the daemon, and either hand you the URL or ask the
+operating system to mount it for you.
+
+They are chosen automatically when no FUSE back end works on this machine — their Java priorities
+put them below every FUSE provider (`50` for the two OS-integrated ones, `0` for the plain
+fallback), so on a Mac without macFUSE and FUSE-T an ordinary `crypto unlock Secret` ends in a
+Finder volume — and explicitly with `--mounter webdav`, `--mounter webdav-applescript` or
+`--mounter webdav-gio`:
+
+| Alias | Class (what `settings.json` stores) | Where it works | What `unlock` answers with |
+|---|---|---|---|
+| `webdav` | `org.cryptomator.frontend.webdav.mount.FallbackMounter` | macOS and Linux | the URL; mounting it is your step |
+| `webdav-applescript` | `org.cryptomator.frontend.webdav.mount.MacAppleScriptMounter` | macOS (`/usr/bin/osascript`) | the `/Volumes/<name>` Finder mounted |
+| `webdav-gio` | `org.cryptomator.frontend.webdav.mount.LinuxGioMounter` | Linux (`gio --version` answers) | the gvfs path under `/run/user/<uid>/gvfs` |
+
+`crypto mounters` lists the ones that work here, `crypto mounters --all` the rest as well. Only the
+platform's own is built in, so asking a Mac for `webdav-gio` (or Linux for `webdav-applescript`) is
+a failed mount (exit `6`, "not available") rather than an unknown name.
+
+    $ crypto unlock Secret --mounter webdav --port 0
+    Unlocked Secret at http://127.0.0.1:53219/UARWQsp1etRW
+    Mount it in Finder: Go -> Connect to Server, then enter http://127.0.0.1:53219/UARWQsp1etRW
+
+The URL is `http://<webdavBind>:<port>/<vault id>` — the vault id is the servlet context path, the
+same one the desktop app uses (the AppleScript mounter appends the volume name, so its own URL is
+`…/<vault id>/<name>`). It is what `--json`'s `mountpoint`, the `MOUNTPOINT` column of
+`crypto status` and the run info carry, and `crypto lock` stops the server and frees the port.
+
+**Mounting the URL by hand.** Everything that speaks WebDAV reaches the decrypted vault:
+
+- **macOS Finder:** *Go → Connect to Server* (Cmd-K), paste the `http://…` URL, *Connect*, and the
+  volume appears under `/Volumes`. macOS asks whether you really want to connect to an unencrypted
+  server — there is no keychain entry to suppress that yet (the desktop app writes one; that is
+  M6's job). Without Finder: `mount_webdav -S -i "<url>" <empty directory>`.
+- **GNOME:** `gio mount "dav://127.0.0.1:<port>/<vault id>"` — note the `dav:` scheme, not `http:` —
+  or Nautilus's *Other Locations → Connect to Server* with the same `dav://` address.
+- **Anything else:** `curl -X PROPFIND -H 'Depth: 1' <url>/`, `rclone`, a WebDAV-capable editor.
+
+**The port.** `--port 0` takes any free port and is the safe choice for a second vault or a machine
+where the desktop app is running. Without `--port` the rule is the desktop app's: the vault's own
+`port` when the vault names a `mountService` (`crypto vault set <VAULT> --port <N>` stores one),
+otherwise `settings.json`'s `port` — both default to `42427`. A port that is already taken fails
+the unlock with exit `6` and names both ways out in the message.
+
+**No authentication.** The server asks for no credentials: whoever can reach the port can read and
+write the decrypted vault. That is why it binds a loopback address and nothing else.
+`crypto config set webdavBind ::1` moves it to another loopback address; a non-loopback address is
+refused (exit `2`) unless `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` is set, and setting that publishes the
+decrypted vault to everyone who can reach that interface.
+
+**Locking.** `crypto lock <VAULT>` always works — it stops the server, and with the two OS mounters
+it unmounts the volume first (`diskutil umount`, `gio mount -u`). `crypto lock <VAULT> --force` is
+refused on the plain `webdav` fallback with exit `7` ("does not support forced unmount"): there is
+nothing in the system mount table to force, and Cryptomator gives `FallbackMounter` no
+`UNMOUNT_FORCED` capability either — lock it without `--force`. `webdav-gio` has none either (a
+gvfs mount is not a mount point of its own); only `webdav-applescript` has one,
+`diskutil umount force`. A killed `webdav` daemon leaves nothing behind at all — there was
+never a volume — so its vault is `LOCKED` again, never `STALE_MOUNT`. A Finder volume from
+`webdav-applescript` does outlive its daemon and is reported as `STALE_MOUNT`, which
+`crypto lock <VAULT> --force` takes down by path. A gvfs mount from `webdav-gio` outlives it too,
+but gvfs mounts are not mount points of their own and `crypto` cannot see them; the server behind
+it is dead either way, and `gio mount -u "dav://…"` clears the entry.
+
+**Limitations.**
+
+- One daemon serves one vault, so two unlocked vaults need two ports. The desktop app's shared,
+  reference-counted WebDAV host does not exist here.
+- **No extended attributes.** WebDAV has no notion of them, so Finder tags, quarantine flags and
+  resource forks do not survive the trip — and nothing sweeps `.DS_Store` or `._*` side cars out of
+  the vault the way the macOS FUSE back ends do; whatever the client writes is stored.
+- **Symbolic links inside the vault are invisible** over WebDAV — neither listed nor addressable —
+  exactly as in Cryptomator's own servlet.
+- Names are normalised to **NFC** on the way in, and answers are not translated back to NFD for
+  macOS clients (Cryptomator's servlet does that for the `WebDAVFS` user agent; the user agent is
+  not visible from inside the file system implementation).
+- A single `Content-Range` PUT that would leave a gap of more than **256 MiB** of zeros is refused
+  with `413`, rather than materialising the zeros. A local HTTP request is not a syscall, and
+  nothing else bounds it.
+- The server answers `DAV: 1,2,3,sabredav-partialupdate` where Cryptomator answers `DAV: 1, 2`.
+  Those are the classes `dav-server` really implements; class 2 locking is there, so Finder and
+  `gio` are happy.
+- Disk usage (`quota-available-bytes`/`quota-used-bytes`) is not reported on macOS 15.4 and newer,
+  where reporting it delays the mount by 90 seconds — the same suppression the desktop app has.
 
 ## Watching an unlocked vault
 

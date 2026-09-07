@@ -322,8 +322,7 @@
 - **Still open:** `.c9u`/`FileIsInUseEvent` creation stays unimplemented — those markers exist only
   with a Hub owner and are ignored on listing, by design. The `flock` on `settings.json.lock` and the
   warning about a running desktop app that M2 deferred to "the milestone with the daemon" did **not**
-  ship with M4; the atomic tmp + rename write is still all there is, so close the desktop app before
-  `crypto vault add/remove/set` and `crypto config set`.
+  ship with M4 either; the atomic tmp + rename write was all there was until M5 closed it (below).
 
 #### Known limitations and follow-ups
 
@@ -337,7 +336,7 @@
   other — is a manual check nobody has run.
 - The daemon reads its socket through a `BufReader`, whose internal buffer keeps the base64 vault key
   of the `unlock` line until later traffic overwrites it. Every decoded copy is wiped; the buffer is
-  an M5 follow-up.
+  not, and M5 did not change that either.
 - `crypto status` does not distinguish the daemon's `STARTING` phase: for the few milliseconds
   between the pid file and the run info a vault shows as `UNLOCKED` with a null mount point.
 - The state files are named after a sanitised vault id, so two *hand-written* ids in `settings.json`
@@ -348,13 +347,44 @@
 - The branch that puts a mount back into the daemon's state when a forced unmount is asked of a
   service that has none is not covered by a test — no mount service in this build lacks a forced
   unmount.
-- `crypto unlock --port` (WebDAV) and `--store-password` (keychain) do not exist yet; they arrive
-  with M5 and M6.
+- `--store-password` (keychain) does not exist yet; it arrives with M6. `crypto unlock --port`
+  arrived with M5 (below).
 - The unlock timeouts are compiled in: 60 seconds for the daemon to receive an `unlock`, 70 for the
   whole call. A mount slower than that needs a rebuild, not a setting.
 
-### M5 – WebDAV mount
+### M5 – WebDAV
 
+- **`cryptomator-mount::webdav`**: a `dav_server::fs::DavFileSystem` over `CryptoFs`
+  (`CryptoDavFs`/`CryptoDavFile`), a loopback HTTP server on hyper 1 with a tokio runtime of its
+  own, and the three mount services Cryptomator ships — `FallbackMounter` (the URL, nothing else),
+  `MacAppleScriptMounter` (`osascript -e 'mount volume …'`, a volume under `/Volumes`) and
+  `LinuxGioMounter` (`gio mount dav://…`, a gvfs volume) — with the Java class names, priorities,
+  capabilities and default ports of webdav-nio-adapter 3.0.2.
+- **`crypto unlock --mounter webdav|webdav-applescript|webdav-gio [--port <N>]`**: the daemon serves
+  the vault over HTTP on the loopback interface and answers with a URL
+  (`http://127.0.0.1:<port>/<vault id>`) or, for the two OS mounters, with the path of the volume
+  they mounted. `crypto status`, the run info and `--json`'s `mountpoint` carry the same string, and
+  the unlock prints a one-line hint for mounting a URL by hand.
+- The desktop app's **port rule**: `--port` wins (including `--port 0` for any free port), else the
+  vault's own `port` when the vault names a `mountService`, else `settings.json`'s `port` (42427).
+  `crypto vault set <VAULT> --port <N>` stores one. A port that is taken fails the unlock with exit
+  `6` and names both ways out. New in the protocol: `Request::Unlock.port` (absent reads as `null`).
+- **`webdavBind` in `cli.json`** (default `127.0.0.1`): the address the server binds. Only a
+  loopback address is accepted — the server has no authentication — unless
+  `CRYPTO_WEBDAV_ALLOW_NONLOOPBACK=1` says otherwise; an unusable value fails a WebDAV unlock with
+  exit `6` naming the key and leaves a FUSE unlock alone.
+- **Java parity in the servlet's behaviour**: symbolic links are invisible (neither listed nor
+  addressable), `Range`/`If-Range` GETs, class-2 locking (`MemLs`, so Finder and `gio` can lock),
+  `414` for a name the vault cannot store, NFC path normalisation, and no `quota-*` on macOS 15.4
+  and newer, where reporting it delays the mount by 90 seconds.
+- **`process.rs`**: the subprocess helpers (`run_command`, `run_unmount_command`, `probe_command`,
+  `wait_for_exit`) moved out of `fuse/mount.rs` and are now shared with the WebDAV OS mounters —
+  every external command is an argument vector, never a shell string.
+- **Tests and CI**: `webdav_http.rs` drives the real server over HTTP in the ordinary `cargo test`
+  run (PROPFIND, ranged GET, PUT, MKCOL, MOVE, COPY, DELETE, LOCK/UNLOCK, the port-in-use and
+  shutdown paths). `webdav_e2e.rs` and the WebDAV case in `cli_daemon.rs` mount a *real* volume and
+  need `CRYPTO_E2E_WEBDAV=1`; the new CI jobs `webdav-e2e-macos` (advisory) and `webdav-e2e-linux`
+  (`curl` against the server) run them.
 - **Resolved (deferred in M2, still open after M4):** every `settings.json` write happens under an
   exclusive `flock` on `settings.json.lock` — an empty 0600 file next to `settings.json`, created
   once and never removed. `SettingsStore::update` holds it across load, change and rename, so two
@@ -374,4 +404,88 @@
 - The vendored fuser sends a reply that goes out in one piece without copying the slice list: the
   first `writev` is made against the caller's own `IoSlice`s and only a genuinely short write
   allocates the owned copy `IoSlice::advance_slices` needs. `/dev/fuse` always takes the fast path.
+  An ops-level test now pins that a `rename` over a kernel-held inode takes the name away from it.
 
+#### Decisions taken along the way
+
+*The bridge into the vault*
+
+- `DavFileSystem` is async, `CryptoFs` is not, so **every core call runs on tokio's blocking pool**
+  (two worker threads, up to 64 blocking threads) — never `block_in_place`, which would stall the
+  runtime's own worker.
+- **Stopping the server drops its runtime** rather than abandoning it, and waits (up to 65 s) for
+  the blocking calls still in flight. A WebDAV write is flushed when the file handle is dropped, so
+  a shutdown that did not wait could lose the last bytes of a copy. The daemon therefore stops the
+  mount off the signal path.
+- **`dav-server` is built without default features**: its `hyper` feature only serves `warp-compat`,
+  the server speaks hyper itself, and neither `localfs` nor `memfs` is compiled in. HTTP/1 only.
+- **The health probe is a `GET` on the context path.** `2xx`, `3xx` and `405` mean the server is up
+  — there is no directory browsing, exactly as in Java — `404` and `5xx` do not.
+- **A zero-fill gap is bounded at 256 MiB** and answered with `413` beyond that. Java and the FUSE
+  adapter zero-fill without a limit; there a syscall asks for it, here an unauthenticated local HTTP
+  request does, and nothing else bounds it.
+- **A `Content-Range` PUT never truncates.** `truncate` is what `dav-server` asked for and nothing
+  more, so a partial update writes into the file instead of wiping it first.
+- **A name that is too long is `414`**, checked by the adapter itself: `CryptoFs` reports it as
+  `InvalidInput`, which is indistinguishable from any other bad input.
+- **Requests are normalised to NFC and answers stay NFC.** Cryptomator rewrites multistatus answers
+  to NFD for the `WebDAVFS` user agent; the user agent is not visible from inside a `DavFileSystem`.
+
+*Mounting and the command line*
+
+- **Read-only follows the file system.** The WebDAV services serve the very `CryptoFs` the daemon
+  opened, so `MountService::read_only_follows_file_system()` says so and the mounter neither demands
+  a `READ_ONLY` capability nor appends `-oro`.
+- **The bind address is process-wide.** One daemon serves one vault, so `webdavBind` is applied once
+  from `cli.json` instead of being threaded through the builder chain — and it is applied inside
+  `unlock`, where an unusable value is a failed mount (exit `6`) rather than a daemon that never
+  answers.
+- **A stale mount is always a path.** A run info whose mount point is a URL is never a stale mount:
+  that server died with its daemon, so there is nothing left to take down.
+- **`--volume-name` is refused** by a service without the `VOLUME_NAME` capability (Java ignores it
+  silently), and **`--reveal` opens nothing for a URL** — a browser is not the vault, and
+  `$CRYPTO_REVEAL_CMD` does not change that.
+- **No keychain entry before the AppleScript mount.** Java stores an anonymous internet password
+  first so macOS does not ask about the unencrypted connection; writing to the keychain is M6's
+  decision, so macOS asks.
+- **The OS mounts unmount themselves when dropped**, blocking and logging failures like their FUSE
+  siblings, so a dropped mount cannot strand a Finder volume.
+
+#### Deliberate deviations from webdav-nio-adapter 3.0.2
+
+- **No reference-counted shared server** (`WebDavServerManager`): one daemon, one vault, one server,
+  so two unlocked vaults need two ports.
+- `LinuxGioMounter.isSupported()` probes **`gio --version`**; Java's
+  `new ProcessBuilder("test", " \`command -v gio\`")` hands `/usr/bin/test` one non-empty string and
+  therefore always succeeds, whatever is installed.
+- `dav-server` answers **`DAV: 1,2,3,sabredav-partialupdate`** where Java answers `DAV: 1, 2`. The
+  extra classes are what the library really implements; no client of ours needs fewer.
+- A `MacAppleScriptMounter` mount whose mount point cannot be found in the mount table **fails**,
+  like Java's — but the error says so and names the URL, because the volume may well be mounted.
+- The zero-fill bound and the refused `--volume-name` above.
+
+#### Known limitations and follow-ups
+
+- **`webdav-gio` has never mounted anything.** No machine this port was tested on had a gvfs session
+  and hosted CI runners have none, so the Linux OS mounter rests on its unit tests and the HTTP-level
+  end-to-end check alone.
+- **The macOS end-to-end mount needs a GUI session.** `osascript -e 'mount volume …'` talks to
+  Finder, so the `webdav-e2e-macos` job is advisory (`continue-on-error`) and skips where the runner
+  has no window server. It was run by hand on a Mac instead.
+- **macFUSE is still unverified**, and **coexistence with the Cryptomator desktop app** is still a
+  manual check nobody has run (both carried over from M4).
+- `crypto lock --force` cannot be used on a `webdav` or `webdav-gio` mount: neither service
+  advertises `UNMOUNT_FORCED`, exactly as in Java. The graceful `crypto lock` always works.
+- The `DAV:` header deviation above has not been tried against every WebDAV client; Finder, `gio`
+  and `curl` are the ones that were.
+- The daemon still reads its socket through a `BufReader` that keeps the base64 vault key of the
+  `unlock` line until later traffic overwrites it. Every decoded copy is wiped; the buffer is not
+  (carried over from M4).
+- `Request::Shutdown` is implemented and documented but no CLI command sends it — `lock` unmounts
+  first, and a stale mount has no daemon left to ask.
+- The mounter alias table exists twice, in `cryptomator-mount::registry` and in
+  `cryptomator_app::mounters`, kept in step by a parity test rather than by one owner.
+- The timeouts are still compiled in: 60 seconds for the daemon to receive an `unlock`, 70 for the
+  whole call, and 10 for the mount table to show the volume.
+- `--store-password` and the keychain (`password store`/`forget`) remain M6, and with them the
+  keychain item that would stop macOS asking about the unencrypted connection.
