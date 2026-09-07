@@ -59,6 +59,8 @@ hyper = { version = "1.11.1", default-features = false, features = ["server", "h
 hyper-util = { version = "0.1.20", default-features = false, features = [
     "tokio",
     "server-graceful",
+    # `http1` is what carries hyper-util's `GracefulConnection` impl for an HTTP/1 connection.
+    "http1",
 ] }
 http-body-util = "0.1.5"
 tokio = { version = "1.53.1", default-features = false, features = [
@@ -68,6 +70,8 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "io-util",
     "time",
     "sync",
+    # `macros` is for `tokio::select!` in the server's accept loop.
+    "macros",
 ] }
 bytes = "1.12"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }

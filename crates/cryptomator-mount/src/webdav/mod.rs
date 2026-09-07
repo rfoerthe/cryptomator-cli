@@ -15,6 +15,10 @@ pub mod os_mount;
 pub mod server;
 
 pub use fs::{fs_error, CryptoDavEntry, CryptoDavFile, CryptoDavFs, CryptoDavMeta};
+pub use server::{
+    probe_context_root, strip_prefix_for, WebDavServerConfig, WebDavServerError,
+    WebDavServerHandle, HEALTH_TIMEOUT,
+};
 
 /// Set to `1` to let [`set_bind_address`] accept an address the rest of the network can reach.
 pub const ALLOW_NONLOOPBACK_ENV: &str = "CRYPTO_WEBDAV_ALLOW_NONLOOPBACK";
@@ -30,6 +34,27 @@ pub fn bind_address() -> IpAddr {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The bind policy, on its own so that both [`set_bind_address`] and
+/// [`WebDavServerHandle::start`] can apply it.
+///
+/// `start` re-checks rather than trusting its caller: [`WebDavServerConfig::bind`] is a plain
+/// `IpAddr` that anything could fill in, and the one thing that must never happen is a vault
+/// served, unauthenticated, on an address the rest of the network can reach.
+///
+/// # Errors
+/// [`MountError::Failed`] for an address that is not a loopback address, unless
+/// [`ALLOW_NONLOOPBACK_ENV`] is `1`.
+pub fn check_bind_address(addr: IpAddr) -> Result<(), MountError> {
+    let allowed = std::env::var(ALLOW_NONLOOPBACK_ENV).is_ok_and(|value| value == "1");
+    if !addr.is_loopback() && !allowed {
+        return Err(MountError::Failed(format!(
+            "webdavBind {addr} is not a loopback address; the WebDAV server has no \
+             authentication. Set {ALLOW_NONLOOPBACK_ENV}=1 to override."
+        )));
+    }
+    Ok(())
+}
+
 /// Sets the address every following server binds to (`cli.json`'s `webdavBind`).
 ///
 /// One process serves one vault, so this is process-wide rather than threaded through the
@@ -40,13 +65,7 @@ pub fn bind_address() -> IpAddr {
 /// [`MountError::Failed`] for an address that is not a loopback address, unless
 /// [`ALLOW_NONLOOPBACK_ENV`] is `1`.
 pub fn set_bind_address(addr: IpAddr) -> Result<(), MountError> {
-    let allowed = std::env::var(ALLOW_NONLOOPBACK_ENV).is_ok_and(|value| value == "1");
-    if !addr.is_loopback() && !allowed {
-        return Err(MountError::Failed(format!(
-            "webdavBind {addr} is not a loopback address; the WebDAV server has no \
-             authentication. Set {ALLOW_NONLOOPBACK_ENV}=1 to override."
-        )));
-    }
+    check_bind_address(addr)?;
     *BIND_ADDRESS
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = addr;
