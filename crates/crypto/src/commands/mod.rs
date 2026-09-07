@@ -149,6 +149,39 @@ pub fn keychain_source<'a>(
     })
 }
 
+/// Saves `passphrase` for `vault`, replacing whatever was stored there before.
+///
+/// Unlike [`crate::commands::password::update_keychain_entry`] this writes even when nothing was
+/// stored yet -- it backs `--store-password`, where the user asked for exactly that. Returns
+/// `false` when there is no keychain in this run (`--no-keychain`, `useKeychain = false`, no
+/// supported provider), which is not a failure by itself: the caller decides whether that
+/// deserves a warning or an exit code.
+///
+/// The passphrase is not verified here. Both callers hold one that has just opened the vault --
+/// `unlock` derived a key from it, `vault create` chose it -- so re-deriving would only cost a
+/// second scrypt round. `crypto password store`, whose passphrase comes from the user, does
+/// verify.
+///
+/// # Errors
+/// [`AppError::Keychain`] (exit code 8) when a keychain is there but refuses.
+pub fn store_passphrase_now(
+    ctx: &Ctx,
+    vault: &VaultSettingsJson,
+    passphrase: &str,
+) -> Result<bool> {
+    let Some(keychain) = ctx.keychain()? else {
+        return Ok(false);
+    };
+    let (key, display_name) = vault_key_and_name(vault);
+    let (key, display_name) = (key.to_string(), display_name.map(str::to_string));
+    // The clone the worker thread gets is wiped when that thread drops it, however late it runs.
+    let secret = zeroize::Zeroizing::new(passphrase.to_string());
+    keychain_call(&keychain, move |keychain| {
+        keychain.store(&key, display_name.as_deref(), &secret)
+    })?;
+    Ok(true)
+}
+
 /// Runs one keychain call under [`cryptomator_app::KEYCHAIN_TIMEOUT`].
 ///
 /// The provider is owned (`Arc<dyn Keychain>`), so it can be moved to the worker thread that the

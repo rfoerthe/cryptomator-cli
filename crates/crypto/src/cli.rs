@@ -118,6 +118,21 @@ pub struct UnlockArgs {
     /// Open the mount point in the file manager afterwards
     #[arg(long)]
     pub reveal: bool,
+    /// Save the password in the keychain once the vault is mounted
+    // `--password-keychain` took the password *from* the keychain, so there would be nothing to
+    // store that is not stored already: clap refuses that combination as a usage error (exit 2).
+    #[arg(
+        long,
+        group = "store-password-choice",
+        conflicts_with = "password_keychain"
+    )]
+    pub store_password: bool,
+    /// Do not save the password (the default; spell it out to be explicit in a script)
+    // A no-op today, on purpose: without `--store-password` nothing is ever stored implicitly. It
+    // is in the same group so a script can write the default down and keep its meaning if the
+    // default ever changes.
+    #[arg(long, group = "store-password-choice")]
+    pub no_store_password: bool,
     #[command(flatten)]
     pub password: PasswordArgs,
 }
@@ -207,6 +222,9 @@ pub enum VaultCommand {
         // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
         #[arg(allow_hyphen_values = true)]
         vault: String,
+        /// Also remove the vault's password from the keychain
+        #[arg(long)]
+        forget_password: bool,
     },
     /// List registered vaults with their state
     List,
@@ -309,6 +327,9 @@ pub struct CreateArgs {
     /// Do not add the vault to settings.json
     #[arg(long)]
     pub no_register: bool,
+    /// Save the new password in the keychain
+    #[arg(long)]
+    pub store_password: bool,
     #[command(flatten)]
     pub password: PasswordArgs,
 }

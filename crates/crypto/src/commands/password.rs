@@ -108,7 +108,10 @@ fn vault_for_keychain(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, 
 /// at all: every later `crypto unlock` would take it, fail, and never ask the user -- so
 /// `open_vault` has to accept it first. The passphrase itself is read *without* the keychain
 /// steps ([`read_passphrase`], not `read_passphrase_with_keychain`): storing what is already
-/// stored is not a thing, and `--password-keychain` is rejected as a usage error (exit 2).
+/// stored is not a thing. `--password-keychain` therefore ends in
+/// [`AppError::Keychain`] (exit code **8**, not 2): the flag is grammatically fine -- it comes
+/// with the flattened [`PasswordArgs`] -- but the keychain is not a source for `password store`,
+/// so from `read_passphrase`'s point of view there is no keychain to read from here.
 ///
 /// # Errors
 /// [`AppError::VaultNotFound`] (3), [`cryptomator_core::CoreError::InvalidPassphrase`] (4),

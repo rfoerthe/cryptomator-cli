@@ -1632,3 +1632,121 @@ fn a_stored_passphrase_unlocks_a_vault_without_any_other_source() {
         serde_json::json!({ &id: { "password": common::PW, "displayName": "v" } })
     );
 }
+
+/// `--store-password` writes only once the vault is really mounted, and only when it is asked to.
+#[test]
+fn unlock_store_password_saves_only_after_the_mount_succeeded() {
+    let fx = Fixture::new("v");
+    let id = fx.id();
+
+    // A mount that fails leaves the keychain untouched. The null mounter mounts into an existing
+    // directory, so a mount point that is not there is `MountPointInvalid` -- exit 6, and the
+    // password was already read and verified by then.
+    fx.crypto_daemon_keychain(&[
+        "unlock",
+        "v",
+        "--mounter",
+        "null",
+        "--mount-point",
+        fx.path("not-here").to_str().unwrap(),
+        "--store-password",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .code(6);
+    assert_eq!(
+        fx.fake_keychain_json(),
+        serde_json::json!({}),
+        "nothing is stored for a vault that never mounted"
+    );
+    // The parent reaps the daemon it spawned, but the next unlock needs the vault LOCKED in the
+    // runtime sense too, so wait for the state files to be gone first.
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
+
+    // A mount that works stores it, after the mount point has been reported.
+    let out = fx
+        .crypto_daemon_keychain(&[
+            "--json",
+            "unlock",
+            "v",
+            "--mounter",
+            "null",
+            "--store-password",
+            "--password-stdin",
+        ])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).expect("utf-8");
+    assert!(
+        !stdout.contains(common::PW),
+        "the passphrase never reaches stdout"
+    );
+    assert_eq!(fx.fake_keychain_json()[&id]["password"], common::PW);
+    assert_eq!(fx.fake_keychain_json()[&id]["displayName"], "v");
+    fx.crypto_daemon_keychain(&["lock", "v"]).assert().success();
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
+
+    // What was stored is what unlocks the vault next time, with no source given at all.
+    fx.crypto_daemon_keychain(&["unlock", "v", "--mounter", "null"])
+        .assert()
+        .success();
+    fx.crypto_daemon_keychain(&["lock", "v"]).assert().success();
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
+
+    // And --no-store-password is the (current) default spelled out: nothing new is written.
+    std::fs::write(fx.keychain_file(), "{}").unwrap();
+    fx.crypto_daemon_keychain(&[
+        "unlock",
+        "v",
+        "--mounter",
+        "null",
+        "--no-store-password",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .success();
+    assert_eq!(fx.fake_keychain_json(), serde_json::json!({}));
+    fx.crypto_daemon_keychain(&["lock", "v"]).assert().success();
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
+
+    // Without a keychain to store into, `--store-password` fails *before* anything is unlocked:
+    // an unlocked vault plus an error is the worst of both answers.
+    fx.crypto(&["config", "set", "useKeychain", "false"])
+        .assert()
+        .success();
+    fx.crypto_daemon_keychain(&[
+        "unlock",
+        "v",
+        "--mounter",
+        "null",
+        "--store-password",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .code(8)
+    .stderr(predicates::str::contains("useKeychain"));
+    assert!(
+        !fx.state_file(".pid").exists(),
+        "no daemon was ever spawned"
+    );
+    fx.crypto_daemon(&["status", "v"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("LOCKED"));
+    assert_eq!(fx.fake_keychain_json(), serde_json::json!({}));
+}

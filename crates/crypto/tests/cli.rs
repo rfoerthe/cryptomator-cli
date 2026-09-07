@@ -1383,3 +1383,176 @@ fn recovery_key_reset_password_carries_a_stored_passphrase_along() {
     // And the new one really opens the vault, straight out of the keychain.
     sb.crypto_keychain(&["fs", "ls", "v"]).assert().success();
 }
+
+#[test]
+fn password_store_never_reads_the_keychain_as_a_source() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    sb.crypto_keychain(&["password", "store", "v", "--password-stdin"])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success();
+    // `--password-keychain` comes with the flattened `PasswordArgs`, so clap accepts it -- but
+    // `password store` reads without the keychain steps, so the source the user insisted on is
+    // not there: exit 8 (a keychain error), not 2, and nothing is rewritten.
+    let before = sb.fake_keychain_json();
+    sb.crypto_keychain(&["password", "store", "v", "--password-keychain"])
+        .assert()
+        .code(8);
+    assert_eq!(sb.fake_keychain_json(), before);
+}
+
+#[test]
+fn vault_create_can_store_the_new_password_and_remove_can_forget_it() {
+    let sb = Sandbox::new();
+    sb.crypto_keychain(&[
+        "vault",
+        "create",
+        sb.path("v").to_str().unwrap(),
+        "--store-password",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("keychain"));
+    let id = sb.vault_id(0);
+    assert_eq!(sb.fake_keychain_json()[&id]["password"], common::PW);
+    assert_eq!(sb.fake_keychain_json()[&id]["displayName"], "v");
+    // The stored password is enough to open the vault with no other source.
+    sb.crypto_keychain(&["fs", "ls", "v"]).assert().success();
+
+    // Without --forget-password the entry survives the vault leaving settings.json ...
+    sb.crypto_keychain(&["--json", "vault", "remove", "v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"forgotten\": false"));
+    assert_eq!(sb.fake_keychain_json()[&id]["password"], common::PW);
+
+    // ... and with it, it goes. (A fresh registration gets a fresh id, so the entry is seeded
+    // under that one -- `vault add` does not carry the old id over.)
+    sb.crypto_keychain(&["vault", "add", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    let id2 = sb.vault_id(0);
+    sb.seed_keychain(&id2, "v", common::PW);
+    sb.crypto_keychain(&["--json", "vault", "remove", "v", "--forget-password"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"forgotten\": true"));
+    let left = sb.fake_keychain_json();
+    assert_eq!(left[&id2], serde_json::Value::Null, "the entry is gone");
+    assert_eq!(
+        left[&id]["password"],
+        common::PW,
+        "and only the entry of the vault that was named"
+    );
+
+    // A vault that never had a stored password is removed all the same; `forgotten` says so.
+    sb.crypto_keychain(&["vault", "add", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    sb.crypto_keychain(&["--json", "vault", "remove", "v", "--forget-password"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"forgotten\": false"));
+}
+
+#[test]
+fn vault_create_with_store_password_says_so_in_json() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto_keychain(&[
+            "--json",
+            "vault",
+            "create",
+            sb.path("w").to_str().unwrap(),
+            "--store-password",
+            "--password-stdin",
+        ])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf-8");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(value["stored"], true);
+    assert!(
+        !stdout.contains(common::PW),
+        "the passphrase never reaches stdout"
+    );
+    assert_eq!(
+        sb.fake_keychain_json()[&sb.vault_id(0)]["password"],
+        common::PW
+    );
+
+    // Without the flag nothing is stored and the field says so.
+    let out = sb
+        .crypto_keychain(&[
+            "--json",
+            "vault",
+            "create",
+            sb.path("x").to_str().unwrap(),
+            "--password-stdin",
+        ])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success();
+    let value: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    assert_eq!(value["stored"], false);
+    assert_eq!(
+        sb.fake_keychain_json().as_object().map(|o| o.len()),
+        Some(1)
+    );
+}
+
+#[test]
+fn vault_create_without_a_keychain_still_creates_the_vault() {
+    // A keychain that is not there must not lose the vault the user just made: the vault is
+    // created, the failure is a warning, and the exit code stays 0.
+    let sb = Sandbox::new();
+    sb.crypto_keychain(&[
+        "vault",
+        "create",
+        sb.path("v").to_str().unwrap(),
+        "--store-password",
+        "--password-stdin",
+    ])
+    .env("CRYPTO_KEYCHAIN_FAKE_UNSUPPORTED", "1")
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("warning"));
+    assert!(sb.path("v").join("vault.cryptomator").exists());
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+
+    // Same for a vault that was never registered: there is no id to key the entry by.
+    sb.crypto_keychain(&[
+        "vault",
+        "create",
+        sb.path("w").to_str().unwrap(),
+        "--no-register",
+        "--store-password",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("--no-register"));
+    assert!(sb.path("w").join("vault.cryptomator").exists());
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+}
+
+#[test]
+fn store_and_no_store_password_are_mutually_exclusive() {
+    let sb = Sandbox::new();
+    sb.crypto(&["unlock", "v", "--store-password", "--no-store-password"])
+        .assert()
+        .code(2);
+    // And there is nothing to store that is not stored already, so the two keychain flags are a
+    // usage error too.
+    sb.crypto(&["unlock", "v", "--store-password", "--password-keychain"])
+        .assert()
+        .code(2);
+}

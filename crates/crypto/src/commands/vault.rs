@@ -1,6 +1,6 @@
 //! `crypto vault create|add|remove|list|info|set`
 use crate::cli::{AddArgs, CreateArgs, SetArgs};
-use crate::commands::Ctx;
+use crate::commands::{keychain_call, store_passphrase_now, Ctx};
 use crate::exit;
 use anyhow::{Context, Result};
 use cryptomator_app::settings::{
@@ -158,12 +158,18 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
         .as_ref()
         .and_then(|v| v.display_name.clone())
         .or(args.name.clone());
+    // The vault exists on disk and, unless `--no-register` said otherwise, in `settings.json`.
+    // Nothing below may undo that, so every way the keychain can disappoint is a warning here and
+    // the exit code stays 0 -- `stored` says what really happened.
+    let stored = store_new_password(ctx, &args, registered.as_ref(), &passphrase);
+    drop(passphrase);
     let value = json!({
         "id": registered.as_ref().map(|v| v.id.clone()),
         "path": path,
         "displayName": display_name,
         "cipherCombo": cipher_combo.as_str(),
         "shorteningThreshold": args.shortening_threshold,
+        "stored": stored,
         // A `serde_json::Value` cannot be wiped, so this copy of the recovery key outlives the
         // `Zeroizing` buffer; `emit_secret` drops it as soon as the output is rendered.
         "recoveryKey": recovery_key.as_deref(),
@@ -176,6 +182,9 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
                 v.id,
                 v.display_name.clone().unwrap_or_default()
             ));
+        }
+        if stored {
+            lines.push("The password was stored in the keychain.".to_string());
         }
         lines.join("\n")
     };
@@ -194,6 +203,44 @@ pub fn create(ctx: &Ctx, args: CreateArgs) -> Result<u8> {
     Ok(exit::OK)
 }
 
+/// `vault create --store-password`: save the password of the vault that was just created.
+///
+/// Returns whether an entry was written. Every failure is a warning rather than an exit code: the
+/// vault is already on disk and in `settings.json`, and a command that ends non-zero would tell a
+/// script the creation failed.
+fn store_new_password(
+    ctx: &Ctx,
+    args: &CreateArgs,
+    registered: Option<&VaultSettingsJson>,
+    passphrase: &str,
+) -> bool {
+    // `--store-password` only means something for a vault that is in `settings.json`: the keychain
+    // is keyed by the vault id, and `--no-register` never assigns one.
+    match (args.store_password, registered) {
+        (false, _) => false,
+        (true, None) => {
+            eprintln!(
+                "warning: --store-password needs a registered vault; --no-register was given"
+            );
+            false
+        }
+        (true, Some(vault)) => match store_passphrase_now(ctx, vault, passphrase) {
+            Ok(true) => true,
+            Ok(false) => {
+                eprintln!(
+                    "warning: --store-password had no effect: no keychain is in use \
+                     (--no-keychain, useKeychain=false, or no supported provider)"
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!("warning: the password was not stored: {err:#}");
+                false
+            }
+        },
+    }
+}
+
 pub fn add(ctx: &Ctx, args: AddArgs) -> Result<u8> {
     let path = normalize_vault_path(&args.path);
     assert_is_vault_directory(&path)
@@ -210,15 +257,43 @@ pub fn add(ctx: &Ctx, args: AddArgs) -> Result<u8> {
     Ok(exit::OK)
 }
 
-pub fn remove(ctx: &Ctx, reference: &str) -> Result<u8> {
+/// `crypto vault remove <VAULT> [--forget-password]`.
+///
+/// The keychain entry goes first: once `settings.json` no longer lists the vault there is no id
+/// left to look it up by. A keychain that refuses therefore stops the removal -- the user can
+/// still run `crypto vault remove` without the flag, which never touches the keychain and always
+/// works.
+///
+/// # Errors
+/// [`AppError::VaultNotFound`] (exit code 3), [`AppError::Keychain`] (8) when `--forget-password`
+/// was given and there is no keychain or it refuses.
+pub fn remove(ctx: &Ctx, reference: &str, forget_password: bool) -> Result<u8> {
+    let forgotten = if forget_password {
+        let settings = ctx.store.load()?;
+        let index = resolve_vault_index(&settings, reference)?;
+        let key = settings.directories[index].id.clone();
+        let keychain = ctx.keychain_required()?;
+        // Only if present: `delete` reports `false` for a vault that never had a stored password,
+        // which is the end state the user asked for either way.
+        keychain_call(&keychain, move |keychain| keychain.delete(&key))?
+    } else {
+        false
+    };
     let removed = ctx.store.update(|settings| {
         let index = resolve_vault_index(settings, reference)?;
         Ok(settings.directories.remove(index))
     })?;
-    ctx.out
-        .emit(json!({ "id": removed.id, "path": removed.path }), || {
-            format!("Removed {} from the vault list (files kept)", removed.id)
-        })?;
+    ctx.out.emit(
+        json!({ "id": removed.id, "path": removed.path, "forgotten": forgotten }),
+        || {
+            let line = format!("Removed {} from the vault list (files kept)", removed.id);
+            if forgotten {
+                format!("{line} and forgot the stored password")
+            } else {
+                line
+            }
+        },
+    )?;
     Ok(exit::OK)
 }
 

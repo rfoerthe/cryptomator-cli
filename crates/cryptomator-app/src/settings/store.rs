@@ -456,8 +456,30 @@ mod tests {
         assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
     }
 
-    /// Serialises the tests that change the process environment.
+    /// Serialises every test in this module that sets **or reads** process environment: the
+    /// environment is process-wide, so a test that only reads `$CRYPTO_DESKTOP_IPC_SOCKET`
+    /// (through [`SettingsStore::desktop_ipc_socket`]) sees whatever a parallel test happens to
+    /// have set. Poison-tolerant: a test that panicked while holding it says nothing about
+    /// whether the environment is usable, and the guard below puts it back either way.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Removes an environment variable again when the test ends -- including when it ends by
+    /// panicking, which a plain `remove_var` at the end of the test body would skip, leaving the
+    /// override in place for every test that runs afterwards.
+    struct EnvVarGuard(&'static str);
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            std::env::set_var(name, value);
+            Self(name)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
 
     /// Long enough for the waiting thread to retry a few times, short enough for a test.
     const SHORT_TIMEOUT: Duration = Duration::from_millis(300);
@@ -589,6 +611,9 @@ mod tests {
 
     #[test]
     fn the_desktop_socket_path_follows_the_packaging_scripts() {
+        // Reads `$CRYPTO_DESKTOP_IPC_SOCKET` through `desktop_ipc_socket()`, so it has to be
+        // serialised against the test that sets it.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = Path::new("/home/u");
         let socket = desktop_app_socket(home);
         if cfg!(target_os = "macos") {
@@ -632,13 +657,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = SettingsStore::at(dir.path().join("settings.json"));
         let socket = dir.path().join("elsewhere.socket");
-        std::env::set_var(DESKTOP_IPC_SOCKET_ENV, &socket);
+        let _env = EnvVarGuard::set(DESKTOP_IPC_SOCKET_ENV, &socket);
         assert_eq!(store.desktop_ipc_socket(), socket);
         assert!(!store.desktop_app_running());
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
         assert!(store.desktop_app_running());
         drop(listener);
-        std::env::remove_var(DESKTOP_IPC_SOCKET_ENV);
     }
 
     #[test]

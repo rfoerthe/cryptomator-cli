@@ -79,7 +79,10 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Vault { command } => match command {
             VaultCommand::Create(args) => commands::vault::create(&ctx, args),
             VaultCommand::Add(args) => commands::vault::add(&ctx, args),
-            VaultCommand::Remove { vault } => commands::vault::remove(&ctx, &vault),
+            VaultCommand::Remove {
+                vault,
+                forget_password,
+            } => commands::vault::remove(&ctx, &vault, forget_password),
             VaultCommand::List => commands::vault::list(&ctx),
             VaultCommand::Info { vault } => commands::vault::info(&ctx, &vault),
             VaultCommand::Set(args) => commands::vault::set(&ctx, args),

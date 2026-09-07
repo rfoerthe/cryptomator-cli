@@ -4,7 +4,7 @@
 //! file: the parent derives it with scrypt, spawns the daemon detached and sends the key as the
 //! first request over the daemon's 0600 control socket.
 use crate::cli::UnlockArgs;
-use crate::commands::{daemon, keychain_source, locked_vault, Ctx};
+use crate::commands::{daemon, keychain_source, locked_vault, store_passphrase_now, Ctx};
 use crate::exit;
 use anyhow::{anyhow, Context, Result};
 use cryptomator_app::settings::{VaultSettingsJson, WhenUnlocked};
@@ -65,6 +65,14 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
         .key_id()?
         .require_masterkey_file()?;
 
+    // `--store-password` with nowhere to store is exit 8 *here*, before the vault is opened: the
+    // alternative is an unlocked vault plus an error, which is the worst of both answers. Only
+    // the *absence* of a provider is caught this way; one that is there and refuses is not known
+    // until it is asked, which happens after the mount (see `store_after_report`).
+    if args.store_password {
+        ctx.keychain_required()?;
+    }
+
     let read_only = args.read_only || vault.uses_read_only_mode;
     // The keychain is the parent process's business only: the daemon gets the derived key and
     // never talks to a keyring (see `docs/daemon-protocol.md`). Lazy: the provider is only probed
@@ -77,6 +85,9 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
         &mut SystemIo,
     )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;
+    // Not dropped yet when `--store-password` was given: the passphrase is written *after* the
+    // daemon reported ready, so a mount that fails never leaves a password behind.
+    let to_store = args.store_password.then(|| passphrase.clone());
     drop(passphrase);
     let max_cleartext_name_length = name_length(ctx, &vault, &path, read_only)?;
     // The wire format is base64; this buffer is wiped when it goes out of scope and `Request`'s
@@ -105,9 +116,32 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     ctx.state_dir.ensure()?;
     let files = ctx.state_dir.files(&vault.id);
     if args.foreground {
-        serve_in_foreground(ctx, &vault, &files, request, &args)
+        serve_in_foreground(ctx, &vault, &files, request, &args, to_store)
     } else {
-        spawn_daemon(ctx, &vault, &files, request, &args)
+        spawn_daemon(ctx, &vault, &files, request, &args, to_store)
+    }
+}
+
+/// Saves the passphrase of a vault that is now mounted, if `--store-password` asked for it.
+///
+/// Called only after [`report`] returned: at that point the daemon has answered `ready` and the
+/// mount point is known, so a keychain entry can no longer outlive a failed unlock. Nothing here
+/// is an exit code -- the vault *is* mounted, and telling a script otherwise would be a lie -- so
+/// both "there was no keychain after all" and "the provider refused" are warnings on stderr.
+fn store_after_report(ctx: &Ctx, vault: &VaultSettingsJson, to_store: Option<Zeroizing<String>>) {
+    let Some(passphrase) = to_store else {
+        return;
+    };
+    match store_passphrase_now(ctx, vault, &passphrase) {
+        Ok(true) => {}
+        // Unreachable in practice: `unlock` checks `keychain_required()` before it opens the
+        // vault. It stays a warning rather than an `unreachable!()` because the provider is
+        // probed twice and a machine can lose its keyring in between.
+        Ok(false) => eprintln!(
+            "warning: --store-password had no effect: no keychain is in use \
+             (--no-keychain, useKeychain=false, or no supported provider)"
+        ),
+        Err(err) => eprintln!("warning: the password was not stored: {err:#}"),
     }
 }
 
@@ -162,6 +196,7 @@ fn spawn_daemon(
     files: &VaultStateFiles,
     request: Request,
     args: &UnlockArgs,
+    to_store: Option<Zeroizing<String>>,
 ) -> Result<u8> {
     let log = open_log(&files.log)?;
     let exe = std::env::current_exe().context("cannot locate the crypto binary")?;
@@ -200,7 +235,15 @@ fn spawn_daemon(
         .spawn()
         .with_context(|| format!("cannot start the vault daemon for {}", vault.id))?;
     match handshake(&files.socket, request, &files.log) {
-        Ok(mountpoint) => report(ctx, vault, files, &mountpoint, args),
+        Ok(mountpoint) => {
+            // The result is bound first: `--store-password` writes only once the mount point has
+            // been reported, and not at all if reporting it failed.
+            let reported = report(ctx, vault, files, &mountpoint, args);
+            if reported.is_ok() {
+                store_after_report(ctx, vault, to_store);
+            }
+            reported
+        }
         Err(err) => {
             // The timeout above lands here too: the daemon gets a SIGTERM and with it its own
             // graceful unmount, so a mount that came up late is still taken down again.
@@ -219,6 +262,7 @@ fn serve_in_foreground(
     files: &VaultStateFiles,
     request: Request,
     args: &UnlockArgs,
+    to_store: Option<Zeroizing<String>>,
 ) -> Result<u8> {
     let mut config = daemon::config(ctx, &vault.id, Some(files.log.clone()))?;
     // Unlike the detached daemon, this process has the terminal the signal came from -- so a
@@ -232,7 +276,15 @@ fn serve_in_foreground(
         .spawn(move || cryptomator_app::run_daemon(config, flag))
         .context("cannot start the vault daemon thread")?;
     let handshake = match handshake(&files.socket, request, &files.log) {
-        Ok(mountpoint) => report(ctx, vault, files, &mountpoint, args),
+        Ok(mountpoint) => {
+            // Before the wait for the shutdown signal below, and only after `report` succeeded --
+            // the same order the detached path uses.
+            let reported = report(ctx, vault, files, &mountpoint, args);
+            if reported.is_ok() {
+                store_after_report(ctx, vault, to_store);
+            }
+            reported
+        }
         Err(err) => {
             // Nobody else is going to lock this daemon: it either never came up or refused the
             // unlock, and it would otherwise sit out its whole unlock deadline.
