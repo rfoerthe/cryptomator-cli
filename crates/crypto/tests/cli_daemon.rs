@@ -1461,3 +1461,46 @@ fn an_os_webdav_mount_carries_a_write_through_the_server_into_the_vault() {
         .success()
         .stdout(E2E_CONTENT);
 }
+
+/// The desktop app writes `settings.json` without taking the lock, so the CLI cannot serialise
+/// against it -- it can only say so before it writes.
+#[test]
+fn a_running_desktop_app_is_warned_about_before_settings_are_written() {
+    let sandbox = Sandbox::new();
+    // Not next to `settings.json`, so this proves the override and not the derived path.
+    std::fs::create_dir_all(sandbox.path("d")).expect("socket directory");
+    let socket = sandbox.path("d/ipc.socket");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("a fake desktop app");
+    let assertion = sandbox
+        .crypto(&["config", "set", "logLevel", "debug"])
+        .env("CRYPTO_DESKTOP_IPC_SOCKET", &socket)
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(stderr.contains("desktop app"), "{stderr}");
+    assert!(stderr.contains("settings.json"), "{stderr}");
+
+    // A read-only command says nothing: there is nothing to lose.
+    let assertion = sandbox
+        .crypto(&["--json", "config", "get", "logLevel"])
+        .env("CRYPTO_DESKTOP_IPC_SOCKET", &socket)
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr).is_empty(),
+        "a read does not warn"
+    );
+
+    // And with nobody listening, a write says nothing either.
+    drop(listener);
+    std::fs::remove_file(&socket).expect("remove the socket");
+    let assertion = sandbox
+        .crypto(&["config", "set", "logLevel", "info"])
+        .env("CRYPTO_DESKTOP_IPC_SOCKET", &socket)
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr).is_empty(),
+        "no app, no warning"
+    );
+}

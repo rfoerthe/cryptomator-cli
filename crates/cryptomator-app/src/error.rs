@@ -22,6 +22,9 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+    /// Another process holds the `flock` on `settings.json.lock`; the CLI reports exit code 1.
+    #[error("{0} is locked by another process; it did not let go in time")]
+    SettingsLocked(PathBuf),
     #[error("no vault matches {0:?} (by id, display name or path)")]
     VaultNotFound(String),
     #[error("{:?} matches several vaults: {}", _0, _1.join(", "))]

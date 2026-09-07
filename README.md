@@ -381,6 +381,11 @@ environment (a `:`-separated list like Java's `-Dcryptomator.settingsPath`; the 
 file that gets written). Saving is atomic (`settings.json.<pid>.tmp` + rename) and keeps unknown fields, so
 a file written by the desktop app survives a round trip.
 
+Every write additionally takes an exclusive `flock` on **`settings.json.lock`**, an empty 0600 file
+next to `settings.json` that is created once and never removed. Load, change and rename happen under
+that one lock, so two `crypto` processes never lose each other's changes; a lock somebody else holds
+is retried for five seconds and then reported as `… is locked by another process` (exit `1`).
+
 ### `cli.json`
 
 Everything the CLI needs *in addition* lives in `cli.json`, a sibling of `settings.json`, so a
@@ -401,7 +406,12 @@ is written 0600. `crypto config get|set` reads and writes both files in one flat
     crypto config set webdavBind 127.0.0.2     # a non-loopback address is refused (exit 2)
 
 Because the file is shared, **close the desktop app before `crypto vault add` or `crypto vault
-remove`**: the running app keeps its own copy in memory and overwrites the file when it exits.
+remove`**: the running app keeps its own copy in memory and overwrites the file when it exits — and
+it takes no lock, so `settings.json.lock` cannot serialise against it. A command that writes settings
+(`vault create/add/remove/set`, `config set`, `unlock`) therefore prints a warning to stderr when the
+app answers on its IPC socket, `ipc.socket` next to `settings.json` (the app's own
+`-Dcryptomator.ipcSocketPath`; `$CRYPTO_DESKTOP_IPC_SOCKET` overrides the path). A socket file with
+nobody listening — what a crashed app leaves behind — does not count as running.
 A `settings.json` that cannot be parsed is reported as an error — unlike the desktop app, `crypto`
 never silently replaces it.
 

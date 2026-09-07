@@ -10,6 +10,7 @@ pub use model::{
     DEFAULT_AUTOLOCK_IDLE_SECONDS, DEFAULT_MAX_CLEARTEXT_FILENAME_LENGTH, DEFAULT_PORT,
 };
 pub use store::{
-    candidates_from_env_value, default_settings_candidates, SettingsStore, SETTINGS_PATH_ENV,
+    candidates_from_env_value, default_settings_candidates, desktop_app_socket, SettingsStore,
+    DESKTOP_IPC_SOCKET_ENV, SETTINGS_PATH_ENV,
 };
 pub use vault_ref::{normalize_vault_path, resolve_vault, resolve_vault_index};

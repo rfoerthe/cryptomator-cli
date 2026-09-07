@@ -356,3 +356,16 @@
   with M5 and M6.
 - The unlock timeouts are compiled in: 60 seconds for the daemon to receive an `unlock`, 70 for the
   whole call. A mount slower than that needs a rebuild, not a setting.
+
+### M5 – WebDAV mount
+
+- **Resolved (deferred in M2, still open after M4):** every `settings.json` write happens under an
+  exclusive `flock` on `settings.json.lock` — an empty 0600 file next to `settings.json`, created
+  once and never removed. `SettingsStore::update` holds it across load, change and rename, so two
+  `crypto` processes cannot lose each other's changes; a lock another process holds is retried for
+  five seconds (50 ms apart) and then reported as `… is locked by another process` (exit `1`).
+- The desktop app takes no lock, so `crypto` warns instead: `vault create/add/remove/set`,
+  `config set` and `unlock` print a line to stderr when the app answers on its IPC socket
+  (`ipc.socket` next to `settings.json`, per its `-Dcryptomator.ipcSocketPath` packaging value;
+  `$CRYPTO_DESKTOP_IPC_SOCKET` overrides it, and the probe gives up after 200 ms). Read-only
+  commands stay silent, and a socket file nobody listens on does not count as a running app.
