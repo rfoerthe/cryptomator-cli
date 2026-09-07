@@ -1,5 +1,6 @@
-//! Passphrase sources for the CLI. Order: --password-stdin (one line) → --password-file → --password-env VAR
-//! → $CRYPTO_PASSWORD → --password-keychain → the keychain implicitly → interactive prompt (only when
+//! Passphrase sources for the CLI. `--password-keychain` is exclusive and checked first, ahead of
+//! every other source; without it, the order is --password-stdin (one line) → --password-file →
+//! --password-env VAR → $CRYPTO_PASSWORD → the keychain implicitly → interactive prompt (only when
 //! stdin is a terminal). Passphrases are NFC-normalised like the desktop app's `SecurePasswordField`.
 //! `read_new_passphrase_no_env_fallback` drops the $CRYPTO_PASSWORD step for callers where that
 //! variable already holds a different password; the two keychain steps exist only in
@@ -243,19 +244,21 @@ impl KeychainSource<'_> {
 
 /// [`read_passphrase`] with the two keychain steps of the source order.
 ///
-/// The full order, first present source wins:
+/// `--password-keychain` is the exclusive source: when it is given, it pre-empts every other
+/// step below and nothing else is consulted -- a missing entry is
+/// [`AppError::KeychainNoEntry`] (exit code 8), never a fall-through to the prompt.
+///
+/// Without that flag, the order is, first present source wins:
 /// 1. `--password-stdin`
 /// 2. `--password-file`
 /// 3. `--password-env VAR`
 /// 4. `$CRYPTO_PASSWORD`
-/// 5. `--password-keychain` -- the keychain and nothing else; a missing entry is
-///    [`AppError::KeychainNoEntry`] (exit code 8), never a prompt
-/// 6. the keychain implicitly, when `source` is `Some` (i.e. `useKeychain` is on, a provider is
-///    supported and `--no-keychain` was not given) **and** an entry exists
-/// 7. the interactive prompt
+/// 5. the keychain implicitly, when `source()` answers `Some` (i.e. `useKeychain` is on, a
+///    provider is supported and `--no-keychain` was not given) **and** an entry exists
+/// 6. the interactive prompt
 ///
-/// `$CRYPTO_PASSWORD` deliberately outranks the keychain: it is the source a script sets on
-/// purpose, and it can never open a dialog.
+/// `$CRYPTO_PASSWORD` deliberately outranks the implicit keychain step: it is the source a script
+/// sets on purpose, and it can never open a dialog.
 ///
 /// The implicit step falls through to the prompt for "nothing stored" and for a provider that
 /// turns out to be unusable here ([`crate::keychain::KeychainError::Unsupported`]) -- both are
@@ -263,17 +266,24 @@ impl KeychainSource<'_> {
 /// refused or unanswered dialog, a backend that broke -- is reported (exit code 8) instead:
 /// prompting would hide a real problem behind a password the user then has to type by hand.
 ///
+/// `source` is a closure rather than an already-resolved `Option<KeychainSource>`: choosing a
+/// keychain provider probes every candidate (`KEYCHAIN_PROBE_TIMEOUT` each on a platform without
+/// one built in, e.g. a Secret Service D-Bus connect on Linux), so a caller whose own source
+/// answers first -- `--password-stdin` and friends -- must not pay for a provider it will never
+/// ask. `source` is therefore called at most once, only when step 1 (`--password-keychain`, if
+/// given) or the implicit step 5 is actually reached.
+///
 /// # Errors
 /// [`AppError::KeychainNoEntry`] / [`AppError::Keychain`] (exit code 8) for the keychain steps,
-/// [`AppError::NoPasswordSource`] (2) when nothing is left.
-pub fn read_passphrase_with_keychain(
+/// [`AppError::NoPasswordSource`] (2) when nothing is left. Whatever `source` itself reports.
+pub fn read_passphrase_with_keychain<'a>(
     args: &PasswordArgs,
     prompt: &str,
-    source: Option<KeychainSource<'_>>,
+    source: impl FnOnce() -> Result<Option<KeychainSource<'a>>>,
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
     if args.password_keychain {
-        let Some(source) = source else {
+        let Some(source) = source()? else {
             return Err(AppError::Keychain(
                 crate::keychain::KeychainError::Unsupported {
                     provider: "keychain".to_string(),
@@ -291,12 +301,12 @@ pub fn read_passphrase_with_keychain(
             }),
         };
     }
-    // Everything that is not the keychain, minus the prompt: the prompt is step 7 and has to stay
+    // Everything that is not the keychain, minus the prompt: the prompt is step 6 and has to stay
     // *after* the implicit keychain step.
     if let Some(raw) = read_raw_without_prompt(args, DefaultEnv::Allowed, io)? {
         return Ok(normalize_passphrase(&raw));
     }
-    if let Some(source) = source {
+    if let Some(source) = source()? {
         match source.load() {
             Ok(Some(passphrase)) => {
                 // Not printed: a silent unlock is the point of storing the password. The log line
@@ -306,7 +316,8 @@ pub fn read_passphrase_with_keychain(
             }
             // Nothing stored: the ordinary case for a vault whose password was never saved.
             Ok(None) => {}
-            // "There is no keychain here after all" -- the same situation as `source == None`.
+            // "There is no keychain here after all" -- the same situation as `source` answering
+            // `None`.
             Err(err @ crate::keychain::KeychainError::Unsupported { .. }) => {
                 log::debug!("no keychain to ask for {}: {err}", source.vault_label);
             }
@@ -326,7 +337,7 @@ pub fn read_passphrase(
     prompt: &str,
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
-    read_passphrase_with_keychain(args, prompt, None, io)
+    read_passphrase_with_keychain(args, prompt, || Ok(None), io)
 }
 
 /// For new passwords: interactive input is asked twice and compared; every source enforces `min_len` characters.
@@ -362,8 +373,13 @@ fn read_new(
     // too. A *new* password is the one being invented; taking it from the keychain is meaningless,
     // and silently ignoring the flag would create the vault with a password the user never chose.
     if args.password_keychain {
+        // Not `format!("{}-keychain", args.label)`: for `--new-password-*` callers `args.label` is
+        // `--new-password`, but clap only ever defines `--password-keychain` (see
+        // `PasswordArgs::password_keychain`'s `#[arg(long, …)]`) -- there is no
+        // `--new-password-keychain` to name. Unreachable today (`From<&NewPasswordArgs>` always
+        // sets `password_keychain: false`), so this only has to be honest, not exercised.
         return Err(AppError::InvalidValue {
-            key: format!("{}-keychain", args.label),
+            key: "--password-keychain".to_string(),
             message: "a new password cannot be read from the keychain".to_string(),
         });
     }
@@ -612,14 +628,20 @@ mod tests {
 
     #[test]
     fn no_password_source_message_depends_on_the_position() {
-        // Current password: $CRYPTO_PASSWORD is one of the sources.
+        // Current password: $CRYPTO_PASSWORD is one of the sources, and so is --password-keychain.
         let mut no_tty = FakeIo::default();
         let err = read_passphrase(&args(false, None, None), "p", &mut no_tty).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("--password-stdin, --password-file or --password-env"));
+        assert!(
+            message.contains(
+                "--password-stdin, --password-file, --password-env or --password-keychain"
+            ),
+            "{message}"
+        );
         assert!(message.contains(&format!("set {PASSWORD_ENV}")));
 
-        // New password of `password change`: the variable holds the *current* password.
+        // New password of `password change`: the variable holds the *current* password, and there
+        // is no `--new-password-keychain` -- a new password is never read from the keychain.
         let new_args = PasswordArgs::from(&NewPasswordArgs::default());
         let mut with_env = FakeIo {
             env: HashMap::from([(PASSWORD_ENV.to_string(), "current-passphrase".to_string())]),
@@ -631,6 +653,10 @@ mod tests {
         assert!(
             message.contains("--new-password-stdin, --new-password-file or --new-password-env"),
             "{message}"
+        );
+        assert!(
+            !message.contains("keychain"),
+            "a new password has no keychain flag to name: {message}"
         );
         assert!(
             message.contains(&format!(
@@ -793,7 +819,7 @@ mod tests {
             *read_passphrase_with_keychain(
                 &args(false, None, None),
                 "Password: ",
-                Some(source(MemKeychain::with("v1", "from-keychain"))),
+                || Ok(Some(source(MemKeychain::with("v1", "from-keychain")))),
                 &mut io
             )
             .unwrap(),
@@ -802,6 +828,33 @@ mod tests {
         assert!(
             io.prompted.is_empty(),
             "no prompt when the keychain answered"
+        );
+    }
+
+    #[test]
+    fn the_keychain_source_is_never_probed_when_password_stdin_supplies_the_answer() {
+        // The whole point of the lazy closure: a caller whose own source answers first must not
+        // pay for choosing a keychain provider, which can be a real probe (Secret Service D-Bus
+        // on Linux) rather than a free call.
+        let mut io = FakeIo {
+            stdin: VecDeque::from(["from-stdin\n".to_string()]),
+            ..Default::default()
+        };
+        let probed = std::cell::Cell::new(false);
+        let result = read_passphrase_with_keychain(
+            &args(true, None, None),
+            "p",
+            || {
+                probed.set(true);
+                Ok(Some(source(MemKeychain::with("v1", "from-keychain"))))
+            },
+            &mut io,
+        )
+        .unwrap();
+        assert_eq!(*result, "from-stdin");
+        assert!(
+            !probed.get(),
+            "the keychain source closure must not run when --password-stdin already answered"
         );
     }
 
@@ -816,7 +869,7 @@ mod tests {
             *read_passphrase_with_keychain(
                 &args(true, None, None),
                 "p",
-                Some(source(MemKeychain::with("v1", "from-keychain"))),
+                || Ok(Some(source(MemKeychain::with("v1", "from-keychain")))),
                 &mut io
             )
             .unwrap(),
@@ -832,11 +885,29 @@ mod tests {
             *read_passphrase_with_keychain(
                 &args(false, None, None),
                 "p",
-                Some(source(MemKeychain::with("v1", "from-keychain"))),
+                || Ok(Some(source(MemKeychain::with("v1", "from-keychain")))),
                 &mut io
             )
             .unwrap(),
             "from-env"
+        );
+        // `--password-keychain` beats even $CRYPTO_PASSWORD: it is the exclusive source and
+        // pre-empts every other step, not merely the highest-priority one among them.
+        let mut io = FakeIo {
+            env: HashMap::from([(PASSWORD_ENV.to_string(), "from-env".to_string())]),
+            ..Default::default()
+        };
+        let mut explicit = args(false, None, None);
+        explicit.password_keychain = true;
+        assert_eq!(
+            *read_passphrase_with_keychain(
+                &explicit,
+                "p",
+                || Ok(Some(source(MemKeychain::with("v1", "from-keychain")))),
+                &mut io
+            )
+            .unwrap(),
+            "from-keychain"
         );
     }
 
@@ -851,7 +922,7 @@ mod tests {
             *read_passphrase_with_keychain(
                 &args(false, None, None),
                 "Password: ",
-                Some(source(MemKeychain::default())),
+                || Ok(Some(source(MemKeychain::default()))),
                 &mut io
             )
             .unwrap(),
@@ -867,7 +938,7 @@ mod tests {
         match read_passphrase_with_keychain(
             &explicit,
             "p",
-            Some(source(MemKeychain::default())),
+            || Ok(Some(source(MemKeychain::default()))),
             &mut io,
         ) {
             Err(AppError::KeychainNoEntry { vault, provider }) => {
@@ -885,7 +956,7 @@ mod tests {
         let mut explicit = args(false, None, None);
         explicit.password_keychain = true;
         let mut io = FakeIo::default();
-        match read_passphrase_with_keychain(&explicit, "p", None, &mut io) {
+        match read_passphrase_with_keychain(&explicit, "p", || Ok(None), &mut io) {
             Err(AppError::Keychain(err)) => {
                 let text = err.to_string();
                 assert!(
@@ -916,7 +987,7 @@ mod tests {
             *read_passphrase_with_keychain(
                 &args(false, None, None),
                 "Password: ",
-                Some(source(MemKeychain::unsupported())),
+                || Ok(Some(source(MemKeychain::unsupported()))),
                 &mut io
             )
             .unwrap(),
@@ -931,7 +1002,7 @@ mod tests {
             read_passphrase_with_keychain(
                 &args(false, None, None),
                 "p",
-                Some(source(MemKeychain::locked())),
+                || Ok(Some(source(MemKeychain::locked()))),
                 &mut io
             ),
             Err(AppError::Keychain(
@@ -947,7 +1018,7 @@ mod tests {
             read_passphrase_with_keychain(
                 &explicit,
                 "p",
-                Some(source(MemKeychain::unsupported())),
+                || Ok(Some(source(MemKeychain::unsupported()))),
                 &mut io
             ),
             Err(AppError::Keychain(_))
@@ -966,6 +1037,22 @@ mod tests {
         assert!(io.prompted.is_empty());
         // And the conversion from `NewPasswordArgs` never sets it in the first place.
         assert!(!PasswordArgs::from(&NewPasswordArgs::default()).password_keychain);
+    }
+
+    #[test]
+    fn the_new_password_rejection_names_the_flag_that_actually_exists() {
+        // `label` is "--new-password" at this position (`PasswordArgs::from(&NewPasswordArgs)`),
+        // but clap only ever defines `--password-keychain` -- naming the flag via
+        // `format!("{label}-keychain")` would claim a `--new-password-keychain` that does not
+        // exist. `password_keychain` is never actually set by that conversion, so it is set by
+        // hand here to reach the branch at all.
+        let mut new = PasswordArgs::from(&NewPasswordArgs::default());
+        new.password_keychain = true;
+        let mut io = FakeIo::default();
+        match read_new_passphrase(&new, "p", 8, &mut io) {
+            Err(AppError::InvalidValue { key, .. }) => assert_eq!(key, "--password-keychain"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[test]

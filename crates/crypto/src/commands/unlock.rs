@@ -67,12 +67,13 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
 
     let read_only = args.read_only || vault.uses_read_only_mode;
     // The keychain is the parent process's business only: the daemon gets the derived key and
-    // never talks to a keyring (see `docs/daemon-protocol.md`).
-    let keychain = ctx.keychain()?;
+    // never talks to a keyring (see `docs/daemon-protocol.md`). Lazy: the provider is only probed
+    // when the password source order actually reaches the keychain steps, so
+    // `crypto unlock --password-stdin` never pays for it.
     let passphrase = read_passphrase_with_keychain(
         &args.password,
         "Password: ",
-        keychain_source(keychain.as_ref(), &vault),
+        || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
         &mut SystemIo,
     )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;

@@ -20,12 +20,12 @@ pub fn change(ctx: &Ctx, args: ChangePasswordArgs) -> Result<u8> {
         .require_masterkey_file()?;
     let mut io = SystemIo;
     // Only the *current* password may come from the keychain; the new one is being invented, and
-    // the stored entry is not updated here (`password store` is how it is rewritten).
-    let keychain = ctx.keychain()?;
+    // the stored entry is not updated here (`password store` is how it is rewritten). Lazy: the
+    // provider is only probed once the source order actually reaches the keychain steps.
     let old = read_passphrase_with_keychain(
         &args.password,
         "Current password: ",
-        keychain_source(keychain.as_ref(), &vault),
+        || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
         &mut io,
     )?;
     // Not `read_new_passphrase`: $CRYPTO_PASSWORD is where the *current* password just came from,

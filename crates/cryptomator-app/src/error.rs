@@ -76,7 +76,14 @@ pub enum AppError {
 /// Message branch of [`AppError::NoPasswordSource`]: which flags apply and whether
 /// `$CRYPTO_PASSWORD` is one of the sources.
 fn no_password_hint(label: &str, env_fallback: &bool) -> String {
-    let flags = format!("use {label}-stdin, {label}-file or {label}-env");
+    // `--password-keychain` only exists at the current-password position (`label == "--password"`):
+    // a *new* password is never read from the keychain, so there is no `--new-password-keychain`
+    // to name here (see `password::read_new`'s own rejection of the flag).
+    let flags = if label == "--password" {
+        format!("use {label}-stdin, {label}-file, {label}-env or {label}-keychain")
+    } else {
+        format!("use {label}-stdin, {label}-file or {label}-env")
+    };
     if *env_fallback {
         format!("{flags}, set {PASSWORD_ENV}, or run interactively")
     } else {

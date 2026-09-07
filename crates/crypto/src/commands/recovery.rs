@@ -20,11 +20,12 @@ pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
     read_vault_config(&path)?
         .key_id()?
         .require_masterkey_file()?;
-    let keychain = ctx.keychain()?;
+    // Lazy: the provider is only probed once the source order actually reaches the keychain
+    // steps, so a scripted `--password-stdin` run never pays for it.
     let passphrase = read_passphrase_with_keychain(
         &args.password,
         "Password: ",
-        keychain_source(keychain.as_ref(), &vault),
+        || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
         &mut SystemIo,
     )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;

@@ -1585,6 +1585,12 @@ fn a_stored_passphrase_unlocks_a_vault_without_any_other_source() {
         .assert()
         .success();
     fx.crypto_daemon_keychain(&["lock", "v"]).assert().success();
+    // `lock` returns as soon as the daemon acknowledges; the next unlock needs the vault LOCKED
+    // both on disk and in the runtime sense (`locked_vault` -> `require_locked`), so it has to
+    // wait for the daemon to actually finish tearing down its state files first.
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
 
     // --no-keychain takes that source away again, and without a terminal there is nothing left.
     fx.crypto_daemon_keychain(&["--no-keychain", "unlock", "v", "--mounter", "null"])

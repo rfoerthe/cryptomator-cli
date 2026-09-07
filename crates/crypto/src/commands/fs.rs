@@ -61,11 +61,13 @@ pub fn open_fs(
         }
         .into());
     }
-    let keychain = ctx.keychain()?;
+    // Lazy: probing the keychain provider is skipped entirely when `password` already answers
+    // (e.g. `--password-stdin`), so a headless run that opted out of the keychain never pays the
+    // Secret Service probe (and its stderr warning on a provider that turns out unsupported).
     let passphrase = read_passphrase_with_keychain(
         password,
         "Password: ",
-        keychain_source(keychain.as_ref(), &vault),
+        || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
         &mut SystemIo,
     )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;

@@ -23,7 +23,7 @@ use cryptomator_app::{
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct Ctx {
@@ -38,7 +38,14 @@ pub struct Ctx {
     pub no_keychain: bool,
     /// Memoised [`Ctx::keychain`]. Choosing a provider probes every candidate
     /// (`KEYCHAIN_PROBE_TIMEOUT` each), so a command that asks twice must not pay twice.
-    keychain: OnceLock<Option<Arc<dyn Keychain>>>,
+    ///
+    /// A `Mutex<Option<…>>` rather than a `OnceLock`: the cell must stay empty when
+    /// `settings.json` fails to load, so the next call gets to report that error again instead
+    /// of a cached `None` silently standing in for "no keychain" -- `OnceLock::get_or_init`'s
+    /// closure cannot fail, so it cannot express that. The lock also makes the whole
+    /// probe-then-cache sequence atomic, so two concurrent callers (still theoretical: one `Ctx`,
+    /// one thread today) cannot both pay the probe and have one result thrown away.
+    keychain: Mutex<Option<Option<Arc<dyn Keychain>>>>,
 }
 
 impl Ctx {
@@ -55,7 +62,7 @@ impl Ctx {
             state_dir,
             settings_arg,
             no_keychain,
-            keychain: OnceLock::new(),
+            keychain: Mutex::new(None),
         }
     }
 
@@ -73,18 +80,29 @@ impl Ctx {
     /// `Arc`, not `Box`: [`keychain_call`] moves a clone of the provider onto a worker thread it
     /// may stop waiting for, so the provider has to outlive the call that gave up on it.
     ///
+    /// This re-reads `settings.json` on the first call even when [`locked_vault`] already loaded
+    /// it for the same command: threading the loaded [`cryptomator_app::settings::SettingsJson`]
+    /// through here would mean every caller between `locked_vault` and this method carries it
+    /// along for that one read. The [`Mutex`] above already removes the read that would actually
+    /// repeat -- a second `Ctx::keychain()` call in the same process -- so paying for one more
+    /// read of a small local file is not worth that plumbing.
+    ///
     /// # Errors
-    /// Whatever reading `settings.json` reports.
-    pub fn keychain(&self) -> Result<Option<Arc<dyn Keychain>>> {
-        if let Some(cached) = self.keychain.get() {
-            return Ok(cached.clone());
+    /// Whatever reading `settings.json` reports. Not cached: a failed read leaves the cell empty,
+    /// so the next call gets to report the same error again rather than a wrongly memoised
+    /// "no keychain".
+    pub fn keychain(&self) -> cryptomator_app::Result<Option<Arc<dyn Keychain>>> {
+        let mut cached = self.keychain.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resolved) = cached.as_ref() {
+            return Ok(resolved.clone());
         }
         let resolved = if self.no_keychain {
             None
         } else {
             cryptomator_app::keychain::for_settings(&self.store.load()?).map(Arc::from)
         };
-        Ok(self.keychain.get_or_init(|| resolved).clone())
+        *cached = Some(resolved.clone());
+        Ok(resolved)
     }
 
     /// Like [`Ctx::keychain`], but "there is none" is a failure (exit code 8). For the commands
