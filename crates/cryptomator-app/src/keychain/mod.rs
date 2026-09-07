@@ -103,9 +103,14 @@ pub enum KeychainError {
     Unsupported { provider: String, hint: String },
     /// The keyring exists but is locked and nobody unlocked it.
     Locked { provider: String },
-    /// The call did not answer within [`KEYCHAIN_TIMEOUT`] -- on macOS almost always an ACL
-    /// dialog nobody is looking at.
-    TimedOut { provider: String },
+    /// The backend refused the call: the user cancelled the prompt, authentication failed, or the
+    /// session may not show a prompt at all. Distinct from [`Self::Backend`] because it is the one
+    /// failure the user can do something about without filing a bug.
+    AccessDenied { provider: String, message: String },
+    /// The call did not answer within `after` -- on macOS almost always an ACL dialog nobody is
+    /// looking at. `after` is the budget the call actually had, which is [`KEYCHAIN_TIMEOUT`] for
+    /// a real call and [`KEYCHAIN_PROBE_TIMEOUT`] for a support probe.
+    TimedOut { provider: String, after: Duration },
     /// Anything the backend itself reported.
     Backend { provider: String, message: String },
 }
@@ -119,13 +124,18 @@ impl fmt::Display for KeychainError {
             Self::Locked { provider } => {
                 write!(f, "{provider} is locked; unlock the keyring and try again")
             }
-            // The wording the README documents, verbatim. It deliberately does not name the
-            // provider: what the user has to act on is the dialog, and callers that want the
-            // provider in their message have [`KeychainError::provider`].
-            Self::TimedOut { .. } => write!(
+            Self::AccessDenied { provider, message } => write!(
+                f,
+                "{provider} denied access: {message}; approve the keychain prompt (\"Always Allow\") and try again"
+            ),
+            // The wording the README documents. It deliberately does not name the provider: what
+            // the user has to act on is the dialog, and callers that want the provider in their
+            // message have [`KeychainError::provider`]. The number is the budget this very call
+            // had, not the default -- a 5 s probe must not claim it waited 30 s.
+            Self::TimedOut { after, .. } => write!(
                 f,
                 "the keychain did not answer within {} s; a system dialog may be waiting for you",
-                KEYCHAIN_TIMEOUT.as_secs()
+                after.as_secs()
             ),
             Self::Backend { provider, message } => write!(f, "{provider}: {message}"),
         }
@@ -140,7 +150,8 @@ impl KeychainError {
         match self {
             Self::Unsupported { provider, .. }
             | Self::Locked { provider }
-            | Self::TimedOut { provider }
+            | Self::AccessDenied { provider, .. }
+            | Self::TimedOut { provider, .. }
             | Self::Backend { provider, .. } => provider,
         }
     }
@@ -215,8 +226,11 @@ where
     }
     match rx.recv_timeout(budget) {
         Ok(result) => result,
+        // The budget goes into the error so the message states what this call actually waited --
+        // `supported_or_skipped` passes `KEYCHAIN_PROBE_TIMEOUT`, not `KEYCHAIN_TIMEOUT`.
         Err(mpsc::RecvTimeoutError::Timeout) => Err(KeychainError::TimedOut {
             provider: provider.to_string(),
+            after: budget,
         }),
         // The worker panicked and dropped its sender.
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(KeychainError::Backend {
@@ -297,7 +311,9 @@ pub fn all_providers() -> Vec<Box<dyn Keychain>> {
         return vec![Box::new(fake)];
     }
     let mut providers: Vec<Box<dyn Keychain>> = Vec::new();
-    // The macOS backend arrives in task 3, the Linux and KDE ones in task 4.
+    #[cfg(target_os = "macos")]
+    providers.push(Box::new(macos::MacKeychain::new()));
+    // The Linux and KDE back ends arrive in task 4.
     providers.extend(std::iter::empty());
     providers.sort_by_key(|provider| std::cmp::Reverse(provider.priority()));
     providers
@@ -462,16 +478,42 @@ mod tests {
         .unwrap_err();
         assert!(started.elapsed() >= Duration::from_millis(150));
         match err {
-            KeychainError::TimedOut { provider } => assert_eq!(provider, "p"),
-            other => panic!("expected TimedOut, got {other}"),
+            KeychainError::TimedOut {
+                ref provider,
+                after,
+            } => {
+                assert_eq!(provider, "p");
+                // The budget the call actually had, not the default -- see
+                // `a_timeout_message_states_the_budget_the_call_actually_had`.
+                assert_eq!(after, Duration::from_millis(150));
+            }
+            ref other => panic!("expected TimedOut, got {other}"),
         }
         assert!(
             err_hint_mentions_dialog(&KeychainError::TimedOut {
-                provider: "p".to_string()
+                provider: "p".to_string(),
+                after: KEYCHAIN_TIMEOUT,
             }),
             "the message has to tell the user a dialog may be waiting"
         );
         gate.wait();
+    }
+
+    /// A probe gets 5 seconds, a real call 30. The message has to say which one ran out, or the
+    /// warning `supported_or_skipped` logs sends whoever reads it looking for a 30-second hang
+    /// that never happened.
+    #[test]
+    fn a_timeout_message_states_the_budget_the_call_actually_had() {
+        let default = KeychainError::TimedOut {
+            provider: "p".to_string(),
+            after: KEYCHAIN_TIMEOUT,
+        };
+        assert!(default.to_string().contains("within 30 s"), "{default}");
+        let probe = KeychainError::TimedOut {
+            provider: "p".to_string(),
+            after: KEYCHAIN_PROBE_TIMEOUT,
+        };
+        assert!(probe.to_string().contains("within 5 s"), "{probe}");
     }
 
     /// A late answer from a worker the caller gave up on must not be handed to the next call.
@@ -583,13 +625,19 @@ mod tests {
     fn providers_are_ordered_by_priority_descending() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(fake::FAKE_ENV);
-        let priorities: Vec<u32> = all_providers().iter().map(|p| p.priority()).collect();
-        // Backends arrive in tasks 3 (macOS) and 4 (Linux); until then the registry is empty
-        // outside the fake, and only the ordering itself is under test.
+        let providers = all_providers();
+        let priorities: Vec<u32> = providers.iter().map(|p| p.priority()).collect();
         assert!(
             priorities.windows(2).all(|w| w[0] >= w[1]),
             "{priorities:?}"
         );
+        // The Linux back ends arrive in task 4; on macOS the registry is already populated.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!priorities.is_empty());
+            assert_eq!(priorities, vec![macos::MAC_PRIORITY]);
+            assert_eq!(providers[0].java_class_name(), MAC_SYSTEM_CLASS);
+        }
     }
 
     fn err_hint_mentions_dialog(err: &KeychainError) -> bool {

@@ -26,7 +26,7 @@ rpassword.workspace = true
 unicode-normalization.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
+security-framework.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

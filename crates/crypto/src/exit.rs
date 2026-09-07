@@ -133,6 +133,7 @@ mod tests {
         use cryptomator_app::KeychainError;
         let timed_out = AppError::Keychain(KeychainError::TimedOut {
             provider: "macOS Keychain".to_string(),
+            after: cryptomator_app::KEYCHAIN_TIMEOUT,
         });
         assert_eq!(
             failure_report(&anyhow::Error::from(timed_out)),

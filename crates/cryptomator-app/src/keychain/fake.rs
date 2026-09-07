@@ -22,6 +22,11 @@
 //! why the file is created `0600` and written through a temporary file that is renamed over it --
 //! the same way [`crate::state_dir`] writes its private state. The **path** never holds a
 //! passphrase; only the values do.
+//!
+//! Concurrency stops there: every mutation is a plain read-modify-write of the whole file, so two
+//! processes writing the same `$CRYPTO_KEYCHAIN_FAKE` at once simply have a last writer who wins
+//! (a `store` can silently undo a concurrent `delete`). A test that spawns `crypto` more than once
+//! against one fake path must serialize those runs -- this is a test double, not a database.
 use super::{Keychain, KeychainError, KeychainResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
