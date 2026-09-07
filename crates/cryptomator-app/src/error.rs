@@ -62,6 +62,13 @@ pub enum AppError {
     /// The daemon answered with an error; the CLI maps `code` to an exit code.
     #[error("{message}")]
     DaemonError { code: String, message: String },
+    /// The keychain could not serve the request; the CLI reports exit code 8.
+    #[error(transparent)]
+    Keychain(#[from] crate::keychain::KeychainError),
+    /// `--password-keychain` was given but nothing is stored for this vault; exit code 8 as well,
+    /// because the source the user insisted on is not available.
+    #[error("no passphrase is stored for {vault} in {provider}")]
+    KeychainNoEntry { vault: String, provider: String },
     #[error("no home directory (set HOME or CRYPTO_SETTINGS_PATH)")]
     NoHomeDirectory,
 }

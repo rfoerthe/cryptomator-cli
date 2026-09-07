@@ -5,6 +5,7 @@
 pub mod cli_config;
 pub mod daemon;
 pub mod error;
+pub mod keychain;
 pub mod mounters;
 pub mod mounting;
 pub mod password;
@@ -20,6 +21,10 @@ pub use daemon::{
     PROTOCOL_VERSION,
 };
 pub use error::{AppError, Result};
+pub use keychain::{
+    alias_for_keychain, resolve_keychain_provider, service_name, with_timeout, Keychain,
+    KeychainError, KeychainResult, DEFAULT_SERVICE, KEYCHAIN_TIMEOUT, SERVICE_ENV,
+};
 pub use mounters::{alias_for, resolve_mounter};
 pub use mounting::{
     choose_service, conflicts_with, mount, MountHandle, MountOverrides, MountRequest,
