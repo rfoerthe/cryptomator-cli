@@ -235,13 +235,21 @@ fn applescript_mount(server: WebDavServerHandle) -> Result<Box<dyn Mount>, Mount
     }))
 }
 
+/// `gio mount <uri>`, as argument vector rather than Java's `sh -c "gio mount \"…\""`: the URI
+/// carries the volume id through [`crate::webdav::normalize_context_path`], but the same "never
+/// interpolate into a shell" rule as for [`gio_unmount_command`] applies -- a shell would be one
+/// quoting bug away from expanding it.
+fn gio_mount_command(uri: &str) -> Command {
+    let mut command = Command::new("gio");
+    command.args(["mount"]).arg(uri);
+    command
+}
+
 /// What happens after the server is up on Linux: `gio mount`, then find the gvfs directory.
 fn gio_mount(server: WebDavServerHandle) -> Result<Box<dyn Mount>, MountError> {
     let http_uri = server.root_uri();
     let uri = dav_uri(&http_uri);
-    let mut mount = Command::new("sh");
-    mount.arg("-c").arg(format!("gio mount \"{uri}\""));
-    let mounted = run_command(mount, GIO_MOUNT_TIMEOUT)?;
+    let mounted = run_command(gio_mount_command(&uri), GIO_MOUNT_TIMEOUT)?;
     if !mounted.success() {
         return Err(MountError::Failed(format!(
             "gio could not mount {uri}: {}",
@@ -767,11 +775,11 @@ mod tests {
         .expect("start test server")
     }
 
-    /// Finding 1: `diskutil umount [force] <path>` and `gio mount -u <uri>` go straight to
-    /// `Command::new(..).arg(..)`, never through a shell -- a path or URI carrying `` ` `` or
-    /// `$(…)` must reach the child process byte for byte instead of being expanded.
+    /// Finding 1: `diskutil umount [force] <path>`, `gio mount <uri>` and `gio mount -u <uri>` go
+    /// straight to `Command::new(..).arg(..)`, never through a shell -- a path or URI carrying
+    /// `` ` `` or `$(…)` must reach the child process byte for byte instead of being expanded.
     #[test]
-    fn diskutil_and_gio_unmount_commands_carry_the_argument_verbatim_without_a_shell() {
+    fn diskutil_and_gio_commands_carry_the_argument_verbatim_without_a_shell() {
         let tricky = Path::new("/tmp/$(rm -rf ~)`touch pwned` \"quoted\"");
 
         let command = diskutil_umount_command(tricky, false);
@@ -801,6 +809,15 @@ mod tests {
                 OsStr::new("-u"),
                 OsStr::new(tricky_uri)
             ]
+        );
+
+        // The mount side goes the same way: Java's `sh -c "gio mount \"<uri>\""` would have let a
+        // URI with a `"` in it close the quote and run the rest.
+        let command = gio_mount_command(tricky_uri);
+        assert_eq!(command.get_program(), OsStr::new("gio"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("mount"), OsStr::new(tricky_uri)]
         );
     }
 

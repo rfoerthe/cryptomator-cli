@@ -57,6 +57,8 @@ pub struct MountOverrides {
     pub mount_options: Vec<String>,
     /// Mount read-only (`--read-only`); overrides `usesReadOnlyMode`.
     pub read_only: Option<bool>,
+    /// The TCP port of a loopback mount (`--port`); overrides the settings' port rule.
+    pub port: Option<u16>,
     /// The volume name (`--volume-name`); overrides the vault's mount name.
     pub volume_name: Option<String>,
 }
@@ -210,6 +212,26 @@ fn named(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+/// The TCP port a loopback (WebDAV) mount binds, `SettledMounter.prepare`'s `LOOPBACK_PORT` rule.
+///
+/// `--port` wins -- including `--port 0`, which is how a user asks for any free port. Without it
+/// Java's rule applies: a vault that names its own mount service brings its own port, a vault that
+/// does not follows `settings.json`'s. The service's own
+/// [`MountService::default_loopback_port`] deliberately plays no part; it is the desktop app's
+/// pre-fill and `crypto mounters` reports it, nothing more.
+pub fn loopback_port(req: &MountRequest<'_>) -> u16 {
+    if let Some(port) = req.overrides.port {
+        return port;
+    }
+    // `named`: a blank `mountService` is "not configured" everywhere else in this module, and a
+    // hand-edited settings.json is the only way to get one.
+    if named(req.vault.mount_service.as_deref()).is_some() {
+        req.vault.port
+    } else {
+        req.settings.port
+    }
+}
+
 /// Mounts `fs` as the vault's settings and the command line ask for.
 ///
 /// Follows `Mounter.mount`: pick the service, refuse it if it conflicts with one another unlocked
@@ -258,8 +280,8 @@ pub fn mount(
 }
 
 /// `SettledMounter.prepare`: every capability the service advertises is configured from the
-/// vault's settings, the rest is left alone. `LOOPBACK_PORT`/`LOOPBACK_HOST_NAME` belong to the
-/// WebDAV back end, which lands in M5.
+/// vault's settings, the rest is left alone. `LOOPBACK_PORT` follows [`loopback_port`], `VOLUME_ID`
+/// the vault's id.
 fn apply_capabilities(
     req: &MountRequest<'_>,
     service: &dyn MountService,
@@ -282,9 +304,10 @@ fn apply_capabilities(
             MountCapability::MountFlags => builder.set_mount_flags(&flags),
             MountCapability::VolumeId => builder.set_volume_id(&req.vault.id),
             MountCapability::VolumeName => builder.set_volume_name(&volume_name),
-            // The mount point is prepared separately, and network mounts are M5.
-            MountCapability::LoopbackPort
-            | MountCapability::LoopbackHostName
+            MountCapability::LoopbackPort => builder.set_loopback_port(loopback_port(req)),
+            // The mount point is prepared separately; no service advertises LOOPBACK_HOST_NAME
+            // (the WebDAV back ends bind what `cli.json`'s `webdavBind` says, see ruling 5).
+            MountCapability::LoopbackHostName
             | MountCapability::MountToExistingDir
             | MountCapability::MountWithinExistingParent
             | MountCapability::MountAsDriveLetter
@@ -304,6 +327,10 @@ fn apply_capabilities(
 /// A service without `READ_ONLY` gets `-oro` appended instead, which is how libfuse is told to
 /// mount read-only; refusing to mount at all would be the only alternative, and silently mounting
 /// a writable volume when the user asked for a read-only one is not one.
+///
+/// A service whose [`MountService::read_only_follows_file_system`] says yes needs neither: it
+/// serves the very `CryptoFs` the daemon opened read-only, so the volume is read-only whatever the
+/// mount options say (the WebDAV back ends answer a write with `403`).
 fn mount_flags(
     req: &MountRequest<'_>,
     service: &dyn MountService,
@@ -317,7 +344,10 @@ fn mount_flags(
                 service.java_class_name()
             )));
         }
-        if read_only && !service.has_capability(MountCapability::ReadOnly) {
+        if read_only
+            && !service.has_capability(MountCapability::ReadOnly)
+            && !service.read_only_follows_file_system()
+        {
             return Err(AppError::MountFailed(format!(
                 "{} cannot mount read-only",
                 service.java_class_name()
@@ -332,11 +362,22 @@ fn mount_flags(
         flags.push(req.vault.mount_flags.clone());
     }
     flags.extend(req.overrides.mount_options.iter().cloned());
-    if read_only && !service.has_capability(MountCapability::ReadOnly) {
+    if read_only
+        && !service.has_capability(MountCapability::ReadOnly)
+        && !service.read_only_follows_file_system()
+    {
         flags.push("-oro".to_owned());
     }
     flags.retain(|flag| !flag.trim().is_empty());
     Ok(flags.join(" "))
+}
+
+/// The mount point the command line or the vault's settings ask for, if any.
+fn chosen_mount_point(req: &MountRequest<'_>) -> Option<PathBuf> {
+    req.overrides
+        .mount_point
+        .clone()
+        .or_else(|| req.vault.mount_point.as_deref().map(PathBuf::from))
 }
 
 /// `Mounter.prepareMountPoint`, without the Windows branches.
@@ -345,6 +386,9 @@ fn mount_flags(
 /// wrong with it; without one, a service that picks its own mount point is left to do so and
 /// every other service mounts to `<mountPointsDir>/<mountName>`, which is created and reported
 /// back for [`MountHandle::close`] to remove again.
+///
+/// A service with no mount-point capability whatsoever -- the WebDAV fallback, which hands out a
+/// URL -- gets none, and refuses a mount point the user insisted on.
 fn prepare_mount_point(
     req: &MountRequest<'_>,
     service: &dyn MountService,
@@ -352,11 +396,21 @@ fn prepare_mount_point(
 ) -> Result<Option<PathBuf>> {
     let can_mount_to_dir = service.has_capability(MountCapability::MountToExistingDir);
     let can_mount_to_system = service.has_capability(MountCapability::MountToSystemChosenPath);
-    let chosen = req
-        .overrides
-        .mount_point
-        .clone()
-        .or_else(|| req.vault.mount_point.as_deref().map(PathBuf::from));
+    let can_mount_within_parent =
+        service.has_capability(MountCapability::MountWithinExistingParent);
+    // A service with no mount-point capability at all mounts nowhere in the file system -- the
+    // WebDAV fallback hands out a URL. Java's `prepareMountPoint` falls through its whole
+    // `if/else if` chain for it and sets nothing; so does this.
+    if !can_mount_to_dir && !can_mount_to_system && !can_mount_within_parent {
+        if let Some(path) = chosen_mount_point(req) {
+            return Err(AppError::MountPointInvalid(
+                path,
+                format!("{} takes no mount point", service.java_class_name()),
+            ));
+        }
+        return Ok(None);
+    }
+    let chosen = chosen_mount_point(req);
 
     if let Some(path) = chosen {
         if path.exists() {
@@ -424,11 +478,13 @@ mod tests {
     use cryptomator_core::{initialize, open_vault_with_key, CipherCombo, Masterkey, OsRng};
     use cryptomator_mount::api::{MountError, UnmountError};
     use cryptomator_mount::registry::{NullMountProvider, NULL_MOUNTER_CLASS, NULL_MOUNT_MARKER};
+    use cryptomator_mount::FallbackMounter;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     const CAPS_ALL: &[MountCapability] = &[
         MountCapability::FileSystemName,
+        MountCapability::LoopbackPort,
         MountCapability::MountFlags,
         MountCapability::MountToExistingDir,
         MountCapability::ReadOnly,
@@ -441,6 +497,7 @@ mod tests {
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
     struct Recorded {
         file_system_name: Option<String>,
+        loopback_port: Option<u16>,
         mountpoint: Option<PathBuf>,
         flags: Option<String>,
         read_only: Option<bool>,
@@ -453,6 +510,7 @@ mod tests {
         class: &'static str,
         supported: bool,
         capabilities: &'static [MountCapability],
+        read_only_from_fs: bool,
         recorded: Arc<Mutex<Recorded>>,
     }
 
@@ -462,6 +520,7 @@ mod tests {
                 class,
                 supported,
                 capabilities: CAPS_ALL,
+                read_only_from_fs: false,
                 recorded: Arc::new(Mutex::new(Recorded::default())),
             }
         }
@@ -486,6 +545,9 @@ mod tests {
         fn default_mount_flags(&self) -> String {
             "-odefault".to_owned()
         }
+        fn read_only_follows_file_system(&self) -> bool {
+            self.read_only_from_fs
+        }
         fn for_file_system(&self, _fs: Arc<CryptoFs>) -> Box<dyn MountBuilder> {
             Box::new(FakeBuilder {
                 recorded: Arc::clone(&self.recorded),
@@ -508,6 +570,9 @@ mod tests {
     impl MountBuilder for FakeBuilder {
         fn set_file_system_name(&mut self, name: &str) -> std::result::Result<(), MountError> {
             self.with(|r| r.file_system_name = Some(name.to_owned()))
+        }
+        fn set_loopback_port(&mut self, port: u16) -> std::result::Result<(), MountError> {
+            self.with(|r| r.loopback_port = Some(port))
         }
         fn set_mountpoint(&mut self, path: &Path) -> std::result::Result<(), MountError> {
             self.with(|r| r.mountpoint = Some(path.to_path_buf()))
@@ -788,6 +853,11 @@ mod tests {
         );
         assert_eq!(recorded.volume_id.as_deref(), Some("AAAAAAAAAAAA"));
         assert_eq!(recorded.volume_name.as_deref(), Some("My Vault"));
+        assert_eq!(
+            recorded.loopback_port,
+            Some(42427),
+            "no mountService on the vault, so settings.port decides"
+        );
         assert_eq!(
             recorded.mountpoint,
             Some(
@@ -1086,5 +1156,425 @@ mod tests {
             "{err}"
         );
         handle.close().expect("close");
+    }
+
+    #[test]
+    fn the_port_follows_the_java_rule_and_the_command_line_beats_both() {
+        let (_vault_dir, fs) = test_fs();
+        let mut vault = vault();
+        vault.port = 6000;
+        let settings = SettingsJson {
+            port: 5000,
+            ..SettingsJson::default()
+        };
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+
+        // No mountService on the vault: `settings.port` wins, even though the vault has a port.
+        let service = FakeService::new("org.example.Fake", true);
+        let recorded = Arc::clone(&service.recorded);
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        assert_eq!(loopback_port(&req), 5000);
+        let handle = mount(&req, &services, Arc::clone(&fs)).expect("mount");
+        assert_eq!(recorded.lock().expect("recorded").loopback_port, Some(5000));
+        handle.close().expect("close");
+
+        // The vault names a mount service: its own port wins.
+        vault.mount_service = Some("org.example.Fake".to_owned());
+        let service = FakeService::new("org.example.Fake", true);
+        let recorded = Arc::clone(&service.recorded);
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        assert_eq!(loopback_port(&req), 6000);
+        let handle = mount(&req, &services, Arc::clone(&fs)).expect("mount");
+        assert_eq!(recorded.lock().expect("recorded").loopback_port, Some(6000));
+        handle.close().expect("close");
+
+        // `--port` beats everything, 0 included -- that is how a user asks for an ephemeral port.
+        let service = FakeService::new("org.example.Fake", true);
+        let recorded = Arc::clone(&service.recorded);
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides {
+                port: Some(0),
+                ..MountOverrides::default()
+            },
+        };
+        assert_eq!(loopback_port(&req), 0);
+        let handle = mount(&req, &services, fs).expect("mount");
+        assert_eq!(recorded.lock().expect("recorded").loopback_port, Some(0));
+        handle.close().expect("close");
+    }
+
+    #[test]
+    fn a_blank_mount_service_on_the_vault_still_means_the_settings_port() {
+        let mut vault = vault();
+        vault.port = 6000;
+        // A hand-edited settings.json can hold `"mountService": "  "`; Java's `null` check would
+        // take the vault's port, but everything else in this crate treats blank as unset.
+        vault.mount_service = Some("   ".to_owned());
+        let settings = SettingsJson {
+            port: 5000,
+            ..SettingsJson::default()
+        };
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        assert_eq!(loopback_port(&req), 5000);
+    }
+
+    #[test]
+    fn a_service_whose_read_only_comes_from_the_file_system_needs_no_flag_and_no_capability() {
+        const WEBDAV_LIKE: &[MountCapability] =
+            &[MountCapability::LoopbackPort, MountCapability::VolumeId];
+        let (_vault_dir, fs) = test_fs();
+        let mut vault = vault();
+        vault.uses_read_only_mode = true;
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let mut service = FakeService::new("org.example.WebDav", true);
+        service.capabilities = WEBDAV_LIKE;
+        service.read_only_from_fs = true;
+        let recorded = Arc::clone(&service.recorded);
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        let handle = mount(&req, &services, fs).expect("a read-only WebDAV mount is fine");
+        let recorded = recorded.lock().expect("recorded").clone();
+        assert_eq!(recorded.flags, None, "no MOUNT_FLAGS, so nothing is set");
+        assert_eq!(recorded.read_only, None, "no READ_ONLY capability either");
+        assert_eq!(recorded.loopback_port, Some(42427));
+        handle.close().expect("close");
+    }
+
+    #[test]
+    fn a_promise_from_the_file_system_keeps_the_read_only_flag_off() {
+        const FLAGS_ONLY: &[MountCapability] = &[
+            MountCapability::MountFlags,
+            MountCapability::MountToExistingDir,
+        ];
+        let (_vault_dir, fs) = test_fs();
+        let mut vault = vault();
+        vault.uses_read_only_mode = true;
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        // The same service as `read_only_reaches_a_service_without_the_capability_as_a_mount_flag`,
+        // but now the promise is what decides: with it, `-oro` is left off.
+        let mut service = FakeService::new("org.example.Linux", true);
+        service.capabilities = FLAGS_ONLY;
+        service.read_only_from_fs = true;
+        let recorded = Arc::clone(&service.recorded);
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        let handle = mount(&req, &services, fs).expect("mount");
+        assert_eq!(
+            recorded.lock().expect("recorded").flags.as_deref(),
+            Some("-odefault"),
+            "the file system is already read-only, so no -oro"
+        );
+        handle.close().expect("close");
+    }
+
+    #[test]
+    fn a_service_without_read_only_and_without_flags_still_refuses_a_read_only_mount() {
+        const NOTHING: &[MountCapability] = &[MountCapability::MountToExistingDir];
+        let (_vault_dir, fs) = test_fs();
+        let mut vault = vault();
+        vault.uses_read_only_mode = true;
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let mut service = FakeService::new("org.example.Stubborn", true);
+        service.capabilities = NOTHING;
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        let err = mount(&req, &services, fs).expect_err("cannot mount read-only");
+        assert!(err.to_string().contains("cannot mount read-only"), "{err}");
+    }
+
+    #[test]
+    fn a_service_with_no_mount_point_capability_at_all_needs_none() {
+        const WEBDAV_LIKE: &[MountCapability] =
+            &[MountCapability::LoopbackPort, MountCapability::VolumeId];
+        let (_vault_dir, fs) = test_fs();
+        let vault = vault();
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let mut service = FakeService::new("org.example.WebDav", true);
+        service.capabilities = WEBDAV_LIKE;
+        let recorded = Arc::clone(&service.recorded);
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides::default(),
+        };
+        let handle = mount(&req, &services, Arc::clone(&fs)).expect("a URL needs no mount point");
+        assert_eq!(
+            recorded.lock().expect("recorded").mountpoint,
+            None,
+            "nothing was set and nothing was created"
+        );
+        assert!(handle.cleanup.is_none(), "and nothing to clean up either");
+        assert!(
+            !home
+                .path()
+                .join("Library/Application Support/Cryptomator/mnt")
+                .exists()
+                && !home.path().join(".local/share/Cryptomator/mnt").exists(),
+            "no mount-point directory was created either"
+        );
+        handle.close().expect("close");
+
+        // A mount point the user insists on is refused, with a message that says why.
+        let mut service = FakeService::new("org.example.WebDav", true);
+        service.capabilities = WEBDAV_LIKE;
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(service)];
+        let chosen = tempfile::tempdir().expect("mount point");
+        let req = MountRequest {
+            running_services: Vec::new(),
+            vault: &vault,
+            settings: &settings,
+            cli: &cli,
+            home: home.path(),
+            overrides: MountOverrides {
+                mount_point: Some(chosen.path().to_path_buf()),
+                ..MountOverrides::default()
+            },
+        };
+        let err = mount(&req, &services, fs).expect_err("no mount point is possible");
+        assert!(err.to_string().contains("takes no mount point"), "{err}");
+    }
+
+    /// The real [`FallbackMounter`], the service every one of the three call sites above exists
+    /// for. It binds a loopback port, so every test below asks for port 0 or for a port that was
+    /// free moments ago, and none of them mounts anything into the file system.
+    ///
+    /// The AppleScript and gio services are deliberately *not* exercised here: they would ask the
+    /// operating system to mount a volume, which is the E2E test's job
+    /// (`cryptomator-mount/tests/webdav_e2e.rs`), not a unit test's.
+    fn webdav_request<'a>(
+        vault: &'a VaultSettingsJson,
+        settings: &'a SettingsJson,
+        cli: &'a CliConfig,
+        home: &'a Path,
+        overrides: MountOverrides,
+    ) -> MountRequest<'a> {
+        MountRequest {
+            running_services: Vec::new(),
+            vault,
+            settings,
+            cli,
+            home,
+            overrides,
+        }
+    }
+
+    /// A port that was free the moment this returned; the listener is closed again right away.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    #[test]
+    fn the_webdav_fallback_serves_a_url_and_needs_no_mount_point() {
+        let (_vault_dir, fs) = test_fs();
+        let vault = vault();
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FallbackMounter)];
+        let req = webdav_request(
+            &vault,
+            &settings,
+            &cli,
+            home.path(),
+            MountOverrides {
+                // Never the configured 42427 in a test: any free port will do.
+                port: Some(0),
+                ..MountOverrides::default()
+            },
+        );
+        let handle = mount(&req, &services, fs).expect("the fallback always mounts");
+        let Mountpoint::Uri(uri) = handle.mountpoint() else {
+            panic!("a WebDAV mount is a URL, not a path");
+        };
+        assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
+        assert!(
+            uri.ends_with("/AAAAAAAAAAAA"),
+            "the volume id is the context path: {uri}"
+        );
+        assert!(
+            !uri.starts_with("http://127.0.0.1:0/"),
+            "port 0 means the port the kernel picked, not literally 0: {uri}"
+        );
+        assert!(handle.cleanup.is_none(), "no directory was created");
+        assert!(
+            !handle.appears_in_mount_table,
+            "nothing waits for a URL in the mount table"
+        );
+        assert!(
+            !handle.supports_forced,
+            "the fallback has no UNMOUNT_FORCED, so `lock --force` is refused with the hint"
+        );
+        assert!(
+            !home.path().join("Library").exists() && !home.path().join(".local").exists(),
+            "no mount-point base was created either"
+        );
+        handle.close().expect("close");
+    }
+
+    #[test]
+    fn a_read_only_webdav_mount_needs_neither_a_capability_nor_a_flag() {
+        let (_vault_dir, fs) = test_fs();
+        let mut vault = vault();
+        vault.uses_read_only_mode = true;
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FallbackMounter)];
+        let req = webdav_request(
+            &vault,
+            &settings,
+            &cli,
+            home.path(),
+            MountOverrides {
+                read_only: Some(true),
+                port: Some(0),
+                ..MountOverrides::default()
+            },
+        );
+        // Before task 7 this was refused with "…FallbackMounter cannot mount read-only": the
+        // service has neither READ_ONLY nor MOUNT_FLAGS, and only its promise that the file system
+        // decides makes the request answerable.
+        let handle = mount(&req, &services, fs).expect("a read-only WebDAV mount is fine");
+        assert!(matches!(handle.mountpoint(), Mountpoint::Uri(_)));
+        handle.close().expect("close");
+    }
+
+    #[test]
+    fn a_taken_port_is_reported_with_both_ways_out() {
+        let (_vault_dir, fs) = test_fs();
+        let vault = vault();
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let port = free_port();
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FallbackMounter)];
+        let request = || {
+            webdav_request(
+                &vault,
+                &settings,
+                &cli,
+                home.path(),
+                MountOverrides {
+                    port: Some(port),
+                    ..MountOverrides::default()
+                },
+            )
+        };
+        let handle = mount(&request(), &services, Arc::clone(&fs)).expect("the port was free");
+        assert_eq!(
+            handle.mountpoint(),
+            Mountpoint::Uri(format!("http://127.0.0.1:{port}/AAAAAAAAAAAA"))
+        );
+
+        // The very same port again: `EADDRINUSE` reaches the user as the mount error, hint and all.
+        let err = mount(&request(), &services, fs).expect_err("the port is taken now");
+        assert!(matches!(err, AppError::MountFailed(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(&port.to_string()), "{message}");
+        assert!(message.contains("--port 0"), "{message}");
+        assert!(message.contains("crypto vault set"), "{message}");
+        handle.close().expect("close");
+    }
+
+    #[test]
+    fn a_mount_point_for_the_webdav_fallback_is_refused_by_name() {
+        let (_vault_dir, fs) = test_fs();
+        let vault = vault();
+        let settings = SettingsJson::default();
+        let cli = CliConfig::default();
+        let home = tempfile::tempdir().expect("home");
+        let chosen = tempfile::tempdir().expect("mount point");
+        let services: Vec<Box<dyn MountService>> = vec![Box::new(FallbackMounter)];
+        let req = webdav_request(
+            &vault,
+            &settings,
+            &cli,
+            home.path(),
+            MountOverrides {
+                mount_point: Some(chosen.path().to_path_buf()),
+                port: Some(0),
+                ..MountOverrides::default()
+            },
+        );
+        let err = mount(&req, &services, fs).expect_err("a URL has no mount point");
+        match err {
+            AppError::MountPointInvalid(ref path, ref reason) => {
+                assert_eq!(path, chosen.path());
+                assert_eq!(
+                    reason,
+                    "org.cryptomator.frontend.webdav.mount.FallbackMounter takes no mount point"
+                );
+            }
+            other => panic!("expected MountPointInvalid, got {other:?}"),
+        }
+        // The refusal comes before anything is bound, so no server is left behind.
     }
 }

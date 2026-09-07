@@ -485,6 +485,9 @@ fn handle_request(shared: &Arc<Shared>, request: &mut Request, writer: &mut Unix
                     mount_point: mount_point.as_deref().map(PathBuf::from),
                     mount_options: mount_options.clone(),
                     read_only: *read_only,
+                    // `--port` is not in the unlock request yet; until it is, a loopback mount
+                    // takes the port from `settings.json` or the vault (see `loopback_port`).
+                    port: None,
                     volume_name: volume_name.clone(),
                 },
                 max_cleartext_name_length: *max_cleartext_name_length,
