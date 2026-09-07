@@ -71,10 +71,11 @@ impl MountService for MacAppleScriptMounter {
     }
 
     /// Java compares `os.version` against `10.10`; every macOS this binary runs on is newer, so
-    /// what is actually worth checking is that `osascript` is there.
+    /// what is actually worth checking is that `osascript` is there -- a fixed, absolute system
+    /// path, so a file check answers it exactly as well as spawning a probe process would, on
+    /// every one of the `services()` / `service_by_class()` / `service_infos()` calls that ask.
     fn is_supported(&self) -> bool {
-        cfg!(target_os = "macos")
-            && probe_command("/usr/bin/osascript", &["-e", "return 1"], PROBE_TIMEOUT)
+        cfg!(target_os = "macos") && osascript_present()
     }
 
     fn capabilities(&self) -> &'static [MountCapability] {
@@ -183,6 +184,11 @@ impl MountService for LinuxGioMounter {
     }
 }
 
+/// Whether `/usr/bin/osascript` is there, without spawning it.
+fn osascript_present() -> bool {
+    Path::new("/usr/bin/osascript").is_file()
+}
+
 /// The three conditions Java's `LinuxGioMounter.isSupported()` checks, as a pure function so both
 /// the KDE exclusion and the missing-`gvfs` case are testable on any host.
 ///
@@ -211,9 +217,9 @@ fn applescript_mount(server: WebDavServerHandle) -> Result<Box<dyn Mount>, Mount
             first_line(&mounted.stderr)
         )));
     }
-    let mut verify = Command::new("/bin/sh");
-    verify.arg("-c").arg(format!("mount | grep \"{uri}\""));
-    let listed = run_command(verify, VERIFY_TIMEOUT)?;
+    // No shell, no grep: `mount_point_in` already filters the output by `uri` below, so the pipe
+    // Java's `sh -c "mount | grep …"` used bought nothing but a shell to interpolate `uri` into.
+    let listed = run_command(Command::new("mount"), VERIFY_TIMEOUT)?;
     let Some(path) = mount_point_in(&listed.stdout, &uri) else {
         // Java throws here too. The volume may well be mounted; say so, because nothing in this
         // process can take it down without a path.
@@ -342,7 +348,21 @@ fn first_line(stderr: &str) -> String {
         .to_owned()
 }
 
-/// `diskutil umount [force] "<path>"`, Java's unmount command verbatim.
+/// `diskutil umount [force] <path>`, Java's unmount command -- as argument vector, not a shell
+/// line: `path` is not always OS-derived (`crypto lock` reads it back from the run-info file), and
+/// a real directory named with `` ` `` or `$(…)` must reach `diskutil` verbatim, not expanded by a
+/// shell.
+fn diskutil_umount_command(path: &Path, forced: bool) -> Command {
+    let mut command = Command::new("diskutil");
+    command.arg("umount");
+    if forced {
+        command.arg("force");
+    }
+    command.arg(path);
+    command
+}
+
+/// `diskutil umount [force] <path>`, Java's unmount command verbatim.
 ///
 /// # Errors
 /// See [`run_unmount_command`]; a path that is no longer a directory is success.
@@ -352,12 +372,7 @@ fn diskutil_umount(path: &Path, forced: bool) -> Result<(), UnmountError> {
         log::debug!("volume at {} already unmounted", path.display());
         return Ok(());
     }
-    let force = if forced { "force " } else { "" };
-    let mut command = Command::new("sh");
-    command
-        .arg("-c")
-        .arg(format!("diskutil umount {force}\"{}\"", path.display()));
-    run_unmount_command(command, TOLERATED_UNMOUNT)
+    run_unmount_command(diskutil_umount_command(path, forced), TOLERATED_UNMOUNT)
 }
 
 /// A volume `osascript` mounted.
@@ -381,7 +396,12 @@ impl AppleScriptMount {
             .map_err(|e| UnmountError::Failed(e.to_string()))
     }
 
+    /// `diskutil umount` and then stop the server -- a no-op once the server is already taken,
+    /// the same flag Java's `MountImpl.isMounted` guards `unmount()` with.
     fn take_down(&mut self, forced: bool) -> Result<(), UnmountError> {
+        if self.server.is_none() {
+            return Ok(());
+        }
         diskutil_umount(&self.path, forced)?;
         self.stop_server()
     }
@@ -406,6 +426,22 @@ impl Mount for AppleScriptMount {
     }
 }
 
+/// The volume must not outlive the process that mounted it: a panic, an early `?`, or simply a
+/// `Box<dyn Mount>` going out of scope without `close()` would otherwise leave a real `/Volumes/…`
+/// entry mounted with no server behind it. This runs the same graceful unmount `unmount()` does
+/// (`take_down`'s own guard makes it a no-op once `close()` or `unmount()` already ran) and only
+/// logs a failure -- a `Drop` cannot return a `Result` to anyone.
+impl Drop for AppleScriptMount {
+    fn drop(&mut self) {
+        if let Err(err) = self.take_down(false) {
+            log::warn!(
+                "failed to unmount {} while dropping the AppleScript mount: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// A volume `gio` mounted.
 ///
 /// **Dropping or closing it blocks**, see [`AppleScriptMount`].
@@ -417,6 +453,15 @@ struct GioMount {
     /// `http://…`, reported when the gvfs directory could not be found.
     http_uri: String,
     path: Option<PathBuf>,
+}
+
+/// `gio mount -u <uri>`, as argument vector: `uri` is built from the server's own loopback
+/// address and the volume id (see [`crate::webdav::normalize_context_path`]), but the same
+/// "never interpolate into a shell" rule applies as for [`diskutil_umount_command`].
+fn gio_unmount_command(uri: &str) -> Command {
+    let mut command = Command::new("gio");
+    command.args(["mount", "-u"]).arg(uri);
+    command
 }
 
 impl GioMount {
@@ -440,22 +485,46 @@ impl Mount for GioMount {
         }
     }
 
+    /// A no-op once the server is already gone -- Java's `MountImpl` carries a `volatile boolean
+    /// isMounted` for exactly this and `close()` runs after `unmount()` on every normal path,
+    /// which would otherwise run `gio mount -u` on a volume already taken down.
     fn unmount(&mut self) -> Result<(), UnmountError> {
+        if self.server.is_none() {
+            return Ok(());
+        }
         // `gio mount -u` addresses the volume by URI, so it works even without the gvfs path.
         if self.path.as_deref().is_none_or(Path::is_dir) {
-            let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg(format!("gio mount -u \"{}\"", self.uri));
-            run_unmount_command(command, TOLERATED_UNMOUNT)?;
+            run_unmount_command(gio_unmount_command(&self.uri), TOLERATED_UNMOUNT)?;
         }
         self.stop_server()
     }
 
-    /// gio has no forced unmount, and neither does Java's `MountImpl`; the trait's default says
-    /// so, and [`MountService::capabilities`] does not advertise `UNMOUNT_FORCED`.
+    /// gio has no forced unmount, and neither does Java's `MountImpl`. The *service* does not
+    /// advertise [`MountCapability::UnmountForced`], so `MountHandle::unmount(true)` refuses
+    /// before it ever reaches here -- but a caller that reaches this directly must not be left
+    /// with a mount whose server keeps running, the same argument
+    /// [`crate::webdav::fallback::FallbackMount::unmount_forced`] makes. Delegating to the
+    /// graceful unmount is therefore not a shortcut, it is the only correct behaviour: there is no
+    /// stronger command to fall back to.
+    fn unmount_forced(&mut self) -> Result<(), UnmountError> {
+        self.unmount()
+    }
+
     fn close(mut self: Box<Self>) -> Result<(), UnmountError> {
         Mount::unmount(&mut *self)
+    }
+}
+
+/// See [`AppleScriptMount`]'s `Drop`: the same stranding risk applies here, `gio mount -u`
+/// addressing the volume by URI even when no gvfs path was ever found.
+impl Drop for GioMount {
+    fn drop(&mut self) {
+        if let Err(err) = Mount::unmount(self) {
+            log::warn!(
+                "failed to unmount {} while dropping the gio mount: {err}",
+                self.uri
+            );
+        }
     }
 }
 
@@ -463,6 +532,7 @@ impl Mount for GioMount {
 mod tests {
     use super::*;
     use crate::registry::{alias_for_class, all_services, LINUX_GIO_CLASS, MAC_APPLESCRIPT_CLASS};
+    use std::ffi::OsStr;
 
     /// One line of `mount` output as macOS prints it for a WebDAV volume.
     const MOUNT_LINE: &str =
@@ -680,5 +750,168 @@ mod tests {
             crate::registry::service_by_class(LINUX_GIO_CLASS).map(|s| s.display_name()),
             Some("WebDAV (gio)")
         );
+    }
+
+    /// Starts a real server for `fs` under `volume_id`, the same way [`WebDavMountBuilder::mount`]
+    /// does, so the `Drop`/unmount tests below have an actual bound socket to check as freed again
+    /// without going through a whole [`crate::api::MountBuilder`].
+    fn start_test_server(fs: Arc<CryptoFs>, volume_id: &str) -> WebDavServerHandle {
+        use crate::webdav::fs::CryptoDavFs;
+        use crate::webdav::server::WebDavServerConfig;
+        WebDavServerHandle::start(WebDavServerConfig {
+            fs: CryptoDavFs::new(fs),
+            bind: crate::webdav::bind_address(),
+            port: 0,
+            context_path: format!("/{volume_id}"),
+        })
+        .expect("start test server")
+    }
+
+    /// Finding 1: `diskutil umount [force] <path>` and `gio mount -u <uri>` go straight to
+    /// `Command::new(..).arg(..)`, never through a shell -- a path or URI carrying `` ` `` or
+    /// `$(…)` must reach the child process byte for byte instead of being expanded.
+    #[test]
+    fn diskutil_and_gio_unmount_commands_carry_the_argument_verbatim_without_a_shell() {
+        let tricky = Path::new("/tmp/$(rm -rf ~)`touch pwned` \"quoted\"");
+
+        let command = diskutil_umount_command(tricky, false);
+        assert_eq!(command.get_program(), OsStr::new("diskutil"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("umount"), tricky.as_os_str()]
+        );
+
+        let forced = diskutil_umount_command(tricky, true);
+        assert_eq!(
+            forced.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("umount"),
+                OsStr::new("force"),
+                tricky.as_os_str()
+            ]
+        );
+
+        let tricky_uri = "dav://127.0.0.1:1/$(rm -rf ~)`touch pwned` \"quoted\"";
+        let command = gio_unmount_command(tricky_uri);
+        assert_eq!(command.get_program(), OsStr::new("gio"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("mount"),
+                OsStr::new("-u"),
+                OsStr::new(tricky_uri)
+            ]
+        );
+    }
+
+    /// Finding 5: the probe is a file check, not a spawned `osascript -e 'return 1'`. If this
+    /// still shelled out, its answer would depend on the process succeeding, not merely existing
+    /// -- this pins it to the bare path check instead.
+    #[test]
+    fn applescript_is_supported_is_a_pure_file_check_without_spawning_osascript() {
+        assert_eq!(
+            MacAppleScriptMounter.is_supported(),
+            cfg!(target_os = "macos") && Path::new("/usr/bin/osascript").is_file()
+        );
+    }
+
+    /// Finding 6: the one piece of unmount logic testable without a real mount -- a path that is
+    /// no longer a directory returns before anything is spawned.
+    #[test]
+    fn diskutil_umount_of_a_path_that_no_longer_exists_is_ok_without_spawning() {
+        assert!(diskutil_umount(Path::new("/definitely/not/here"), false).is_ok());
+    }
+
+    /// Finding 2: a mount that is never `close()`d or `unmount()`d must still take the volume
+    /// down when it is dropped -- a panic or an early `?` between `mount()` and `close()` must not
+    /// strand a real `/Volumes/…` entry with no server behind it.
+    #[test]
+    fn dropping_an_unclosed_applescript_mount_unmounts_and_stops_the_server() {
+        let (_vault, fs) = crate::testing::test_fs();
+        let _guard = crate::testing::env_lock();
+        let server = start_test_server(fs, "dropme-applescript");
+        let addr = server.local_addr();
+        let mount = AppleScriptMount {
+            server: Some(server),
+            // Not a directory: `diskutil_umount` returns before spawning anything, so this test
+            // does not depend on `diskutil` actually being installed.
+            path: PathBuf::from("/definitely/not/here"),
+        };
+        drop(mount);
+        std::net::TcpListener::bind(addr)
+            .expect("the port is free again: dropping the mount stopped the server");
+    }
+
+    /// The same stranding risk for the gio mount: dropping it without `close()`/`unmount()` must
+    /// still stop the server.
+    #[test]
+    fn dropping_an_unclosed_gio_mount_unmounts_and_stops_the_server() {
+        let (_vault, fs) = crate::testing::test_fs();
+        let _guard = crate::testing::env_lock();
+        let server = start_test_server(fs, "dropme-gio");
+        let addr = server.local_addr();
+        let http_uri = server.root_uri();
+        let mount = GioMount {
+            server: Some(server),
+            uri: dav_uri(&http_uri),
+            http_uri,
+            // Not a directory: the `path.is_dir()` guard keeps this from ever spawning `gio`.
+            path: Some(PathBuf::from("/definitely/not/here")),
+        };
+        drop(mount);
+        std::net::TcpListener::bind(addr)
+            .expect("the port is free again: dropping the mount stopped the server");
+    }
+
+    /// Finding 3: a second `unmount()` after the server is already taken must not run `gio mount
+    /// -u` again -- `close()` runs after a successful `unmount()` on every normal path, and would
+    /// otherwise hit a volume already taken down.
+    #[test]
+    fn gio_unmount_returns_ok_without_spawning_once_the_server_is_already_taken() {
+        let (_vault, fs) = crate::testing::test_fs();
+        let _guard = crate::testing::env_lock();
+        let server = start_test_server(fs, "gio-idempotent");
+        let http_uri = server.root_uri();
+        let mut mount = GioMount {
+            server: Some(server),
+            uri: dav_uri(&http_uri),
+            http_uri,
+            // Not a directory: no `gio` spawn on the first call either, so this test needs
+            // neither a real gvfs mount nor the `gio` binary.
+            path: Some(PathBuf::from("/definitely/not/here")),
+        };
+        assert!(
+            mount.unmount().is_ok(),
+            "first call stops the server without spawning gio"
+        );
+        assert!(
+            mount.server.is_none(),
+            "the server handle is gone after the first unmount"
+        );
+        assert!(
+            mount.unmount().is_ok(),
+            "second call is a no-op, guarded by the missing server"
+        );
+    }
+
+    /// Finding 7: gio has no forced unmount, so `unmount_forced` delegates to the graceful path --
+    /// documented on the impl itself; this pins that it actually runs it rather than merely not
+    /// erroring, by checking the server is gone and the port is free again.
+    #[test]
+    fn gio_unmount_forced_delegates_to_the_graceful_unmount() {
+        let (_vault, fs) = crate::testing::test_fs();
+        let _guard = crate::testing::env_lock();
+        let server = start_test_server(fs, "gio-forced");
+        let addr = server.local_addr();
+        let http_uri = server.root_uri();
+        let mut mount = GioMount {
+            server: Some(server),
+            uri: dav_uri(&http_uri),
+            http_uri,
+            path: Some(PathBuf::from("/definitely/not/here")),
+        };
+        mount.unmount_forced().expect("forced unmount");
+        assert!(mount.server.is_none());
+        std::net::TcpListener::bind(addr).expect("the port is free again");
     }
 }

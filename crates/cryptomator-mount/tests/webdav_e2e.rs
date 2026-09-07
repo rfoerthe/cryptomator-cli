@@ -77,11 +77,10 @@ fn applescript_mounts_a_volume_that_the_finder_can_read() {
     builder.set_loopback_port(0).expect("LOOPBACK_PORT");
     builder.set_volume_id("e2evault").expect("VOLUME_ID");
     builder.set_volume_name("CryptoE2E").expect("VOLUME_NAME");
-    let mount = builder.mount().expect("osascript mount");
-    let Mountpoint::Path(path) = mount.mountpoint() else {
+    let mut guard = Guard(Some(builder.mount().expect("osascript mount")));
+    let Mountpoint::Path(path) = guard.0.as_ref().expect("still mounted").mountpoint() else {
         panic!("the AppleScript mounter reports a path")
     };
-    let mut guard = Guard(Some(mount));
     eprintln!("service: mounted at {}", path.display());
     assert_eq!(
         std::fs::read(path.join("e2e.txt")).expect("read through the volume"),
@@ -122,11 +121,10 @@ fn gio_mounts_a_volume_under_gvfs() {
     let mut builder = service.for_file_system(Arc::clone(&fs));
     builder.set_loopback_port(0).expect("LOOPBACK_PORT");
     builder.set_volume_id("e2evault").expect("VOLUME_ID");
-    let mount = builder.mount().expect("gio mount");
-    let Mountpoint::Path(path) = mount.mountpoint() else {
+    let mut guard = Guard(Some(builder.mount().expect("gio mount")));
+    let Mountpoint::Path(path) = guard.0.as_ref().expect("still mounted").mountpoint() else {
         panic!("gio reports the gvfs path")
     };
-    let mut guard = Guard(Some(mount));
     eprintln!("service: mounted at {}", path.display());
     assert_eq!(
         std::fs::read(path.join("e2e.txt")).expect("read through the volume"),
