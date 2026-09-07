@@ -566,7 +566,7 @@ mod tests {
                 .mode()
                 & 0o777,
             0o755,
-            "the link's target was not chmod-ed through the link"
+            "the link's target was chmod-ed through the link"
         );
     }
 

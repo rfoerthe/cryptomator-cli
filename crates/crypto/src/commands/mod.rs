@@ -103,8 +103,9 @@ pub fn install_interrupt() -> Result<Arc<AtomicBool>> {
     Ok(flag)
 }
 
-/// Resolves a vault reference to its settings entry and path, requiring the vault to be in state
-/// LOCKED (config + masterkey present).
+/// Resolves a vault reference to its settings entry and path, requiring the vault to be LOCKED --
+/// both on disk (config + masterkey present, no partial state) and at runtime (no daemon serving
+/// it, no volume a crashed daemon left behind).
 pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
     let settings = ctx.store.load()?;
     let index = resolve_vault_index(&settings, reference)?;
@@ -121,6 +122,13 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
         }
         .into());
     }
+    // The state on disk is only half the answer: a vault a daemon is serving looks LOCKED there
+    // (its masterkey file is untouched), but its key is live in another process and its files are
+    // open. Rewriting the masterkey underneath that daemon -- which is what `password change` and
+    // `recovery-key reset-password` do -- would leave the running mount serving a vault whose key
+    // no longer opens it. So every command that resolves a vault this way requires it to be
+    // locked in the runtime sense too; `crypto lock --force` is the way out of a stale mount.
+    ctx.registry().require_locked(&vault)?;
     Ok((vault, path))
 }
 

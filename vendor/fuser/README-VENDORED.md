@@ -74,9 +74,12 @@ reads and never accepts a reply only in part (see the last three bullets):
   transfer), replies run to `rwsize=262144` bytes, and the CLI installs SIGINT/SIGTERM/SIGHUP
   handlers that can be delivered on the FUSE thread. A truncated reply desynchronises the stream
   permanently -- the peer reads the tail of one reply as the head of the next -- which is the read
-  side's failure mode mirrored. Covered by `src/channel.rs::send_test` (six tests over a fake
-  writer: short writes resumed in order, a single full write, `EINTR` retried, `WriteZero`, other
-  errors propagated, an empty write as a no-op).
+  side's failure mode mirrored. The first `writev` goes against the caller's own slice list and
+  returns right there when it took everything, so the `/dev/fuse` path allocates nothing; only a
+  write that really came up short copies the list the resume loop has to rewrite in place. Covered
+  by `src/channel.rs::send_test` (seven tests over a fake writer: short writes resumed in order, a
+  single full write, the full write's slice list passed through uncopied, `EINTR` retried,
+  `WriteZero`, other errors propagated, an empty write as a no-op).
 
 ## Touched upstream files
 

@@ -165,6 +165,65 @@ fn unlock_mounts_the_vault_and_lock_takes_it_down() {
     fx.crypto_daemon(&["lock", "v"]).assert().code(5);
 }
 
+/// Rewriting the masterkey of a vault a daemon is serving would leave that daemon holding a key
+/// that no longer opens the vault, so the commands that touch it refuse the same way `fs` does.
+#[test]
+fn password_and_recovery_key_refuse_a_vault_a_daemon_is_serving() {
+    let fixture = Fixture::new("pv");
+    unlock(&fixture);
+    for args in [
+        vec!["password", "change", "pv"],
+        vec!["recovery-key", "show", "pv"],
+        // The recovery-key source is a required argument group, so it has to be there for the
+        // command to reach the state check at all; nothing ever reads that empty stdin.
+        vec![
+            "recovery-key",
+            "reset-password",
+            "pv",
+            "--recovery-key-stdin",
+        ],
+    ] {
+        let assertion = fixture.crypto_daemon(&args).assert().code(5);
+        let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+        assert!(
+            stderr.contains("UNLOCKED"),
+            "{args:?} says what is wrong: {stderr}"
+        );
+    }
+    fixture
+        .crypto_daemon(&["lock", fixture.name])
+        .assert()
+        .success();
+
+    // Once it is locked again, every one of them works. The new password is the one the sandbox
+    // already uses, so each command leaves the vault openable for the next.
+    let key = fixture
+        .crypto_daemon(&["recovery-key", "show", "pv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    fixture
+        .crypto_daemon(&[
+            "recovery-key",
+            "reset-password",
+            "pv",
+            "--recovery-key-stdin",
+            "--new-password-env",
+            "NEWPW",
+        ])
+        .env("NEWPW", common::PW)
+        .write_stdin(key)
+        .assert()
+        .success();
+    fixture
+        .crypto_daemon(&["password", "change", "pv", "--new-password-env", "NEWPW"])
+        .env("NEWPW", common::PW)
+        .assert()
+        .success();
+}
+
 #[test]
 fn a_busy_volume_needs_lock_force() {
     let fx = Fixture::new("b");

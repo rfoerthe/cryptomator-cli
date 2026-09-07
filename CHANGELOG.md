@@ -335,10 +335,6 @@
   failed copy; if it does, the refusal has to become a mount flag instead of a default.
 - **Coexistence with the Cryptomator desktop app** — unlocking in one and looking at the vault in the
   other — is a manual check nobody has run.
-- `crypto password change` and `crypto recovery-key show`/`reset-password` still accept an
-  *unlocked* vault: they resolve it through `locked_vault_path`, which only checks the on-disk
-  state. Neither corrupts ciphertext, but both should refuse like the `fs`/`name` commands do;
-  deferred to M5.
 - The daemon reads its socket through a `BufReader`, whose internal buffer keeps the base64 vault key
   of the `unlock` line until later traffic overwrites it. Every decoded copy is wiped; the buffer is
   an M5 follow-up.
@@ -369,3 +365,13 @@
   (`ipc.socket` next to `settings.json`, per its `-Dcryptomator.ipcSocketPath` packaging value;
   `$CRYPTO_DESKTOP_IPC_SOCKET` overrides it, and the probe gives up after 200 ms). Read-only
   commands stay silent, and a socket file nobody listens on does not count as a running app.
+- **Resolved (deferred in M4):** `crypto password change` and `crypto recovery-key show` /
+  `recovery-key reset-password` no longer accept an *unlocked* vault. The runtime check
+  (`VaultRegistry::require_locked`) moved out of `fs`/`unlock` and into `commands::locked_vault`, so
+  every command that resolves a vault that way refuses a vault a daemon is serving — and one a
+  crashed daemon left mounted — with the same exit `5` wording. `recovery-key validate`, which takes
+  no vault, is unaffected.
+- The vendored fuser sends a reply that goes out in one piece without copying the slice list: the
+  first `writev` is made against the caller's own `IoSlice`s and only a genuinely short write
+  allocates the owned copy `IoSlice::advance_slices` needs. `/dev/fuse` always takes the fast path.
+

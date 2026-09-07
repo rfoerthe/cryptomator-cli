@@ -59,9 +59,6 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
     // Before the password: an unusable mounter name is a usage error, not a failed unlock.
     let mounter = args.mounter.as_deref().map(resolve_mounter).transpose()?;
     let (vault, path) = locked_vault(ctx, &args.vault)?;
-    // Refuses a vault a daemon is already serving, or whose volume a crashed daemon left behind
-    // (`crypto lock --force` is the way out of the latter -- the same hint `crypto fs` gets).
-    ctx.registry().require_locked(&vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?

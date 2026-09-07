@@ -81,7 +81,7 @@ input.
 | `2` | usage: an unknown flag or mounter, no password source, a value the setting does not take |
 | `3` | the vault reference names no registered vault, or more than one |
 | `4` | wrong password, invalid recovery key, a new password below the minimum length |
-| `5` | wrong vault state: already unlocked, not unlocked, needs migration, read-only, or an `fs`/`name` command on a vault that is not `LOCKED` |
+| `5` | wrong vault state: already unlocked, not unlocked, needs migration, read-only, or an `fs`/`name`/`password change`/`recovery-key show`/`recovery-key reset-password` command on a vault that is not `LOCKED` |
 | `6` | the mount failed — a mount point that cannot be used, a mounter that refused, a conflicting mount service, or a daemon that stopped answering while it mounted |
 | `7` | the unmount failed; a volume still in use needs `crypto lock … --force` |
 | `9` | a Hub vault, which this build cannot open |
@@ -368,6 +368,12 @@ fallback listed above, because there is no old password to keep apart from it. `
 `--new-password-file` / `--new-password-env` instead, in the same order. `password change`
 deliberately does **not** fall back to `$CRYPTO_PASSWORD` for the *new* password: that variable holds
 the current one, and silently reusing it would keep the old password.
+
+`password change` and `recovery-key show` / `recovery-key reset-password` need the vault to be
+`LOCKED` in the same sense `crypto fs` does (exit `5` otherwise): a vault a daemon is serving, or one
+a crashed daemon left mounted, holds a live key that rewriting the masterkey file would invalidate.
+`crypto lock` — with `--force` for the volume a crashed daemon left behind — is the way out.
+`recovery-key validate` takes no vault and is unaffected.
 
 ## Settings file
 
