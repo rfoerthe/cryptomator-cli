@@ -41,6 +41,9 @@ fn core_code(err: &CoreError) -> u8 {
         | CoreError::VaultConfigLoad(_)
         | CoreError::UnsupportedKeyId(_)
         | CoreError::MissingCapability { .. }
+        // A limit of the storage, like a missing capability: nothing about the vault or the
+        // command is wrong, the file system simply cannot hold the migrated names.
+        | CoreError::FileNameTooLong { .. }
         | CoreError::Io(_) => GENERAL,
     }
 }
@@ -175,6 +178,31 @@ mod tests {
                 "busy".to_owned()
             ))),
             Some(UNMOUNT_FAILED)
+        );
+    }
+
+    /// The migration errors: what the storage cannot do is a general failure, what the vault is
+    /// keeps its state code.
+    #[test]
+    fn a_name_the_storage_cannot_hold_is_a_general_failure() {
+        let too_long = CoreError::FileNameTooLong {
+            path: std::path::PathBuf::from("/v/d/AB/CD/xxx.c9r"),
+            needed: 232,
+            allowed: 143,
+        };
+        assert_eq!(
+            too_long.to_string(),
+            "/v/d/AB/CD/xxx.c9r needs 232 characters, but the storage supports only 143"
+        );
+        assert_eq!(
+            failure_report(&anyhow::Error::from(too_long)),
+            Some(GENERAL)
+        );
+        assert_eq!(
+            failure_report(&anyhow::Error::from(CoreError::MigrationBlocked(
+                "a full scan is needed".to_owned()
+            ))),
+            Some(WRONG_STATE)
         );
     }
 }

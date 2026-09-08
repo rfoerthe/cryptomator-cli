@@ -46,7 +46,9 @@ pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
 /// `migration::detect_version`, `migration::needs_migration`); only the types are re-exported,
 /// because `needs_migration` already exists here with the plain numeric semantics of
 /// `vault::state`.
-pub use migration::{MigrationEvent, MigrationPlan, MigrationStep, PlannedRename, VaultVersion};
+pub use migration::{
+    MigrationEvent, MigrationOptions, MigrationPlan, MigrationStep, PlannedRename, VaultVersion,
+};
 pub use vault::init::{
     create_vault, initialize, write_root_file, CreateVaultOptions, DEFAULT_SHORTENING_THRESHOLD,
     MAX_SHORTENING_THRESHOLD, MIN_SHORTENING_THRESHOLD,

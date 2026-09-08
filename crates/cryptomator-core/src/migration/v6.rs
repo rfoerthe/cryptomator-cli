@@ -14,6 +14,12 @@ use zeroize::Zeroizing;
 
 /// `passphrase` is the passphrase in whatever form the user typed it — that is the form the
 /// format 5 key file was locked with. Afterwards the vault opens with its NFC form only.
+///
+/// # Preconditions
+///
+/// The vault is at format 5. Nothing here checks that: called on a format 6 or 7 vault this would
+/// happily re-stamp the key file back to version 6. Java reaches the migrator only through
+/// `Migrators`' dispatch map; call [`crate::migration::migrate`] for the same effect.
 pub fn migrate(vault_path: &Path, passphrase: &str, rng: &mut dyn Rng) -> Result<()> {
     let masterkey_file = vault_path.join(MASTERKEY_FILENAME);
     let access = MasterkeyFileAccess::new(Vec::new());

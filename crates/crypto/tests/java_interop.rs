@@ -180,6 +180,45 @@ fn java_opens_fixtures_after_a_password_change_by_crypto() {
     }
 }
 
+/// A vault migrated from format 6 to format 8 by `crypto` must be a vault cryptofs 2.10.0 reads —
+/// the 6 → 7 name migration (BASE32 → base64url, `.lng` → `.c9s`) is the one step of the chain
+/// that rewrites the ciphertext, so this is where a mistake would hide. The fixture is read-only,
+/// so the migration runs on a copy, and the migrated vault opens with the **NFC** passphrase.
+#[test]
+#[ignore = "needs Java + Maven; run with --ignored"]
+fn java_reads_a_legacy_vault_migrated_by_crypto() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("legacy_v6");
+    let fixture = repo_root().join("tests/fixtures/legacy_v6");
+    copy_dir(&fixture, &vault);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("fixture.json")).unwrap()).unwrap();
+    let passphrase = meta["passphrase"].as_str().unwrap().to_owned();
+    let nfc = meta["passphraseNfc"]
+        .as_str()
+        .unwrap_or(&passphrase)
+        .to_owned();
+
+    let reached = cryptomator_core::migration::migrate(
+        &vault,
+        &passphrase,
+        cryptomator_core::MigrationOptions {
+            full_scan_allowed: true,
+            dry_run: false,
+        },
+        &mut |_| {},
+    )
+    .expect("the 6 -> 8 chain");
+    assert_eq!(reached, cryptomator_core::VaultVersion::V8);
+    assert!(!vault.join("m").exists(), "the metadata directory is gone");
+
+    let manifest = verify_with_java(&vault, &nfc);
+    assert_eq!(
+        manifest, meta["expected"],
+        "cryptofs sees a different tree than the fixture manifest after the migration"
+    );
+}
+
 /// A tree written by `CryptoFs` (long names, unicode, sizes at chunk boundaries, symlinks, nesting)
 /// is read by the real cryptofs; the Java manifest equals `crypto fs tree --json --hash`.
 #[test]

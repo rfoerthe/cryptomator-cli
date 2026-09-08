@@ -43,6 +43,15 @@ pub enum CoreError {
     /// format 7 masterkey file, or a step of the chain is not implemented yet.
     #[error("migration cannot continue: {0}")]
     MigrationBlocked(String),
+    /// `cryptofs/FileNameTooLongException`: the 6 → 7 migration would produce a name or a path
+    /// that the storage cannot hold. `allowed` is what the capability probe found — the name limit
+    /// for a name, that limit plus 48 for a path — and the vault is left unchanged.
+    #[error("{path} needs {needed} characters, but the storage supports only {allowed}")]
+    FileNameTooLong {
+        path: std::path::PathBuf,
+        needed: usize,
+        allowed: usize,
+    },
     /// A vault format outside 5..=8: either older than any migrator this tool has
     /// (`NoApplicableMigratorException`) or newer than it knows.
     #[error("vault format {version} cannot be migrated by this version of the tool")]

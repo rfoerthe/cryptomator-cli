@@ -19,6 +19,11 @@ use std::path::Path;
 const FORMAT_7_CIPHER_COMBO: CipherCombo = CipherCombo::SivCtrMac;
 const FORMAT_7_SHORTENING_THRESHOLD: u32 = 220;
 
+/// # Preconditions
+///
+/// The vault is at format 7 and has no `vault.cryptomator` yet (an existing one is refused rather
+/// than overwritten). Nothing here checks the version; call [`crate::migration::migrate`] to
+/// dispatch, exactly as Java reaches this migrator only through `Migrators`.
 pub fn migrate(vault_path: &Path, passphrase: &str, rng: &mut dyn Rng) -> Result<()> {
     let masterkey_file = vault_path.join(MASTERKEY_FILENAME);
     let config_file = vault_path.join(VAULTCONFIG_FILENAME);

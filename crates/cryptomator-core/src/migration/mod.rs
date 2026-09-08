@@ -5,15 +5,17 @@
 //! step re-reads the vault's own version first, so an interrupted run simply continues where it
 //! stopped, and every step that rewrites `masterkey.cryptomator` backs the old file up first.
 //!
-//! Only the 6 → 7 step is missing: [`migrate`] stops there with
-//! [`CoreError::MigrationBlocked`](crate::error::CoreError::MigrationBlocked).
-//!
 //! The passphrase handed to [`migrate`] is what the user typed. Format 6 is precisely the format
-//! that encodes the passphrase in Unicode NFC, so the 5 → 6 step normalises it and every later
-//! step uses the normalised form — the caller never has to know (Java parity: `Version6Migrator`
-//! persists with `Normalizer.normalize(passphrase, NFC)`, and the chain then continues with the
-//! same `CharSequence` because everything above format 5 normalises on unlock anyway).
+//! that encodes the passphrase in Unicode NFC, so the 5 → 6 step normalises it (Java parity:
+//! `Version6Migrator` persists with `Normalizer.normalize(passphrase, NFC)`) and the chain then
+//! carries the **normalised** form forward. That hand-over at [`migrate`]'s `current = …nfc()` is
+//! load-bearing, not a convenience: nothing after format 5 normalises anything — neither our
+//! `crypto::kdf` nor cryptolib's `Scrypt.scrypt(CharSequence, …)` does more than UTF-8-encode what
+//! it is given — so a chain that kept the user's original NFD input would fail the 6 → 7 step with
+//! [`CoreError::InvalidPassphrase`](crate::error::CoreError::InvalidPassphrase) *after* the 5 → 6
+//! step had already been committed.
 pub mod v6;
+pub mod v7;
 pub mod v8;
 
 use crate::backup::{attempt_backup, BackupStatus};
@@ -142,9 +144,29 @@ pub struct MigrationPlan {
     /// Always [`VaultVersion::LATEST`]; a plan never stops halfway.
     pub to: VaultVersion,
     pub steps: Vec<MigrationStep>,
-    /// The renames of the 6 → 7 step's dry run. Empty while that step is unimplemented, and empty
-    /// for every plan that does not contain it.
+    /// The renames of the 6 → 7 step's dry run, empty for every plan that does not contain that
+    /// step. Collisions are not resolved here: two sources landing on the same target are both
+    /// listed with it, and the migration gives the second one a `_1` suffix when it gets there.
     pub renames: Vec<PlannedRename>,
+}
+
+/// How [`migrate`] should behave. [`Default`] is "change the vault, and refuse a migration that
+/// would need a full scan first".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MigrationOptions {
+    /// Permission to walk the whole vault when the storage cannot hold 220-character names.
+    ///
+    /// Java asks the user through `MigrationContinuationListener.continueMigrationOnEvent(
+    /// REQUIRES_FULL_VAULT_DIR_SCAN)`; a CLI cannot ask in the middle of a run, so the answer is
+    /// given up front (`--yes`). Without it such a vault is reported as
+    /// [`CoreError::MigrationBlocked`](crate::error::CoreError::MigrationBlocked) and left alone.
+    /// It has no effect on storage that supports the full name length — the common case, where no
+    /// scan is needed at all.
+    pub full_scan_allowed: bool,
+    /// Report what would happen and change nothing. [`migrate`] then returns the format the vault
+    /// is at, having written nothing and reported no [`MigrationEvent`]; the renames it would make
+    /// are what [`plan`] lists.
+    pub dry_run: bool,
 }
 
 /// What [`migrate`] reports while it works (`migration/api/MigrationProgressListener.java`).
@@ -206,12 +228,24 @@ pub fn needs_migration(vault_path: &Path) -> Result<bool> {
     Ok(detect_version(vault_path)? != VaultVersion::LATEST)
 }
 
-/// The steps [`migrate`] would run, in order.
+/// The steps [`migrate`] would run, in order, and the renames the 6 → 7 step among them would
+/// perform — the `--dry-run` at core level. Nothing is written.
 ///
 /// The passphrase is verified against the masterkey file whenever there is anything to do, so a
-/// wrong passphrase is reported before the first byte is written; it is also what the 6 → 7 step's
-/// dry run will need to fill [`MigrationPlan::renames`].
+/// wrong passphrase is reported before the first byte is written.
 pub fn plan(vault_path: &Path, passphrase: &str) -> Result<MigrationPlan> {
+    let mut plan = plan_steps(vault_path, passphrase)?;
+    if plan.steps.contains(&MigrationStep::SixToSeven) {
+        // Formats 5 and 6 share the on-disk layout, so the renames can be listed for a format 5
+        // vault too, long before its own step has run.
+        plan.renames = v7::plan_renames(vault_path)?;
+    }
+    Ok(plan)
+}
+
+/// [`plan`] without the rename pass, which [`migrate`] does not need and which costs a full walk
+/// of `d/`.
+fn plan_steps(vault_path: &Path, passphrase: &str) -> Result<MigrationPlan> {
     let from = detect_version(vault_path)?;
     let mut steps = Vec::new();
     let mut version = from;
@@ -237,25 +271,28 @@ pub fn plan(vault_path: &Path, passphrase: &str) -> Result<MigrationPlan> {
 ///
 /// `passphrase` is the passphrase the user typed; see the module documentation for how the 5 → 6
 /// step normalises it. A vault that is already at format 8 is left alone and reported as
-/// [`VaultVersion::V8`].
+/// [`VaultVersion::V8`], and so is every vault when
+/// [`MigrationOptions::dry_run`] is set.
 pub fn migrate(
     vault_path: &Path,
     passphrase: &str,
+    options: MigrationOptions,
     progress: &mut dyn FnMut(MigrationEvent),
 ) -> Result<VaultVersion> {
-    migrate_with_rng(vault_path, passphrase, progress, &mut OsRng)
+    migrate_with_rng(vault_path, passphrase, options, progress, &mut OsRng)
 }
 
 fn migrate_with_rng(
     vault_path: &Path,
     passphrase: &str,
+    options: MigrationOptions,
     progress: &mut dyn FnMut(MigrationEvent),
     rng: &mut dyn Rng,
 ) -> Result<VaultVersion> {
     assert_all_capabilities(vault_path)?;
     // Also verifies the passphrase, so a wrong one leaves the vault untouched.
-    let planned = plan(vault_path, passphrase)?;
-    if planned.steps.is_empty() {
+    let planned = plan_steps(vault_path, passphrase)?;
+    if planned.steps.is_empty() || options.dry_run {
         return Ok(planned.from);
     }
     // The passphrase changes in 5 → 6 (NFC); the following steps need the new form.
@@ -273,12 +310,15 @@ fn migrate_with_rng(
                 v6::migrate(vault_path, &current, rng)?;
                 current = Zeroizing::new(current.nfc().collect::<String>());
             }
-            // Task 11 fills this in. Until then the chain stops here — with whatever earlier steps
-            // it already completed left in place, which is exactly how an interrupted run looks.
             MigrationStep::SixToSeven => {
-                return Err(CoreError::MigrationBlocked(
-                    "the 6->7 migrator arrives with the next task".to_string(),
-                ))
+                progress(MigrationEvent::StepStarted { step });
+                v7::migrate_reporting(
+                    vault_path,
+                    &current,
+                    options.full_scan_allowed,
+                    progress,
+                    rng,
+                )?;
             }
             MigrationStep::SevenToEight => {
                 progress(MigrationEvent::StepStarted { step });
@@ -292,8 +332,10 @@ fn migrate_with_rng(
     }
 }
 
-/// `BackupHelper.attemptBackup` with Java's failure behaviour: a backup that cannot be written is
-/// fatal, because the original is about to be overwritten.
+/// `BackupHelper.attemptBackup`, with one **deliberate deviation**: a backup that cannot be
+/// written is fatal here, while Java catches the `IOException`, logs `"Failed to backup {}."` and
+/// returns the backup path regardless. The original is about to be overwritten, so a migration
+/// that could not secure it should not proceed.
 ///
 /// An existing backup is never overwritten — [`attempt_backup`] creates the file with `CREATE_NEW`
 /// and otherwise only compares. A backup whose content differs from the current file is a
@@ -394,11 +436,75 @@ mod tests {
     }
 
     #[test]
-    fn a_backup_that_cannot_be_written_is_fatal() {
+    fn a_file_that_cannot_be_read_cannot_be_backed_up() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
             back_up(&dir.path().join("nope")),
             Err(CoreError::Io(_))
         ));
+    }
+
+    /// The [`BackupStatus::Failed`] arm proper: the file is there, but its backup path is occupied
+    /// by a directory, so opening it fails with something other than `AlreadyExists`.
+    #[test]
+    fn a_backup_that_cannot_be_written_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("masterkey.cryptomator");
+        let content = b"hello\n";
+        std::fs::write(&file, content).unwrap();
+        let blocked = file.with_file_name(crate::backup::backup_file_name(
+            "masterkey.cryptomator",
+            content,
+        ));
+        std::fs::create_dir(&blocked).unwrap();
+        assert_eq!(
+            attempt_backup(&file).unwrap().status,
+            BackupStatus::Failed(
+                std::fs::read(&blocked)
+                    .expect_err("a directory is not readable as a file")
+                    .to_string()
+            ),
+            "the precondition of this test"
+        );
+        let err = back_up(&file).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::Io(e) if e.to_string().contains("cannot back up")),
+            "{err}"
+        );
+    }
+
+    /// `assertWriteAccess`: a directory that can be listed but not written to.
+    #[test]
+    fn a_read_only_directory_has_no_write_access() {
+        if is_root() {
+            return; // root ignores the permission bits, so there is nothing to observe
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("read-only");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = assert_all_capabilities(&vault).unwrap_err();
+        // Restore before the assertion, so a failure still leaves a removable temp dir behind.
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(
+                err,
+                CoreError::MissingCapability {
+                    capability: "write access",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// Tests that turn permission bits into an expectation are meaningless as root.
+    pub(crate) fn is_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+            .unwrap_or(false)
     }
 }
