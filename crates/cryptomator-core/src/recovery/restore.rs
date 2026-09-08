@@ -298,12 +298,40 @@ pub fn detect_cipher_combo(vault_path: &Path, masterkey: &Masterkey) -> Result<C
     Err(undetectable())
 }
 
+/// Whether `dir` (recursively) holds a node using the format 7/8 naming, i.e. anything ending in
+/// `.c9r` or `.c9s`.
+///
+/// Broader than [`first_encrypted_file`] on purpose: that scan is after a file whose *header* can
+/// be read, so it skips `dir.c9r`, `symlink.c9r`, `dirid.c9r` and every `.c9s` directory. This one
+/// only asks "did the 6 → 7 rename ever touch this vault", so any of those count too -- a vault
+/// with nothing but subdirectories still answers `true` the moment the first one was renamed.
+fn has_format_seven_node(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(CRYPTOMATOR_FILE_SUFFIX) || name.ends_with(DEFLATED_FILE_SUFFIX) {
+            return true;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) && has_format_seven_node(&entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Refuses a restore into a vault that still has the format 5/6 layout, before anything is
 /// written.
 ///
 /// The tell is `<vault>/m`, the metadata directory of the long names, which only formats 5 and 6
-/// have (7 and 8 keep the inflated name inside the node, so stamping a format 8 config onto a
-/// format 7 vault is right and is left alone here).
+/// have -- but `m/` alone is not proof: `crypto migrate`'s 6 → 7 step keeps a leftover `m/` when
+/// one or more nodes could not be renamed (see the *skipped nodes* section of the README), even
+/// though every other node below `d/` already carries its format 7/8 name. Refusing such a vault
+/// would make a migrated vault's key files unrecoverable, so the real question is whether `d/` has
+/// been touched by the rename yet: only a vault with `m/` and **no** `.c9r`/`.c9s` node anywhere
+/// under `d/` is still genuinely format 5/6.
 ///
 /// Without this check a legacy vault that lost **both** key files -- state `ALL_MISSING`, which
 /// `crypto recovery-key restore` accepts -- would be given a `format: 8` config and a masterkey
@@ -313,7 +341,9 @@ pub fn detect_cipher_combo(vault_path: &Path, masterkey: &Masterkey) -> Result<C
 /// afterwards is the only order that works, and the migration needs the passphrase, not the
 /// recovery key.
 fn assert_not_legacy_layout(vault_path: &Path) -> Result<()> {
-    if vault_path.join(OLD_METADATA_DIR_NAME).is_dir() {
+    if vault_path.join(OLD_METADATA_DIR_NAME).is_dir()
+        && !has_format_seven_node(&vault_path.join(DATA_DIR_NAME))
+    {
         return Err(CoreError::MigrationBlocked(format!(
             "{} still has the format 5/6 layout (its `{OLD_METADATA_DIR_NAME}` directory is \
              there); restoring would stamp a format {VAULT_VERSION} config onto it and no \
@@ -616,6 +646,18 @@ mod tests {
         // A well-formed key for a vault of our own: the refusal comes before it is looked at.
         let (_other_tmp, _other, masterkey) = vault_with(CipherCombo::SivGcm);
         let key = crate::recovery::key::create_recovery_key(&encoder, masterkey.raw());
+        // The fixture already ships a `.bkup` of its own (from cryptofs 1.x), so "no backup
+        // exists" would be true regardless of whether the refusal actually ran before writing
+        // anything -- what matters is that no *new* one is added by any of the three calls below.
+        let bkup_names_of = |vault: &Path| -> std::collections::BTreeSet<std::ffi::OsString> {
+            std::fs::read_dir(vault)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".bkup"))
+                .collect()
+        };
+        let bkups_before = bkup_names_of(&vault);
 
         for outcome in [
             restore_all(
@@ -651,9 +693,78 @@ mod tests {
                 "{err}"
             );
         }
-        // And nothing moved: the fixture's own masterkey file is untouched and no config appeared.
+        // And nothing moved: the fixture's own masterkey file is untouched, no config appeared
+        // and no new backup was written -- the fixture's pre-existing one is still the only one.
         assert!(!vault.join(VAULTCONFIG_FILENAME).exists());
-        assert!(!vault.join("masterkey.cryptomator.bkup").exists());
+        assert_eq!(
+            bkup_names_of(&vault),
+            bkups_before,
+            "no backup was written by any of the three refused calls"
+        );
+    }
+
+    /// A vault that `crypto migrate` already brought to format 8 but that kept a leftover `m/`
+    /// (because one node's long name could not be recovered, see the README's *skipped nodes*
+    /// section) must not be refused: `d/` already carries format 7/8 names, so `m/`'s presence
+    /// alone is not the format 5/6 tell any more.
+    #[test]
+    fn a_migrated_vault_that_kept_its_metadata_directory_is_restored() {
+        let (_tmp, vault) = fixture_copy("legacy_v6");
+        // Break the one shortened node's long name the same way `crypto migrate`'s own tests do,
+        // so the 6 → 7 step below skips it and -- per its documented, deliberate deviation from
+        // Java -- keeps `m/` instead of deleting it.
+        let metadata_file = vault
+            .join("m")
+            .join("3M")
+            .join("SA")
+            .join("3MSAEQBCWEIQAHCPY6SI2WTAUVSN3FCA.lng");
+        assert!(metadata_file.is_file(), "the fixture's one shortened name");
+        std::fs::remove_file(&metadata_file).unwrap();
+
+        let version = crate::migration::migrate(
+            &vault,
+            "test-password-123",
+            crate::migration::MigrationOptions::default(),
+            &mut |_event| {},
+        )
+        .expect("the migration runs to completion despite the one skip");
+        assert_eq!(version, crate::migration::VaultVersion::V8);
+        assert!(
+            vault.join("m").is_dir(),
+            "kept because it holds the only copy of the skipped node's name"
+        );
+        assert!(
+            has_format_seven_node(&vault.join(DATA_DIR_NAME)),
+            "every other node was renamed to its format 7/8 name"
+        );
+
+        // The vault's own key, from the still-migrated masterkey file -- unlike the refusal test
+        // above, this restore has to succeed *and* open the vault, so it needs the real recovery
+        // key, not a foreign one: `restore_all` detects the cipher combo from the vault's own
+        // content, which a foreign key cannot decrypt.
+        let access = MasterkeyFileAccess::new(Vec::new());
+        let encoder = WordEncoder::new();
+        let masterkey = access
+            .load(&vault.join(MASTERKEY_FILENAME), "test-password-123")
+            .expect("the migrated vault still opens with its own passphrase");
+        let key = crate::recovery::key::create_recovery_key(&encoder, masterkey.raw());
+
+        // Both key files are now gone -- state `ALL_MISSING` -- and `restore --all` still has to
+        // work: `m/` is not the format 5/6 tell here, `d/` already is format 7/8.
+        std::fs::remove_file(vault.join(MASTERKEY_FILENAME)).unwrap();
+        std::fs::remove_file(vault.join(VAULTCONFIG_FILENAME)).unwrap();
+
+        restore_all(
+            &encoder,
+            &access,
+            &vault,
+            key.as_str(),
+            "new-passphrase",
+            ConfigOptions::default(),
+            &mut DetRng::default(),
+        )
+        .expect("a migrated vault with a leftover m/ is not a legacy layout");
+        open_vault(&vault, &access, "new-passphrase").expect("the restored vault opens");
     }
 
     /// Formats 7 and 8 share the on-disk layout, so a format 7 vault has no `m/` and stamping a

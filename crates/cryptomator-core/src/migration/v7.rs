@@ -734,8 +734,9 @@ pub(crate) fn migrate_reporting(
     // could not migrate still carries its format 5/6 `<32 chars>.lng` name, and `m/` holds the only
     // copy of what that name inflates to. Deleting it would make those names unrecoverable — the
     // node would keep its data but lose its identity, in the one command that rewrites every name
-    // in the vault. A leftover `m/` costs nothing: formats 7 and 8 never look at it, and a later
-    // run of this step (after the user repaired whatever blocked the node) removes it.
+    // in the vault. A leftover `m/` costs nothing: formats 7 and 8 never look at it, and `crypto
+    // migrate` never revisits a vault it already brought to format 8 -- once the skipped nodes
+    // have been dealt with, removing `m/` is on the user, by hand.
     if skipped.is_empty() {
         match std::fs::remove_dir_all(vault_root.join(OLD_METADATA_DIR_NAME)) {
             Ok(()) => {}

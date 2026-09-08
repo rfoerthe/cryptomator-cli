@@ -243,7 +243,9 @@ fn report_skips(skipped: &[PathBuf]) {
         eprintln!("  {}", path.display());
     }
     eprintln!(
-        "The metadata directory `m/` was kept, because it holds the only copy of their long          names. Repair or remove these nodes and run `crypto migrate` again to finish the job."
+        "The metadata directory `m/` was kept, because it holds the only copy of their long \
+         names. Repair or remove these nodes, then remove `m/` by hand -- `crypto migrate` \
+         will not revisit this vault."
     );
 }
 

@@ -337,6 +337,14 @@ fn a_node_that_cannot_be_migrated_is_reported_and_keeps_the_metadata_directory()
     let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
     assert!(stderr.contains(&node), "{stderr}");
     assert!(stderr.contains("old names"), "{stderr}");
+    // The remediation line is wrapped across several string literals in the source; make sure
+    // that never leaves a run of two spaces in the rendered text (the path lines above it are
+    // deliberately indented by two spaces, so this checks only the remediation sentence itself).
+    let remediation = stderr
+        .lines()
+        .find(|line| line.contains("metadata directory"))
+        .unwrap_or_default();
+    assert!(!remediation.contains("  "), "{remediation}");
 
     // And now for real.
     let assertion = migrate(&fx, &["--json", "migrate", "legacy_v6", "--yes"], &pw)

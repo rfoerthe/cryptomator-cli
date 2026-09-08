@@ -362,7 +362,8 @@ fn copy_recursively(from: &Path, to: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} is neither a regular file nor a directory ({file_type:?}); refusing to copy it                  into /LOST+FOUND",
+                "{} is neither a regular file nor a directory ({file_type:?}); refusing to copy \
+                 it into /LOST+FOUND",
                 from.display()
             ),
         ));
@@ -804,6 +805,7 @@ mod tests {
             .expect_err("a symlink is not something to copy");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("link"), "{error}");
+        assert!(!error.to_string().contains("  "), "{error}");
         assert!(!dir.path().join("copy").exists(), "nothing was written");
 
         // The same inside a directory, where the walk has to notice it one level down.

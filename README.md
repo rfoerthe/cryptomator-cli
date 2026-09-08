@@ -640,8 +640,9 @@ same nodes before anything is written.
 
 **`m/` is then kept**, which is a deliberate deviation from the desktop app: it deletes the
 metadata directory unconditionally, and with it the only copy of those nodes' long names. A
-leftover `m/` costs nothing (formats 7 and 8 never look at it) and a later `crypto migrate` run
-removes it once the nodes are dealt with.
+leftover `m/` costs nothing (formats 7 and 8 never look at it), but `crypto migrate` never
+revisits a vault it already brought to format 8 -- once the skipped nodes are dealt with, remove
+`m/` by hand.
 
 While it works, the migration probes the storage by creating and deleting `<vault>/c` — Java's
 `FileSystemCapabilityChecker`, which removes that directory recursively whether or not the probe
