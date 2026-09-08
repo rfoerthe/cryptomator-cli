@@ -62,20 +62,33 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
         return Ok(exit::OK);
     }
 
-    note(
-        ctx,
-        format!(
-            "Vault {label} is at format {from}; migrating to {} via {}",
-            VaultVersion::LATEST,
-            step_names.join(", ")
-        ),
-    );
+    // Not when a confirmation is about to be asked: `confirm` below prints its own sentence
+    // covering the same format-and-steps information, and printing it twice (once here, once in
+    // the prompt) is just noise. `--yes` and `--dry-run` never reach `confirm`, so they keep this
+    // line as their only announcement.
+    if args.yes || args.dry_run {
+        note(
+            ctx,
+            format!(
+                "Vault {label} is at format {from}; migrating to {} via {}",
+                VaultVersion::LATEST,
+                step_names.join(", ")
+            ),
+        );
+    }
     // Lazy keychain, exactly as `health` and `fs` have it: a scripted `--password-stdin` run never
-    // pays for the provider probe.
+    // pays for the provider probe. `keychain_resolved` remembers whether this closure actually ran
+    // and found one, so the keychain-update step below (which needs the same information) can
+    // reuse it instead of probing a second time -- see there.
+    let mut keychain_resolved = false;
     let passphrase = read_passphrase_with_keychain(
         &args.password,
         "Password: ",
-        || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
+        || {
+            let source = keychain_source(ctx.keychain()?.as_ref(), &vault);
+            keychain_resolved = source.is_some();
+            Ok(source)
+        },
         &mut SystemIo,
     )?;
 
@@ -101,10 +114,10 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
     }
 
     if !args.yes && !confirm(&label, from, &step_names)? {
-        ctx.out.emit(
-            json!({ "vault": vault.id, "migrated": false, "aborted": true }),
-            || "aborted".to_string(),
-        )?;
+        ctx.out
+            .emit(aborted_json(&vault.id, &path, from, &step_names), || {
+                "aborted".to_string()
+            })?;
         return Ok(exit::OK);
     }
 
@@ -116,7 +129,7 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
     let mut renamed = 0u64;
     let mut reported = 0u64;
     let json_output = ctx.out.json;
-    let (reached, used) = with_legacy_passphrase(from, &passphrase, |passphrase| {
+    let outcome = with_legacy_passphrase(from, &passphrase, |passphrase| {
         renamed = 0;
         reported = 0;
         let mut progress = |event: MigrationEvent| {
@@ -142,13 +155,27 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
             },
             &mut progress,
         )?)
-    })?;
+    });
+    // This is the one command that cannot be undone by re-running it with different arguments --
+    // a chain that dies between two steps (a storage limit in 6 → 7, a permission lost mid-write)
+    // leaves the vault at whatever format it reached, and `--json` suppresses every step line
+    // above, so the error is the only thing that says the vault moved at all. The core resumes
+    // from whatever `detect_version` reports (`migration::migrate`'s doc comment), so re-reading
+    // it here and naming it in the error is also the correct instruction, not just reassurance.
+    let (reached, used) = outcome.map_err(|err| stopped_at(err, &path, &args.vault))?;
 
     // The passphrase of a format 5 vault becomes its NFC form in the 5 → 6 step, so a stored one
     // has to follow -- otherwise the next implicit-keychain unlock would fail with a password the
     // user never got wrong. `update_keychain_entry_or_warn` writes only when something is stored,
     // and a keychain that refuses is a warning: the vault is migrated either way.
+    //
+    // Gated on `keychain_resolved`, not just `*used != *passphrase`: `update_keychain_entry` calls
+    // `ctx.keychain()` too, and without this gate a `--password-stdin` run that hit the format 5
+    // NFD retry would pay for the provider probe here even though the read above never needed it
+    // -- the opposite of what this function's first comment promises. `keychain_resolved` is only
+    // ever `true` when that probe already ran (and is thus cached), so this adds no new cost.
     let keychain_updated = *used != *passphrase
+        && keychain_resolved
         && update_keychain_entry_or_warn(
             ctx,
             &vault,
@@ -185,6 +212,22 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
         },
     )?;
     Ok(exit::OK)
+}
+
+/// Adds "where it stopped, and how to go on" to an error out of `migration::migrate`.
+///
+/// Re-reads the format rather than trusting `from`: the whole point is to say where the vault
+/// *actually* ended up, and a chain that got through one or more steps before failing is already
+/// past `from`. When even that re-read fails -- the vault directory itself became unreadable, say
+/// -- `err` is returned as it came in; a second error about the first would only obscure it.
+fn stopped_at(err: anyhow::Error, path: &Path, reference: &str) -> anyhow::Error {
+    match migration::detect_version(path) {
+        Ok(now) => err.context(format!(
+            "migration stopped: the vault is now at format {now}; run `crypto migrate {reference}` \
+             again to continue where it stopped"
+        )),
+        Err(_) => err,
+    }
 }
 
 /// The `*.bkup` files directly in the vault directory. Unreadable directory: an empty set, because
@@ -315,11 +358,32 @@ fn note(ctx: &Ctx, text: String) {
     }
 }
 
+/// The JSON contract for `crypto migrate`: every object this command emits names the format
+/// numbers `from`/`to` (never the brief's `fromVersion`/`toVersion`), and a single planned rename
+/// is `{old, new}` (never `{from, to}`, which would collide with the format keys on the same
+/// object). This is the shape actually shipped and pinned by `tests/cli_migrate.rs` -- a
+/// deliberate, if undocumented, deviation from the brief, not a draft to rename later.
 fn renames_json(plan: &MigrationPlan) -> Vec<Value> {
     plan.renames
         .iter()
         .map(|rename| json!({ "old": rename.from, "new": rename.to }))
         .collect()
+}
+
+/// The object for the one outcome that stops at the `[y/N]` prompt: the same four keys every
+/// other outcome carries (`path`, `from`, `to`, `steps`), plus `migrated: false` and `aborted:
+/// true`. `to` is [`VaultVersion::LATEST`] -- what the migration would have reached, since nothing
+/// ran.
+fn aborted_json(vault_id: &str, path: &Path, from: VaultVersion, steps: &[&str]) -> Value {
+    json!({
+        "vault": vault_id,
+        "path": path,
+        "from": from.number(),
+        "to": VaultVersion::LATEST.number(),
+        "steps": steps,
+        "migrated": false,
+        "aborted": true,
+    })
 }
 
 fn render_dry_run(label: &str, plan: &MigrationPlan) -> String {
@@ -371,13 +435,13 @@ fn render_result(
     }
     // Formats 7 and earlier never wrote `dirid.c9r`, so a freshly migrated vault reports
     // `MissingDirIdBackup` for every content directory -- INFO findings, and the one repair a
-    // migration cannot do for itself.
-    if from <= VaultVersion::V7 {
-        lines.push(format!(
-            "hint: run `crypto health {reference} --fix --fix-severity INFO` to write the \
-             directory-id backups format 7 vaults lack"
-        ));
-    }
+    // migration cannot do for itself. Unconditional, not a live branch: `render_result` is only
+    // reached when `steps` was non-empty, and every chain starts at V5, V6 or V7 -- there is no
+    // migrated vault for which this hint would not apply.
+    lines.push(format!(
+        "hint: run `crypto health {reference} --fix --fix-severity INFO` to write the \
+         directory-id backups format 7 vaults lack"
+    ));
     lines.join("\n")
 }
 
@@ -419,6 +483,23 @@ mod tests {
             ["7->8"]
         );
         assert!(chain(VaultVersion::V8).is_empty());
+    }
+
+    #[test]
+    fn the_aborted_object_carries_the_same_keys_as_every_other_outcome() {
+        let value = aborted_json(
+            "v1",
+            Path::new("/vaults/v1"),
+            VaultVersion::V6,
+            &["6->7", "7->8"],
+        );
+        assert_eq!(value["vault"], "v1");
+        assert_eq!(value["path"], "/vaults/v1");
+        assert_eq!(value["from"], 6);
+        assert_eq!(value["to"], 8, "what the migration would have reached");
+        assert_eq!(value["steps"], serde_json::json!(["6->7", "7->8"]));
+        assert_eq!(value["migrated"], false);
+        assert_eq!(value["aborted"], true);
     }
 
     #[test]

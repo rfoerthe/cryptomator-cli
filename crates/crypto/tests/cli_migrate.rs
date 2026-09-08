@@ -3,8 +3,7 @@
 //!
 //! Every run passes the passphrase through `--password-stdin`, which outranks the
 //! `$CRYPTO_PASSWORD` that [`Sandbox::crypto`] sets -- the legacy fixtures have passphrases of
-//! their own. The one keychain test uses the *fake* keychain; nothing here ever touches the real
-//! one.
+//! their own. The keychain tests use the *fake* keychain; nothing here ever touches the real one.
 mod common;
 
 use common::Sandbox;
@@ -13,6 +12,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Tests that turn permission bits into an expectation are meaningless as root, which ignores
+/// them outright.
+fn is_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
+}
 
 /// The fixture's manifest: the passphrase(s) it was created with and the cleartext tree it holds.
 fn manifest(fixture: &str) -> Value {
@@ -312,7 +321,12 @@ fn without_yes_and_without_a_terminal_it_is_a_usage_error() {
         .code(2)
         .stderr(predicate::str::contains(
             "refusing to migrate without --yes",
-        ));
+        ))
+        // Whenever a confirmation would be asked (with `--yes` or `--dry-run` absent, as here),
+        // the announcement above the prompt is skipped: `confirm`'s own sentence -- unreachable
+        // on this no-terminal path, but the *decision* to skip is made before that check -- would
+        // otherwise say the same "format 7, migrating to 8 via 7->8" twice.
+        .stderr(predicate::str::contains("migrating to 8 via").not());
 
     assert_eq!(layout(&path), before, "nothing was migrated");
     assert!(!path.join("vault.cryptomator").exists());
@@ -439,4 +453,91 @@ fn a_stored_password_follows_the_nfc_normalisation() {
         .assert()
         .success()
         .stdout(predicate::str::contains("hello.txt"));
+}
+
+/// A `--password-stdin` run never reads the keychain for the passphrase (it does not need to),
+/// and the NFD retry of a format 5 vault must not turn that into a keychain *write* either: a
+/// keychain that is resolved but refuses every call (`crypto_keychain_locked`) would otherwise
+/// surface as a warning here, proving the update step probed it even though the read never did.
+#[test]
+fn a_password_stdin_run_does_not_probe_the_keychain_it_never_read_from() {
+    let fx = Sandbox::new();
+    fx.add_fixture("legacy_v5");
+    let nfd = manifest("legacy_v5")["passphrase"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let assert = fx
+        .crypto_keychain_locked(&[
+            "--json",
+            "migrate",
+            "legacy_v5",
+            "--yes",
+            "--password-stdin",
+        ])
+        .write_stdin(format!("{nfd}\n"))
+        .assert()
+        .success();
+    let output = assert.get_output();
+    let value = json(&output.stdout);
+    assert_eq!(value["to"], 8);
+    assert_eq!(
+        value["keychainUpdated"], false,
+        "nothing was stored to begin with, so there is nothing to update either way"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("could not be updated"),
+        "the locked keychain was never asked, so it never got the chance to refuse: {stderr}"
+    );
+}
+
+/// The one command that cannot be undone by re-running it: a chain that dies between two steps
+/// must say where the vault ended up, not just what went wrong -- and the next run has to be able
+/// to pick it up from there.
+#[test]
+fn a_run_that_fails_mid_chain_names_the_format_it_stopped_at_and_a_retry_finishes_it() {
+    if is_root() {
+        return; // root ignores the permission bits, so there is nothing to observe
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Sandbox::new();
+    let path = fx.add_fixture("legacy_v7");
+    let pw = passphrase("legacy_v7");
+
+    // `assert_all_capabilities` probes `<vault>/c`, creating it first if it is not there; with it
+    // already present that probe never needs to write into the vault root, so making the root
+    // read-only fails only the 7 -> 8 step's own write (a new `vault.cryptomator`) -- not the
+    // capability check ahead of it, and not the version detection before and after.
+    std::fs::create_dir(path.join("c")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let assert = migrate(&fx, &["migrate", "legacy_v7", "--yes"], &pw).assert();
+    // Restored before any predicate below can panic, so a failing assertion still leaves a
+    // directory `Sandbox`'s own `TempDir` can clean up afterwards.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = std::fs::remove_dir_all(path.join("c"));
+
+    assert
+        .code(1)
+        .stderr(predicate::str::contains("the vault is now at format 7"))
+        .stderr(predicate::str::contains("crypto migrate legacy_v7"));
+    assert!(
+        !path.join("vault.cryptomator").exists(),
+        "the 7 -> 8 step never got to write it"
+    );
+
+    // The core resumes from whatever format the vault is actually at, exactly as the error said.
+    let out = migrate(&fx, &["--json", "migrate", "legacy_v7", "--yes"], &pw)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value = json(&out);
+    assert_eq!(value["from"], 7);
+    assert_eq!(value["to"], 8);
+    assert_eq!(value["migrated"], true);
 }
