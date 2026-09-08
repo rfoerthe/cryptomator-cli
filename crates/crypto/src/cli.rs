@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "crypto",
-    version,
+    version = crate::VERSION,
     about = "Cryptomator vaults from the command line",
     arg_required_else_help = true
 )]

@@ -8,6 +8,27 @@ pub mod commands;
 pub mod exit;
 pub mod output;
 
+/// What `crypto --version` prints after the program name: `0.1.0 (a01958d, aarch64-apple-darwin)`.
+///
+/// `concat!` + `env!` rather than a `format!` at run time, so this is one static string in the
+/// binary and no allocation. The two build-time variables come from `build.rs`; `CRYPTO_BUILD_SHA`
+/// is `unknown` when there was no git repository to ask.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CRYPTO_BUILD_SHA"),
+    ", ",
+    env!("CRYPTO_BUILD_TARGET"),
+    ")"
+);
+
+/// The commit this binary was built from, abbreviated, or `unknown` outside a git repository.
+/// Separate from [`VERSION`] so a packaging step (`xtask`) can name a file after it.
+pub const GIT_SHA: &str = env!("CRYPTO_BUILD_SHA");
+
+/// The target triple this binary was built for, e.g. `aarch64-apple-darwin`.
+pub const TARGET: &str = env!("CRYPTO_BUILD_TARGET");
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
