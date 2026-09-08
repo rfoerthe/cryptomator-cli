@@ -158,7 +158,10 @@ impl RecoveryDirectory {
         let from = self.path.join(file_name);
         let to = self.vault_path.join(file_name);
         match crate::durability::rename_durably(&from, &to) {
-            Ok(()) => Ok(()),
+            Ok(outcome) => {
+                outcome.warn_unconfirmed(to.display());
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
                 copy_then_rename(&from, &to)
             }
@@ -208,9 +211,15 @@ fn copy_then_rename(from: &Path, to: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&staged);
         return Err(e.into());
     }
-    if let Err(e) = crate::durability::rename_durably(&staged, to) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(e.into());
+    match crate::durability::rename_durably(&staged, to) {
+        // The staged file has become `to`; there is nothing left to clean up and nothing to fail.
+        Ok(outcome) => {
+            outcome.warn_unconfirmed(to.display());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e.into());
+        }
     }
     std::fs::remove_file(from)?;
     Ok(())

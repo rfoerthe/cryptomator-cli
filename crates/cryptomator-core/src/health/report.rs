@@ -218,9 +218,15 @@ fn replace_with_temp(dir: &Path, file_name: &str, contents: &str, target: &Path)
     // `rename_durably`, not `std::fs::rename`: `write_temp_file` synced the text itself, and the
     // entry that names it needs the directory's own fsync. A report is evidence about a damaged
     // vault, and a crash minutes later must not be able to make it vanish again.
-    if let Err(e) = crate::durability::rename_durably(&temp, target) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(e);
+    match crate::durability::rename_durably(&temp, target) {
+        // The report is written and named; only its durability is unconfirmed.
+        Ok(outcome) => {
+            outcome.warn_unconfirmed(target.display());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
     }
     Ok(())
 }

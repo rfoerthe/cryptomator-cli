@@ -49,6 +49,7 @@ pub fn change_password(
     // The same durability argument as in `MasterkeyFileAccess::persist`: the new key file's
     // contents are synced above, and the directory entry that names them is synced here. A vault
     // whose passphrase was just changed is the last place to lose a masterkey file to a power cut.
-    crate::durability::rename_durably(&tmp_path, &masterkey_path)?;
+    crate::durability::rename_durably(&tmp_path, &masterkey_path)?
+        .warn_unconfirmed(masterkey_path.display());
     Ok(backup)
 }

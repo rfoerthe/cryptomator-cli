@@ -852,6 +852,10 @@
   directory `fsync` that the file system refuses as unsupported (`EINVAL`/`ENOTSUP`, seen on SMB
   and some FUSE file systems) is not an error; every other failure is. Nothing changed for writes
   *through* a mount: those still sync when the kernel or the WebDAV client asks (`fsync`, `close`).
+  Reported, but not as a failed write: a directory `fsync` that fails *after* the rename already
+  succeeded is a `warning: wrote <path> but could not confirm durability: <error>` on stderr and
+  the command still exits `0` — the file is under its final name and only that name's durability is
+  unconfirmed. A rename that itself fails is an error as before.
   See *Durability of writes* in the README.
 - Side effect of the same check: `MasterkeyFile::is_valid` is now `validate().is_ok()` and
   therefore stricter — a `scryptCostParam` that is not a power of two (`1000`, say) was accepted by

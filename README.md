@@ -168,7 +168,11 @@ forget and the one that matters here: a rename lives in the directory's own dirt
 it a power cut can leave a vault whose masterkey file has correct contents on the platter and no
 directory entry naming them — a vault with no key file at all. On the few file systems that answer
 `fsync` on a directory with "not supported" (some SMB shares, some FUSE file systems) the sync is
-skipped rather than turned into an error; every other failure is reported. Data written *through* a
+skipped rather than turned into an error; every other failure is reported. Reported, though, is
+not the same as failed: a directory sync that fails *after* the rename already succeeded is a
+`warning: wrote <path> but could not confirm durability: <error>` on stderr and the command still
+exits `0` — the file is on disk under its final name, and only the guarantee that the name survives
+a power cut is missing. A rename that itself fails is an error, and the write is undone. Data written *through* a
 mount is a different matter: there `crypto` syncs when the kernel or the WebDAV client asks it to
 (`fsync(2)`, `close(2)`), exactly like any other file system.
 

@@ -457,9 +457,15 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(FILE_MODE));
     // The rename is what publishes the state file; syncing the directory is what makes the
     // published name survive a power cut, now that its contents already do.
-    if let Err(e) = cryptomator_core::durability::rename_durably(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AppError::Io(e));
+    match cryptomator_core::durability::rename_durably(&tmp, path) {
+        // The state file is published; only its durability is unconfirmed, which is a warning.
+        Ok(outcome) => {
+            outcome.warn_unconfirmed(path.display());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(AppError::Io(e));
+        }
     }
     Ok(())
 }

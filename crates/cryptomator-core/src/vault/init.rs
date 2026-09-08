@@ -78,7 +78,9 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     // and has its own dirty page. Without this a crash right after `crypto vault create` can
     // leave a vault directory with no `vault.cryptomator` -- which is exactly the state
     // `open_vault` refuses to open.
-    crate::durability::sync_parent_dir(path)?;
+    // Best effort: the file is already there under its final name, so a failing directory sync
+    // costs the durability of that name, not the write.
+    crate::durability::sync_parent_dir_best_effort(path).warn_unconfirmed(path.display());
     Ok(())
 }
 

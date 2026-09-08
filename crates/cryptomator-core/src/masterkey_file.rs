@@ -216,7 +216,9 @@ impl MasterkeyFileAccess {
         // Not `std::fs::rename`: the contents are on the platter (`sync_all` above), but the
         // directory entry that names them is not until the directory itself is synced. A crash in
         // between would leave the vault with no masterkey file at all.
-        crate::durability::rename_durably(&tmp_path, path)?;
+        // A directory sync that fails *after* the rename leaves the key file where it belongs and
+        // only the promise that its name survives a power cut unkept: a warning, not a failure.
+        crate::durability::rename_durably(&tmp_path, path)?.warn_unconfirmed(path.display());
         Ok(())
     }
 

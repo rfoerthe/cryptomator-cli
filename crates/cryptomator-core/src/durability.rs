@@ -10,8 +10,53 @@
 //! from a test -- no file system reports it -- so what the tests below pin is the behaviour
 //! around it: the rename takes effect, the errors are the right ones, and a caller cannot
 //! silently get the non-durable version.
+use std::fmt;
 use std::io;
 use std::path::Path;
+
+/// Whether a write is known to have reached the platter, or only known to have reached its final
+/// name.
+///
+/// The two are not the same failure. A `rename` that fails leaves the old state intact and the
+/// caller has to say so; a `rename` that succeeded and whose directory `fsync` then failed leaves
+/// the file exactly where the caller wanted it -- only the guarantee that the *name* survives a
+/// power cut is missing. Failing the command in that second case would be a lie about what is on
+/// disk, so it is a warning ([`Durability::warn_unconfirmed`]) and the command succeeds.
+#[derive(Debug)]
+#[must_use = "an unconfirmed durability has to be warned about"]
+pub enum Durability {
+    /// The rename or creation took effect and the directory holding it was synced.
+    Confirmed,
+    /// The rename or creation took effect; the directory sync that would have made the name
+    /// durable failed with this error.
+    Unconfirmed(io::Error),
+}
+
+impl Durability {
+    /// The text a caller warns with, or `None` when the durability is confirmed.
+    ///
+    /// `target` is what the *user* asked for -- a path, a cleartext vault path -- not the
+    /// temporary name the bytes were written under.
+    #[must_use]
+    pub fn unconfirmed_warning(&self, target: impl fmt::Display) -> Option<String> {
+        match self {
+            Self::Confirmed => None,
+            Self::Unconfirmed(e) => Some(format!(
+                "wrote {target} but could not confirm durability: {e}"
+            )),
+        }
+    }
+
+    /// Logs [`Self::unconfirmed_warning`] through `log::warn!` (the CLI prints it as
+    /// `warning: ...` on stderr) and hands it back, so a caller can assert on it.
+    pub fn warn_unconfirmed(&self, target: impl fmt::Display) -> Option<String> {
+        let warning = self.unconfirmed_warning(target);
+        if let Some(message) = &warning {
+            log::warn!("{message}");
+        }
+        warning
+    }
+}
 
 /// `fsync` on a directory, so a rename or a creation inside it survives a power cut.
 ///
@@ -80,6 +125,28 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     sync_dir(&parent_dir(path)?)
 }
 
+/// [`sync_dir`], but for a directory whose entry is already published: the file is there under its
+/// final name and only the durability of that name is at stake.
+///
+/// Never fails -- every error becomes [`Durability::Unconfirmed`], because there is nothing left to
+/// undo and the caller must not report the write as failed.
+pub fn sync_dir_best_effort(dir: &Path) -> Durability {
+    match sync_dir(dir) {
+        Ok(()) => Durability::Confirmed,
+        Err(e) => Durability::Unconfirmed(e),
+    }
+}
+
+/// [`sync_parent_dir`] as a best-effort sync, for a file that was *created* under its final name:
+/// the bytes and the name are both already there, so a failing directory sync is a warning rather
+/// than a failed write.
+pub fn sync_parent_dir_best_effort(path: &Path) -> Durability {
+    match sync_parent_dir(path) {
+        Ok(()) => Durability::Confirmed,
+        Err(e) => Durability::Unconfirmed(e),
+    }
+}
+
 /// `rename(from, to)` plus an `fsync` on the directory holding `to`, so the new name is on the
 /// platter and not only in the page cache.
 ///
@@ -88,23 +155,45 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
 /// well, because the disappearance of the old name has to be durable too -- otherwise a crash can
 /// resurrect a file under both names.
 ///
+/// An `Err` therefore means the rename did *not* happen and the caller's write failed;
+/// [`Durability::Unconfirmed`] means it did happen and only the guarantee about the new name is
+/// missing.
+///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] when `to` has no parent directory that could be synced
-/// (`rename` has not run in that case), otherwise whatever the rename or the directory sync
-/// reports.
-pub fn rename_durably(from: &Path, to: &Path) -> io::Result<()> {
+/// (`rename` has not run in that case), otherwise whatever the rename reports.
+pub fn rename_durably(from: &Path, to: &Path) -> io::Result<Durability> {
+    rename_durably_with(from, to, sync_dir)
+}
+
+/// [`rename_durably`] with the directory sync passed in, so a test can make it fail without a
+/// file system that refuses `fsync`.
+fn rename_durably_with(
+    from: &Path,
+    to: &Path,
+    sync: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<Durability> {
     let to_parent = parent_dir(to)?;
     std::fs::rename(from, to)?;
-    sync_dir(&to_parent)?;
+    // Past this line the rename has taken effect and nothing may turn into an `Err` any more: the
+    // file is under its final name, and a caller that heard "failed" would delete or rewrite it.
+    if let Err(e) = sync(&to_parent) {
+        return Ok(Durability::Unconfirmed(e));
+    }
     // A cross-directory move: the old name is gone from another directory, and that removal has
     // its own dirty page. `from`'s parent is only unavailable for a bare relative name, which
-    // `parent_dir` maps to the working directory -- so a missing parent here cannot happen and an
-    // error would be a real one.
-    let from_parent = parent_dir(from)?;
+    // `parent_dir` maps to the working directory -- so a missing parent here cannot happen, and if
+    // it did the rename would still have happened.
+    let from_parent = match parent_dir(from) {
+        Ok(parent) => parent,
+        Err(e) => return Ok(Durability::Unconfirmed(e)),
+    };
     if from_parent != to_parent {
-        sync_dir(&from_parent)?;
+        if let Err(e) = sync(&from_parent) {
+            return Ok(Durability::Unconfirmed(e));
+        }
     }
-    Ok(())
+    Ok(Durability::Confirmed)
 }
 
 /// The directory that holds `path`.
@@ -129,6 +218,20 @@ fn parent_dir(path: &Path) -> io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[track_caller]
+    fn assert_confirmed(outcome: Durability) {
+        assert!(
+            matches!(outcome, Durability::Confirmed),
+            "expected a confirmed durability, got {outcome:?}"
+        );
+    }
+
+    /// A sync that fails the way a dying disk does: `EIO` is exactly the kind `sync_dir` passes on
+    /// rather than swallowing.
+    fn failing_sync(_dir: &Path) -> io::Result<()> {
+        Err(io::Error::other("simulated fsync failure"))
+    }
 
     #[test]
     fn syncing_a_real_directory_succeeds() {
@@ -182,7 +285,7 @@ mod tests {
         let from = dir.path().join("tmp");
         let to = dir.path().join("final");
         std::fs::write(&from, b"payload").unwrap();
-        rename_durably(&from, &to).unwrap();
+        assert_confirmed(rename_durably(&from, &to).unwrap());
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"payload");
     }
@@ -196,7 +299,7 @@ mod tests {
         let to = dir.path().join("final");
         std::fs::write(&to, b"old").unwrap();
         std::fs::write(&from, b"new").unwrap();
-        rename_durably(&from, &to).unwrap();
+        assert_confirmed(rename_durably(&from, &to).unwrap());
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
     }
 
@@ -211,7 +314,7 @@ mod tests {
         let from = source.join("f");
         let to = target.join("f");
         std::fs::write(&from, b"payload").unwrap();
-        rename_durably(&from, &to).unwrap();
+        assert_confirmed(rename_durably(&from, &to).unwrap());
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"payload");
     }
@@ -273,6 +376,114 @@ mod tests {
         assert_eq!(
             sync_parent_dir(Path::new("/")).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// The point of the whole type: the rename happened, only the directory sync did not, and the
+    /// caller must not be told the write failed.
+    #[test]
+    fn a_failing_directory_sync_after_a_successful_rename_is_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("tmp");
+        let to = dir.path().join("final");
+        std::fs::write(&from, b"payload").unwrap();
+        let outcome = rename_durably_with(&from, &to, failing_sync)
+            .expect("a failing directory sync is not a failed rename");
+        let Durability::Unconfirmed(e) = outcome else {
+            panic!("expected an unconfirmed durability");
+        };
+        assert!(e.to_string().contains("simulated fsync failure"), "{e}");
+        assert!(!from.exists(), "the rename still took effect");
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+    }
+
+    /// The second sync of a cross-directory move is the one that fails here -- the file is still
+    /// moved, so this too is a warning and not an error.
+    #[test]
+    fn a_failing_source_directory_sync_is_unconfirmed_as_well() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a");
+        let target = dir.path().join("b");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let from = source.join("f");
+        let to = target.join("f");
+        std::fs::write(&from, b"payload").unwrap();
+        let synced = std::cell::RefCell::new(Vec::new());
+        let outcome = rename_durably_with(&from, &to, |d: &Path| {
+            synced.borrow_mut().push(d.to_path_buf());
+            if d == source {
+                failing_sync(d)
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a failing directory sync is not a failed rename");
+        assert!(matches!(outcome, Durability::Unconfirmed(_)), "{outcome:?}");
+        assert_eq!(synced.into_inner(), vec![target.clone(), source.clone()]);
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+    }
+
+    /// The injected sync is the only difference to [`rename_durably`]: with a working one the
+    /// outcome is `Confirmed`, and both directories of a cross-directory move are synced once.
+    #[test]
+    fn a_working_sync_confirms_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("tmp");
+        let to = dir.path().join("final");
+        std::fs::write(&from, b"x").unwrap();
+        assert_confirmed(rename_durably_with(&from, &to, |_| Ok(())).unwrap());
+    }
+
+    /// A failed rename stays a failure: nothing was written, so there is nothing to warn about.
+    #[test]
+    fn a_rename_that_never_happened_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("tmp");
+        std::fs::write(&from, b"x").unwrap();
+        let err = rename_durably(&from, &dir.path().join("gone").join("target")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(from.exists(), "the source is still there after a failure");
+    }
+
+    /// The warning names the file the *user* asked for and says what is missing, and a confirmed
+    /// durability says nothing at all.
+    #[test]
+    fn only_an_unconfirmed_durability_produces_a_warning() {
+        assert_eq!(
+            Durability::Confirmed.unconfirmed_warning(Path::new("/vault/masterkey").display()),
+            None
+        );
+        let warning = Durability::Unconfirmed(io::Error::other("disk on fire"))
+            .warn_unconfirmed(Path::new("/vault/masterkey").display())
+            .expect("an unconfirmed durability warns");
+        assert!(warning.contains("/vault/masterkey"), "{warning}");
+        assert!(warning.contains("durability"), "{warning}");
+        assert!(warning.contains("disk on fire"), "{warning}");
+    }
+
+    /// A best-effort sync never fails, whatever the directory is -- the caller has already
+    /// published the file and cannot take it back.
+    #[test]
+    fn a_best_effort_sync_turns_every_error_into_an_unconfirmed_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        assert_confirmed(sync_dir_best_effort(dir.path()));
+        assert_confirmed(sync_parent_dir_best_effort(&file));
+        assert!(
+            matches!(
+                sync_dir_best_effort(&dir.path().join("nope")),
+                Durability::Unconfirmed(_)
+            ),
+            "a missing directory cannot fail a write that already happened"
+        );
+        assert!(
+            matches!(
+                sync_parent_dir_best_effort(Path::new("/")),
+                Durability::Unconfirmed(_)
+            ),
+            "a path without a parent cannot fail a write that already happened"
         );
     }
 
