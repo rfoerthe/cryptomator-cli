@@ -1,0 +1,306 @@
+# The release: a `v*` tag produces four binaries, five tarballs, two Debian packages, one
+# SHA256SUMS and a *draft* GitHub release. Nothing is published and nothing is written back into
+# the repository -- the last two steps belong to a human.
+#
+# The job graph
+#
+#   build (4 x)  ->  package (macos-15)  ->  release (ubuntu-22.04, contents: write)
+#             \  ->  deb     (2 x)      ->
+#
+#   build    compiles one target per runner and uploads only the bare binary.
+#   package  turns those four binaries into five tarballs (the four targets plus the macOS
+#            Universal one that `lipo` combines), one SHA256SUMS and the rendered Homebrew formula.
+#            It runs on macOS because `lipo` does.
+#   deb      runs cargo-deb natively on each Linux architecture: the package records the
+#            architecture of the machine that built it, so cross-building would mislabel it.
+#   release  collects everything and creates the draft.
+#
+# The artefact layout, which the paths below depend on
+#
+#   `upload-artifact@v4` roots an artefact at the least common ancestor of the paths it is given.
+#   `build` uploads the single file `target/<triple>/release/crypto`, so the artefact
+#   `crypto-<triple>` contains exactly `crypto` at its root -- *not* `target/<triple>/release/`.
+#   `download-artifact@v4` with `pattern:` then writes `artifacts/crypto-<triple>/crypto`, and with
+#   `name:` it writes the artefact's contents directly into `path`. The zip format carries no
+#   permissions, so every downloaded binary is `chmod +x`-ed before it is used.
+#
+#     crypto-<triple>   ->  crypto
+#     packages          ->  crypto-<version>-<triple>.tar.gz (x5), SHA256SUMS, crypto.rb
+#     deb-<triple>      ->  crypto_<version>-1_<arch>.deb
+#
+# What a human still does
+#
+#   1. Create and push the tag (`git tag -s v0.1.0 && git push origin v0.1.0`); CI never tags.
+#   2. Read the draft release, then publish it.
+#   3. Back-port the four sha256 values from the attached `crypto.rb` into
+#      `packaging/homebrew/crypto.rb`, which is committed with placeholders until a release exists.
+#
+# `xtask/tests/workflows.rs` parses this file and asserts the structural half of all of the above.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  # So a failed release can be re-run against an existing tag without pushing a new one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build (e.g. v0.1.0)
+        required: true
+
+# Nothing here needs write access except the job that creates the release. Everything else only
+# reads the checkout and passes artefacts along.
+permissions:
+  contents: read
+
+# Two runs for the same tag would race for the same draft. They are not cancelled, though: a
+# half-uploaded release is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # One binary per target, and nothing else: the packaging happens once, in `package`, so that all
+  # five tarballs and their checksums are produced by one version of `xtask` on one machine.
+  build:
+    strategy:
+      # A red macOS build must not cancel the Linux ones: knowing which targets are broken is the
+      # point of a release build.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            macos_deployment_target: "12.0"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            macos_deployment_target: "12.0"
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A `workflow_dispatch` re-run must build the tag it is given, not the default branch.
+          ref: ${{ inputs.tag || github.ref }}
+          # `git rev-parse --short HEAD` in build.rs needs real history, not a graft, or
+          # `crypto --version` ships the string "unknown".
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: build the release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p crypto
+        env:
+          # Empty on the Linux runners, where nothing reads it. On macOS it is the oldest system
+          # the binary is allowed to require, and it must match what `xtask dist` builds with.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+      # Only the binary travels. `package` and `deb` pack it without rebuilding, so what a user
+      # downloads is bit-for-bit what this job compiled.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crypto-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/crypto
+          if-no-files-found: error
+          retention-days: 7
+
+  # Every tarball, the Universal Mach-O, the single SHA256SUMS and the Homebrew formula. On macOS
+  # because `/usr/bin/lipo` is the only thing that can combine the two Apple binaries.
+  package:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: crypto-*
+          path: artifacts
+      # `xtask dist --bin` packs a binary it is handed instead of building one: the tarball gets
+      # README, LICENSE, CHANGELOG, 43 manpages and the five completion scripts around it, and its
+      # checksum goes into target/dist/SHA256SUMS.
+      - name: pack one tarball per target
+        run: |
+          set -euo pipefail
+          for t in aarch64-apple-darwin x86_64-apple-darwin \
+                   aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            chmod +x "artifacts/crypto-$t/crypto"
+            cargo xtask dist --target "$t" --no-build --bin "artifacts/crypto-$t/crypto"
+          done
+      # `xtask lipo` combines the two Apple binaries, refuses a result that is not actually fat,
+      # and then packs the same tarball layout `dist` produces.
+      - name: combine the macOS binaries and pack the Universal tarball
+        run: |
+          set -euo pipefail
+          cargo xtask lipo \
+            --arm64 artifacts/crypto-aarch64-apple-darwin/crypto \
+            --x86-64 artifacts/crypto-x86_64-apple-darwin/crypto
+      # The formula the release ships. Its four checksums are the ones of the tarballs built above,
+      # so the two can never disagree. It is attached to the release, not committed: writing back
+      # into the repository from a tag build is exactly the thing this workflow does not do.
+      - name: render the Homebrew formula
+        env:
+          # Through the environment rather than into the script text: a `workflow_dispatch` input
+          # is attacker-controlled in a fork, and `${{ }}` inside a `run:` is textual substitution.
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if [ ! -f "target/dist/crypto-$VERSION-aarch64-apple-darwin.tar.gz" ]; then
+            echo "tag $TAG does not match the version in Cargo.toml; the archives are:" >&2
+            ls target/dist >&2
+            exit 1
+          fi
+          sum() {
+            local hash
+            hash=$(awk -v n="crypto-$VERSION-$1.tar.gz" '$2 == n { print $1 }' target/dist/SHA256SUMS)
+            if [ -z "$hash" ]; then
+              echo "no checksum for $1 in SHA256SUMS" >&2
+              return 1
+            fi
+            echo "$hash"
+          }
+          MAC_ARM=$(sum aarch64-apple-darwin)
+          MAC_X86=$(sum x86_64-apple-darwin)
+          LNX_ARM=$(sum aarch64-unknown-linux-gnu)
+          LNX_X86=$(sum x86_64-unknown-linux-gnu)
+          cargo xtask formula --version "$VERSION" \
+            --sha256-arm64 "$MAC_ARM" \
+            --sha256-x86_64 "$MAC_X86" \
+            --sha256-linux-arm64 "$LNX_ARM" \
+            --sha256-linux-x86_64 "$LNX_X86" > target/dist/crypto.rb
+          {
+            echo '## Homebrew formula'
+            echo 'Back-port these checksums into packaging/homebrew/crypto.rb after publishing.'
+            echo '```ruby'
+            cat target/dist/crypto.rb
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            target/dist/*.tar.gz
+            target/dist/SHA256SUMS
+            target/dist/crypto.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  # Native runners rather than cross-compilation: `ubuntu-22.04-arm` exists, and cargo-deb stamps
+  # the package with the architecture of the machine it runs on.
+  deb:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-${{ matrix.target }}
+      - run: cargo install cargo-deb --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: crypto-${{ matrix.target }}
+          path: prebuilt
+      # `cargo deb --no-build` looks for the binary where cargo would have put it, so the artefact
+      # is moved there rather than passed as a flag.
+      - name: put the built binary where cargo-deb expects it
+        run: |
+          set -euo pipefail
+          mkdir -p "target/${{ matrix.target }}/release"
+          cp prebuilt/crypto "target/${{ matrix.target }}/release/crypto"
+          chmod +x "target/${{ matrix.target }}/release/crypto"
+      # Renders the manpages and completion scripts the package installs, then runs cargo-deb.
+      - run: cargo xtask deb --target ${{ matrix.target }} --no-build
+      # The package has to install and the binary has to run before anyone downloads it.
+      - name: install the package and run it
+        run: |
+          set -euo pipefail
+          DEB=$(ls target/dist/*.deb)
+          sudo apt-get update
+          sudo apt-get install -y "./$DEB"
+          crypto --version
+          crypto completions zsh | head -1
+          dpkg -L crypto | grep -E 'man1/crypto\.1|bash-completion'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: target/dist/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [package, deb]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      # For CHANGELOG.md, which is where the release notes come from.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: deb
+          # The two packages have different file names, so one flat directory is unambiguous.
+          merge-multiple: true
+      # `xtask dist` wrote a checksum for every tarball; the .deb files are built afterwards and
+      # have none yet. Appending keeps one SHA256SUMS for the whole release.
+      - name: checksum the Debian packages into SHA256SUMS
+        run: |
+          set -euo pipefail
+          (cd deb && sha256sum -- *.deb) >> packages/SHA256SUMS
+          cat packages/SHA256SUMS
+      # The top section of CHANGELOG.md, without its heading. `generate_release_notes` is off: a
+      # list of commit subjects is not release notes.
+      - name: take the release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          awk '/^## /{ n++; if (n > 1) exit; next } n == 1 { print }' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "See CHANGELOG.md." > notes.md
+          fi
+          cat notes.md
+      - uses: softprops/action-gh-release@v2
+        env:
+          # The job's own token, scoped by `permissions:` above to `contents: write`. No step in
+          # this workflow enables shell tracing, so it cannot reach a log.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body_path: notes.md
+          files: |
+            packages/*.tar.gz
+            packages/SHA256SUMS
+            packages/crypto.rb
+            deb/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          # A release is looked at by a human before it is announced.
+          draft: true
