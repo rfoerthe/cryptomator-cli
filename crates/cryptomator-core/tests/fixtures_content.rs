@@ -31,6 +31,12 @@ const FIXTURE_NAMES: [&str; 8] = [
 struct FixtureMeta {
     cipher_combo: String,
     passphrase: String,
+}
+
+/// Only the `kind` of a manifest, so this filter also parses the manifests of `legacy` fixtures,
+/// which carry neither `cipherCombo` nor `masterkeyHex`.
+#[derive(serde::Deserialize)]
+struct FixtureKind {
     /// `clean` (the default for manifests written before the field existed), `broken` or `legacy`.
     #[serde(default)]
     kind: Option<String>,
@@ -38,9 +44,9 @@ struct FixtureMeta {
 
 /// A fixture is clean unless its manifest marks it as damaged or as an older vault format.
 fn is_clean(vault: &Path) -> bool {
-    let meta: FixtureMeta =
+    let kind: FixtureKind =
         serde_json::from_slice(&std::fs::read(vault.join("fixture.json")).unwrap()).unwrap();
-    !matches!(meta.kind.as_deref(), Some("broken") | Some("legacy"))
+    !matches!(kind.kind.as_deref(), Some("broken") | Some("legacy"))
 }
 
 /// One cleartext node. `size`/`sha256` are set for files, `target` for symlinks, matching `expected.json`.

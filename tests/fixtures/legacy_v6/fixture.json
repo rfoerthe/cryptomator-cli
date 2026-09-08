@@ -1,0 +1,82 @@
+{
+  "name": "legacy_v6",
+  "kind": "legacy",
+  "format": 6,
+  "vaultVersion": 6,
+  "shorteningThreshold": 129,
+  "passphrase": "test-password-123",
+  "passphraseNfc": "test-password-123",
+  "expected": [
+    {
+      "path": "/Grüße.txt",
+      "type": "file",
+      "size": 11,
+      "sha256": "68ee6867bb5b572761bc1e9aa8261803762821ef100c3f976d9d04a69a584837"
+    },
+    {
+      "path": "/blob.bin",
+      "type": "file",
+      "size": 40960,
+      "sha256": "547f4dfa20aa43a4e06d42d5de8b9704c10b2f91b16af04b683dd6b42aaaf4b4"
+    },
+    {
+      "path": "/docs",
+      "type": "dir"
+    },
+    {
+      "path": "/docs/deep",
+      "type": "dir"
+    },
+    {
+      "path": "/docs/deep/inner.txt",
+      "type": "file",
+      "size": 7,
+      "sha256": "370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3"
+    },
+    {
+      "path": "/docs/notes.md",
+      "type": "file",
+      "size": 16,
+      "sha256": "8f25e817e599d50d82e5b90abb4101f4a0f8e09ba8a31b7da648b5cc4b87ba3d"
+    },
+    {
+      "path": "/empty.bin",
+      "type": "file",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/hello.txt",
+      "type": "file",
+      "size": 15,
+      "sha256": "6bcfe634085d3f9c4403a4d5211fb94c5066e441e640ef534550972490c3a4b8"
+    },
+    {
+      "path": "/link.txt",
+      "type": "symlink",
+      "target": "hello.txt"
+    },
+    {
+      "path": "/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll.txt",
+      "type": "file",
+      "size": 10,
+      "sha256": "1272a49868c41260330ce643f91dffd1114abc24bf149dfb4ebfb8833bbe5670"
+    },
+    {
+      "path": "/one-byte.bin",
+      "type": "file",
+      "size": 1,
+      "sha256": "684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1"
+    },
+    {
+      "path": "/日本語",
+      "type": "dir"
+    },
+    {
+      "path": "/日本語/ファイル.txt",
+      "type": "file",
+      "size": 9,
+      "sha256": "e4a888a2a729d5264b6e2d7abbdc3d6023c7bcdd2ae1a8127ad5d4dfb950805d"
+    }
+  ]
+}
