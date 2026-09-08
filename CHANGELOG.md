@@ -862,3 +862,20 @@
   the old `> 1` test and failed later inside the derivation with a usage error (exit `2`); it is
   now refused as a broken file (exit `1`).
 
+#### Parity with the desktop app
+
+- **The anonymous WebDAV internet password is written before the AppleScript mount** — the last
+  item M5 and M6 deferred to M8. Without a keychain entry for the loopback server, macOS asks the
+  user to confirm the unencrypted connection on every `crypto unlock --mounter webdav-applescript`,
+  which is also why that mount has a two-minute timeout. `crypto` now runs Cryptomator's own
+  `security add-internet-password -a anonymous -s <host> -P <port> -r http -D "Cryptomator WebDAV
+  Access" -T …/NetAuthSysAgent` (10-second timeout) first, argument for argument, with one
+  deviation: the server name is the address the server is bound to (`127.0.0.1`, or whatever
+  `webdavBind` says) rather than Java's hard-coded `localhost`, because that is the host
+  `NetAuthSysAgent` looks up — an IPv6 address goes in bare (`::1`), since `-s` takes a name, not a
+  URI authority. There is no `-w` and no `-U`: the item's password stays empty, argv carries
+  nothing secret, and an item the desktop app or the user created is never overwritten. The call is
+  best effort exactly as in Java — a failure (including a `security` that is missing or times out)
+  is a `warn` line and the mount goes ahead, with macOS asking as before. It happens only for
+  `--mounter webdav-applescript`; `--mounter webdav` hands out a URL and touches no keychain, and
+  `webdav-gio` needs no such item. See *WebDAV* in the README.

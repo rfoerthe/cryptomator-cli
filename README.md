@@ -417,9 +417,18 @@ same one the desktop app uses (the AppleScript mounter appends the volume name, 
 
 - **macOS Finder:** *Go → Connect to Server* (Cmd-K), paste the `http://…` URL, *Connect*, and the
   volume appears under `/Volumes`. macOS asks whether you really want to connect to an unencrypted
-  server — there is no keychain entry to suppress that. The desktop app writes an anonymous
-  *internet* password for the WebDAV server first; `crypto` does not, and that item has nothing to
-  do with the vault passwords below. Without Finder: `mount_webdav -S -i "<url>" <empty directory>`.
+  server, because a URL you mount by hand has no keychain entry to suppress that. Without Finder:
+  `mount_webdav -S -i "<url>" <empty directory>`.
+
+  `crypto unlock --mounter webdav-applescript` does not ask: like the desktop app, it runs
+  `security add-internet-password -a anonymous -s <host> -P <port> -r http -D "Cryptomator WebDAV
+  Access" -T …/NetAuthSysAgent` before the mount, which puts an anonymous *internet* password for
+  that loopback server in your login keychain and lets `NetAuthSysAgent` — the helper behind
+  Finder's WebDAV mounts — read it. The item carries no password (nothing secret is passed on the
+  command line) and has nothing to do with the vault passwords below; it is written for
+  `webdav-applescript` only, never by `--mounter webdav` or `webdav-gio`. Writing it is best
+  effort: if `security` fails, the mount goes ahead and macOS asks after all. Keychain Access lists
+  it under the server's address, kind *Cryptomator WebDAV Access*, and it can be deleted there.
 - **GNOME:** `gio mount "dav://127.0.0.1:<port>/<vault id>"` — note the `dav:` scheme, not `http:` —
   or Nautilus's *Other Locations → Connect to Server* with the same `dav://` address.
 - **Anything else:** `curl -X PROPFIND -H 'Depth: 1' <url>/`, `rclone`, a WebDAV-capable editor.
