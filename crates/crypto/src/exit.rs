@@ -32,11 +32,15 @@ fn core_code(err: &CoreError) -> u8 {
         CoreError::NotAVaultDirectory { .. } => NOT_A_VAULT,
         CoreError::NeedsMigration(_)
         | CoreError::ContentRootMissing(_)
-        | CoreError::VaultVersionMismatch { .. } => WRONG_STATE,
+        | CoreError::VaultVersionMismatch { .. }
+        // The vault is the way it is and cannot be migrated: a state error, not a usage error.
+        | CoreError::MigrationBlocked(_)
+        | CoreError::UnsupportedVaultVersion { .. } => WRONG_STATE,
         CoreError::InvalidArgument(_) => USAGE,
         CoreError::InvalidMasterkeyFile(_)
         | CoreError::VaultConfigLoad(_)
         | CoreError::UnsupportedKeyId(_)
+        | CoreError::MissingCapability { .. }
         | CoreError::Io(_) => GENERAL,
     }
 }

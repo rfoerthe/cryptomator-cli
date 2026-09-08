@@ -32,6 +32,21 @@ pub enum CoreError {
     ContentRootMissing(std::path::PathBuf),
     #[error("vault needs migration to format 8: {0}")]
     NeedsMigration(std::path::PathBuf),
+    /// `FileSystemCapabilityChecker.MissingCapabilityException`. `capability` is `"read access"`
+    /// or `"write access"`.
+    #[error("the storage does not support {capability}: {path}")]
+    MissingCapability {
+        path: std::path::PathBuf,
+        capability: &'static str,
+    },
+    /// The vault is, as it is, not migratable — e.g. a `vault.cryptomator` already sits next to a
+    /// format 7 masterkey file, or a step of the chain is not implemented yet.
+    #[error("migration cannot continue: {0}")]
+    MigrationBlocked(String),
+    /// A vault format outside 5..=8: either older than any migrator this tool has
+    /// (`NoApplicableMigratorException`) or newer than it knows.
+    #[error("vault format {version} cannot be migrated by this version of the tool")]
+    UnsupportedVaultVersion { version: u32 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
