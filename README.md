@@ -4,8 +4,9 @@
 for macOS and Linux. It shares the desktop app's `settings.json` and keychain entries.
 
 Status: early development. Vault format 8 read and write, mount-less access, FUSE mounting with a
-per-vault daemon, a loopback WebDAV server and the keychain work; `crypto health`, restore and
-migration do not exist yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the
+per-vault daemon, a loopback WebDAV server, the keychain, the health checks, the migration of older
+vault formats and the rebuilding of lost key files all work; packaging, manpages and shell
+completions do not exist yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the
 design and `docs/daemon-protocol.md` for the daemon's wire protocol.
 
 ## Build
@@ -40,6 +41,9 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
+| `recovery-key restore` | Rebuilds a lost `masterkey.cryptomator` and/or `vault.cryptomator` | `crypto recovery-key restore Secret --all --recovery-key-stdin` |
+| `health` | Checks a vault for structural damage, optionally repairs it | `crypto health Secret --fix` |
+| `migrate` | Brings a vault of format 5, 6 or 7 up to format 8 | `crypto migrate Old --yes` |
 | `unlock` | Mounts a vault in a background daemon (FUSE, or WebDAV with `--port <PORT>`) | `crypto unlock Secret --mounter fuse-t` |
 | `lock` | Unmounts a vault and stops its daemon | `crypto lock Secret --force` |
 | `status` | Lists the registered vaults with their runtime state and mount point | `crypto status --json` |
@@ -75,6 +79,49 @@ The key is read from standard input (it never appears in the process list or the
 It prints `valid` and exits `0`, or prints `invalid` and exits `4`. Error messages never quote the
 input.
 
+### Restoring the masterkey or the vault config
+
+When `masterkey.cryptomator` or `vault.cryptomator` is gone — and the `.bkup` files next to them are
+gone too, because otherwise `crypto` restores from those by itself — `crypto recovery-key restore`
+rebuilds them. Which secret it needs depends on which file is missing:
+
+| Mode | What it needs | What it writes |
+|---|---|---|
+| `--config` | the vault password (the masterkey file is still there) | `vault.cryptomator` |
+| `--masterkey` | the recovery key and a new password | `masterkey.cryptomator` |
+| `--all` | the recovery key and a new password | both files |
+
+    crypto recovery-key restore Secret --config
+    printf '%s' "$RECOVERY_KEY" | crypto recovery-key restore Secret --all --recovery-key-stdin \
+        --new-password-file ./new.txt
+
+The recovery key comes from `--recovery-key-stdin` or `--recovery-key-file`, the new password from
+`--new-password-stdin`/`--new-password-file`/`--new-password-env`, exactly as for
+`recovery-key reset-password`. `--masterkey` writes no config, so it refuses `--cipher-combo` and
+`--shortening-threshold` (exit `2`) rather than ignoring them.
+
+For a new `vault.cryptomator` the **cipher combo is detected** by decrypting the header of the first
+encrypted file in the vault, trying `SIV_CTRMAC` and then `SIV_GCM`. `--cipher-combo
+SIV_GCM|SIV_CTRMAC` names it by hand, which is the only way for a vault that holds no encrypted file
+yet; a combo the vault contradicts is refused (exit `2`), and so is a vault whose combo can neither
+be detected nor given. `--shortening-threshold` (36–220, default 220) goes into the new config —
+use the value the vault was created with, or long file names will be laid out differently from the
+ones already in it.
+
+A vault that lost **both** key files can no longer be registered (`crypto vault add` exits `12`), so
+`restore` also accepts a plain directory path — any directory holding a `d/` — and works on it
+without touching `settings.json`. It prints a hint to register the vault afterwards, and `--json`
+then reports `"vault": null` and `"registered": false`:
+
+    crypto recovery-key restore ~/Vaults/Secret --all --recovery-key-stdin < key.txt
+    crypto vault add ~/Vaults/Secret --name Secret
+
+Both files are written into a temporary directory first, validated there (the masterkey is loaded
+back, the config's signature checked, and `--all` opens the whole pair as a vault) and only then
+moved into place, so a restore that fails leaves the vault exactly as it was. An existing file is
+backed up as `<name>.<checksum>.bkup` before it is replaced; `--json` lists the backups it made
+under `backups`, alongside `restored`, `cipherCombo`, `shorteningThreshold` and `keychainUpdated`.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -84,15 +131,14 @@ input.
 | `2` | usage: an unknown flag or mounter, no password source, a value the setting does not take |
 | `3` | the vault reference names no registered vault, or more than one |
 | `4` | wrong password, invalid recovery key, a new password below the minimum length |
-| `5` | wrong vault state: already unlocked, not unlocked, needs migration, read-only, or an `fs`/`name`/`password change`/`recovery-key show`/`recovery-key reset-password` command on a vault that is not `LOCKED` |
+| `5` | wrong vault state: already unlocked, not unlocked, needs migration (run `crypto migrate`), read-only, or an `fs`/`name`/`password change`/`recovery-key show`/`recovery-key reset-password` command on a vault that is not `LOCKED` |
 | `6` | the mount failed — a mount point that cannot be used, a mounter that refused, a conflicting mount service, a WebDAV port that is already in use, or a daemon that stopped answering while it mounted |
 | `7` | the unmount failed; a volume still in use needs `crypto lock … --force` |
 | `8` | the keychain could not serve the request: no usable provider, `--no-keychain` or `useKeychain false` on a keychain command, a locked keyring, a call that timed out after 30 s, or `--password-keychain` for a vault with nothing stored |
 | `9` | a Hub vault, which this build cannot open |
 | `10` | the vault's daemon cannot be reached |
+| `11` | `crypto health` found at least one finding of the severity given by `--fail-on` (default `CRITICAL`) |
 | `12` | the path is not a vault directory |
-
-`11` (health findings) is reserved for M7 and is never returned today.
 
 ## Mounting
 
@@ -454,6 +500,116 @@ above.
 - **Symlinks** are listed and read, never followed for `ls`/`tree`. Relative targets resolve against
   the link's parent directory (POSIX semantics; cryptofs resolves them against the vault root).
 
+## Health checks
+
+`crypto health <VAULT>` reads the ciphertext of a locked vault and reports everything that does not
+fit the vault format. These are the checks the desktop app runs in its "Vault Health" window, with
+the same names and the same wording, so the two reports can be compared line by line.
+
+| Check | `--check` name | What it looks at |
+|---|---|---|
+| Directory Check | `dirid` | every `dir.c9r`: whether its target content directory exists, whether a directory id is used twice, whether every content directory is reachable, and whether it has its `dirid.c9r` backup |
+| Resource Type Check | `type` | whether each `.c9r`/`.c9s` directory says what it is (`dir.c9r`, `symlink.c9r`, `contents.c9r`) |
+| Shortened Names Check | `shortened` | whether each `.c9s` directory has a `name.c9s` whose content hashes back to the directory's own name |
+
+Findings have four severities: `GOOD` (nothing to say), `INFO` (worth knowing, no impact), `WARN`
+(the structure is damaged, no data lost yet) and `CRITICAL` (data was lost — restore from a backup
+if you can):
+
+| Severity | Findings |
+|---|---|
+| `GOOD` | `HealthyDir`, `KnownType`, `ValidShortenedFile` |
+| `INFO` | `MissingDirIdBackup`\*, `LooseDirFile`\* |
+| `WARN` | `MissingContentDir`\*, `OrphanContentDir`\*, `TrailingBytesInNameFile`\*, `LongShortNamesMismatch`\* |
+| `CRITICAL` | `DirIdCollision`, `EmptyDirFile`, `ObeseDirFile`, `UnknownType`\*, `AmbiguousType`, `MissingLongName`, `ObeseNameFile`, `NotDecodableLongName` |
+
+\* has a fix.
+
+    crypto health Secret                       # report everything, exit 11 if anything is CRITICAL
+    crypto health Secret --check dirid,type    # only two of the three checks
+    crypto health Secret --fail-on WARN        # exit 11 for warnings too
+    crypto health Secret --fix                 # repair what can be repaired, then check again
+    crypto health Secret --no-report           # do not write the log file
+
+The vault must be `LOCKED` (exit `5` otherwise), and a vault of an older format is sent to
+`crypto migrate` rather than checked.
+
+### `--fix`
+
+`--fix` applies the repair of every finding that has one and is at least as severe as
+`--fix-severity` (default `WARN`; `INFO` and `CRITICAL` are the other two values — `INFO` is
+accepted here, unlike for `--fail-on`, because the two `INFO` findings are the ones a freshly
+migrated vault has). Then it runs the checks again, because a repair can uncover the next finding:
+adopting an orphan creates a directory that in turn lacks its `dirid.c9r` backup. That loop runs to
+a fixpoint, at most **three rounds**, and each finding is attempted once per run. The exit code
+comes from the final run.
+
+A fix that fails does not stop the run: it is printed as a `FAILED` line, marked `"fixed": false`
+in the JSON, and the loop carries on. Plenty of findings have no fix at all — an empty `dir.c9r`, a
+`name.c9s` that is simply gone, two directories claiming the same directory id: nothing in the vault
+still holds what it would take to reconstruct them. **`--fix` is not a way back to a healthy
+vault**, it is a way to stop losing more.
+
+Orphaned content directories are not deleted. Their contents are adopted into a `/LOST+FOUND`
+directory inside the vault, under one subdirectory per orphan named after the orphan's hash, with
+the original file names where those could still be decrypted and `file1_<run>`,
+`directory2_<run>`, `symlink3_<run>` … where they could not.
+
+### The report
+
+Unless `--no-report` is given, a text report is written into the current directory as
+`healthReport_<vault>_<YYYYMMDD-HHMMSS>.log` — the desktop app's file name, with a **UTC** timestamp
+— in the format of Java's `ReportWriter`, banner and `Check <name>` sections included, so a report
+from either program reads the same. That automatic file never replaces an existing one (a second run
+in the same second becomes `…-1.log`); `--report FILE` writes exactly where it is told and does
+replace. The report lists every finding including the `GOOD` ones, and it contains ciphertext paths
+only — never a cleartext file name, never the password.
+
+`--json` prints one object: `vault`, `path`, `checks`, `failOn`, `report` (the absolute path, or
+`null`), `summary` (`{critical, warn, info, good}`) and `findings`, each with `check`, `kind`,
+`severity`, `message`, `paths`, `fixable` and `fixed`. With `--fix` it gains `fixSeverity`, `rounds`
+and `fixes` (one `{kind, paths, describe, outcome}` per attempt); `findings` and `summary` then
+describe the state *after* the repairs.
+
+## Migrating older vaults
+
+Vaults created before Cryptomator 1.6 use an older on-disk format. `crypto` reads format 8 only and
+reports such a vault as `NEEDS_MIGRATION`; `crypto migrate` brings it forward, one format at a time,
+until it is a format 8 vault:
+
+| Step | What changes |
+|---|---|
+| 5 → 6 | the passphrase is re-encoded as Unicode NFC and the masterkey file is rewritten |
+| 6 → 7 | every name in the vault is rewritten from BASE32 to base64url, directories and symlinks become `.c9r` directories, long names move from `m/…lng` into `name.c9s`, and `m/` is deleted |
+| 7 → 8 | `vault.cryptomator` is written (format 8, `SIV_CTRMAC`, shortening threshold 220) and the masterkey file loses its version |
+
+    crypto migrate Old --dry-run     # list the steps and the renames, change nothing
+    crypto migrate Old               # ask for confirmation, then migrate
+    crypto migrate Old --yes         # no question (required when there is no terminal)
+
+The migration happens in place. Before a step rewrites the masterkey file it copies it next to
+itself as `masterkey.cryptomator.<checksum>.bkup`, exactly like the desktop app — but the 6 → 7 step
+renames every file in the vault and there is no undo for that, so **make a backup of the whole vault
+first**. Nothing is written before the password has been checked. A vault that is already at format
+8 is not an error: `crypto migrate` says so and exits `0`, as does a run answered with anything but
+`y` at the confirmation. A vault older than format 5 is refused (exit `5`); open it once with
+Cryptomator 1.4 or newer first.
+
+A format 5 vault predates the rule that a passphrase is normalised to NFC before it reaches scrypt —
+normalising it is exactly what the 5 → 6 step does. `crypto` therefore retries a rejected format 5
+passphrase in its decomposed (NFD) form, and after the migration the vault opens with the composed
+one. If the password is stored in the keychain, that entry is updated to the normalised form, so
+unlocking keeps working; a keychain that refuses is a warning, not a failed migration.
+
+The steps are separately durable: a run that dies between two of them says which format the vault
+reached, and running `crypto migrate` again continues from there. A migrated format 7 vault has no
+directory-id backups (that format had none), which `crypto health` reports as `INFO
+MissingDirIdBackup` — `crypto health <VAULT> --fix --fix-severity INFO` writes them, and the command
+says so when it is done.
+
+`--json` prints `{vault, path, from, to, steps, migrated, renamed, backups, keychainUpdated}`, or
+`{…, renames: [{old, new}], dryRun: true}` for `--dry-run`.
+
 ## Password sources
 
 A password is taken from the first source that is present, so a password never has to appear on the
@@ -474,8 +630,8 @@ command line:
 `$CRYPTO_PASSWORD` deliberately outranks the implicit keychain step: it is a source a script sets on
 purpose, and it can never make the operating system open a dialog. `--no-keychain` removes step 5
 from the list for one run and turns step 0 into exit `8` (there is no keychain to read), whatever
-`settings.json` says — and the flags are mutually
-exclusive, so `--password-keychain` together with any other `--password-*` flag is a usage error.
+`settings.json` says — and the flags are mutually exclusive, so `--password-keychain` together with
+any other `--password-*` flag is a usage error.
 
 Without a usable source the command fails with a usage error instead of hanging. Passwords are NFC
 normalised like the desktop app and never appear in error messages or logs.
@@ -651,21 +807,46 @@ never silently replaces it.
 
 ## Test fixtures
 
-`tests/fixtures/` holds eight reference vaults created with the real Java implementation
-(cryptofs 2.10.0 / cryptolib 2.2.2). The Rust tests read them without Java. To regenerate them you
-need a JDK 21+ and Maven:
+`tests/fixtures/` holds twelve reference vaults created with the real Java implementation. The Rust
+tests read them without Java. Eight of them are ordinary format 8 vaults written by cryptofs 2.10.0
+/ cryptolib 2.2.2; the other four exist for the health checks and the migration:
 
-    mvn -q -f tools/fixture-gen/pom.xml compile exec:exec
+- **`broken_health`** — a healthy `SIV_GCM` vault damaged on the ciphertext level in nine ways
+  (orphaned content directory, missing `dirid.c9r`, missing content directory, a loose `dir.c9r`, a
+  repeated directory id, a node of unknown type, a mismatched, a truncated and a missing
+  `name.c9s`). `expected-findings.json` next to its manifest lists what the *real* cryptofs health
+  checks report for it, and the Rust tests compare against that file rather than against
+  themselves.
+- **`legacy_v7`, `legacy_v6`, `legacy_v5`** — pre-format-8 vaults written by the cryptofs release
+  that actually produced each format (1.9.15, 1.8.9 and 1.3.2), with `.lng` long names in 6 and 5
+  and, in `legacy_v5`, an NFD umlaut passphrase that only the 5 → 6 migration step normalises.
+
+To regenerate them you need a JDK 21+ and Maven:
+
+    mvn -q -f tools/fixture-gen/pom.xml compile exec:exec                       # the eight format 8 vaults
+    mvn -q -f tools/fixture-gen/pom.xml compile exec:exec \
+        -Dfixture.cmd=broken -Dfixture.arg1=$(pwd)/tests/fixtures               # broken_health
+    mvn -q -f tools/fixture-gen/legacy-v7/pom.xml compile exec:exec             # legacy_v7
+    mvn -q -f tools/fixture-gen/legacy-v6/pom.xml compile exec:exec             # legacy_v6
+    mvn -q -f tools/fixture-gen/legacy-v5/pom.xml compile exec:exec             # legacy_v5
+
+The three legacy generators are standalone Maven modules, not part of the reactor — their class
+paths are mutually incompatible — and the first run of each needs network, because those cryptofs
+releases are on Maven Central but not in `~/.m2`. Reading the committed fixtures needs none of that.
 
 The output directory defaults to `tests/fixtures` and can be overridden with
-`-Dfixture.arg1=<path>`. The same harness opens a vault written by `crypto` and prints its cleartext
-tree, which is how the interop test checks that the Java implementation accepts our vaults:
+`-Dfixture.arg1=<path>` (absolute — `exec:exec` resolves relative paths against the module
+directory). The same harness opens a vault written by `crypto` and prints its cleartext tree, which
+is how the interop test checks that the Java implementation accepts our vaults — including the
+vaults `crypto migrate` lifted out of formats 7, 6 and 5, and one whose key files
+`crypto recovery-key restore` rebuilt:
 
     mvn -q -f tools/fixture-gen/pom.xml compile exec:exec -Dfixture.cmd=verify -Dfixture.arg1=<vault> -Dfixture.arg2=<passphrase>
     cargo test -p crypto --test java_interop -- --ignored
 
 Regeneration changes nonces and salts but keeps each vault's masterkey and the passphrase
-`test-password-123`; see `tools/fixture-gen/README.md`.
+`test-password-123` (`legacy_v5` is the exception: it needs a non-ASCII one). Commit a regenerated
+vault together with its manifest; see `tools/fixture-gen/README.md`.
 
 ## License
 

@@ -22,8 +22,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # This covers the M7 command tests too -- `cli_health.rs`, `cli_migrate.rs` and
+      # `cli_recovery.rs` need neither Java nor a mount, only the committed fixtures, so they run
+      # here rather than in a job of their own.
       - run: cargo test --workspace --locked
 
+  # The Java side of the interop: cryptofs 2.10.0 opens what `crypto` wrote. Since M7 that also
+  # covers the migrated legacy vaults (`java_reads_vaults_migrated_from_legacy_formats`, formats
+  # 7/6/5 -> 8) and a vault whose key files `recovery-key restore` rebuilt.
   interop-java:
     runs-on: ubuntu-22.04
     steps:
@@ -35,6 +41,13 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
+      # The tests shell out to `mvn ... exec:exec` per vault. Compiling the harness once up front
+      # downloads cryptofs 2.10.0 into the (cached) `~/.m2` and turns a network failure into a
+      # named step instead of a test that times out. `-B` keeps the download progress bars out of
+      # the log. The *legacy* cryptofs releases are not needed: the fixtures are committed, and
+      # only regenerating them (tools/fixture-gen/legacy-v*) reaches for 1.9.15/1.8.9/1.3.2.
+      - name: prime the fixture-gen harness (downloads cryptofs 2.10.0)
+        run: mvn -q -B -f tools/fixture-gen/pom.xml compile
       - run: cargo test -p crypto --test java_interop --locked -- --ignored
 
   # The end-to-end tests that mount a real file system. They are `#[ignore]`d twice over: `cargo

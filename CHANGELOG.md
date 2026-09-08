@@ -629,3 +629,160 @@
 - Still open from earlier milestones: macFUSE is unverified (M4), `LinuxGioMounter` has never run
   on a real GNOME desktop (M5), and coexistence with a running desktop app is still a manual step
   nobody has taken.
+
+### M7 – Health checks, restore and migration
+
+- **`cryptomator_core::health`**: the Rust twin of cryptofs' `health` package — the `HealthCheck`
+  trait, `DiagnosticResult { check, kind, severity, message, paths, fix }`, `Severity`
+  (`GOOD` < `INFO` < `WARN` < `CRITICAL`) and a `CheckContext` that carries the opened vault, the
+  cryptor and the name resolution every check and every fix needs.
+- **Three checks, seventeen result kinds, seven fixes.** `DirIdCheck` (`dirid`, *Directory Check*):
+  `HealthyDir`, `MissingDirIdBackup`, `LooseDirFile`, `ObeseDirFile`, `EmptyDirFile`,
+  `DirIdCollision`, `MissingContentDir`, `OrphanContentDir`. `CiphertextFileTypeCheck` (`type`,
+  *Resource Type Check*): `KnownType`, `UnknownType`, `AmbiguousType`. `ShortenedNamesCheck`
+  (`shortened`, *Shortened Names Check*): `ValidShortenedFile`, `MissingLongName`, `ObeseNameFile`,
+  `NotDecodableLongName`, `TrailingBytesInNameFile`, `LongShortNamesMismatch`. The kinds, the
+  severities and the messages are Java's.
+- **`/LOST+FOUND` adoption**, `OrphanContentDir`'s fix: the recovery directory (dir id `recovery`),
+  one step parent per orphan named after the orphan's hash, the original cleartext names where they
+  can still be decrypted and `file1_<run>` / `directory2_<run>` / `symlink3_<run>` where they
+  cannot — `OrphanContentDir.fix` line for line.
+- **`crypto health <VAULT>`** with `--check dirid,type,shortened`, `--fail-on WARN|CRITICAL`,
+  `--report FILE` / `--no-report`, `--fix` and `--fix-severity INFO|WARN|CRITICAL`. **Exit code
+  `11` is live**: any finding at or above `--fail-on` (default `CRITICAL`).
+- **The report is Java's `ReportWriter` output** — the banner, `Analyzed vault: <id> (Current name
+  "<name>")`, one `Check <name>` section per check with `STATUS: SUCCESS`/`FAILED` and every
+  finding including the `GOOD` ones. It lands in the working directory as
+  `healthReport_<vault>_<yyyyMMdd-HHmmss>.log`, written atomically.
+- **`--fix` runs to a fixpoint**, at most three rounds, because a repair uncovers the next finding
+  (adopting an orphan creates a directory that then lacks its `dirid.c9r`). Every attempt is logged
+  with its outcome, a failing fix does not stop the run, and the exit code comes from the final
+  check pass.
+- **`cryptomator_core::migration`**: `detect_version`, `needs_migration`, `plan` and `migrate` over
+  `VaultVersion` `V5`…`V8`, with the three migrators — `v6` (NFC passphrase, masterkey rewritten),
+  `v7` (`FilePathMigration`: BASE32 → base64url, `0`/`1S` prefixes to `.c9r` directories, `.lng`
+  from `m/xx/yy/` into `name.c9s`, up to three `_n` attempts on a collision, `m/` deleted) and `v8`
+  (the `vault.cryptomator` JWT with `SIV_CTRMAC` and threshold 220, masterkey version 999). The
+  capability probe in `c/`, `PreMigrationVisitor` and the `.bkup` rule are Java's.
+- **`crypto migrate <VAULT>`** with `--yes` and `--dry-run`, a confirmation on a terminal, one
+  progress line per step and per 100 renames, the `.bkup` files it created, and the keychain entry
+  pulled along when the 5 → 6 step normalised the passphrase. A vault already at format 8 exits `0`
+  and says so; `crypto fs`/`health` on an older vault now name `crypto migrate` in their exit `5`.
+- **`cryptomator_core::recovery::restore`**: `detect_cipher_combo` (the header of the first
+  encrypted file, both schemes tried in `CryptorProvider.Scheme` order), the temporary
+  `RecoveryDirectory` and `restore_masterkey` / `restore_config` / `restore_all` —
+  `RecoveryKeyFactory.newMasterkeyFileWithPassphrase`, `restoreWithPassword` and `restorePassword`.
+- **`crypto recovery-key restore <VAULT> --masterkey|--config|--all`** with `--cipher-combo`,
+  `--shortening-threshold`, the recovery-key and new-password sources of `reset-password`, and a
+  `settings.json`-free path for a vault that lost both key files and can therefore not be
+  registered any more.
+- **Everything is staged and validated before the vault is touched**: the recovery key is decoded
+  and, when a config survived, checked against it; the staged masterkey is loaded back; the staged
+  config's signature is verified; `--all` opens the whole pair as a vault. Only then are the files
+  backed up and moved into place.
+- **New fixtures**: `broken_health` (nine deliberate damages plus `expected-findings.json`, the
+  findings the *real* cryptofs health checks report for it) and `legacy_v7` / `legacy_v6` /
+  `legacy_v5`, each written by the cryptofs release that produced that format (1.9.15 / 1.8.9 /
+  1.3.2) — with `.lng` long names and, in `legacy_v5`, an NFD umlaut passphrase. Three standalone
+  Maven modules under `tools/fixture-gen/` generate them.
+- **Java interop closes the chain**: cryptofs 2.10.0 opens the vaults `crypto migrate` lifted out
+  of formats 7, 6 and 5, and the vault whose masterkey and config `recovery-key restore` rebuilt.
+  The `interop-java` CI job compiles the harness up front so a missing artefact is a named step
+  rather than a timing out test.
+- **Follow-ups from M6**: the detached daemon's log file is now asserted in `cli_daemon.rs` (it was
+  only checked for `--foreground`), `output::format_timestamp` uses the core's `civil_utc` instead
+  of a second copy of the same calendar arithmetic, and the mis-wrapped README paragraph on
+  `--no-keychain` is re-set.
+
+#### Decisions taken along the way
+
+- **`--fix-severity` accepts `INFO`, `--fail-on` does not.** The two `INFO` findings
+  (`MissingDirIdBackup`, `LooseDirFile`) have real fixes and a freshly migrated format 7 vault is
+  full of the first one; making them reachable is worth one value beyond the spec's
+  `WARN|CRITICAL`. `--fail-on INFO` stays a usage error — an exit code for "worth knowing" would
+  make `crypto health` useless in a script.
+- **Fixes run to a fixpoint rather than once.** One pass does not converge: the orphan adoption
+  creates a directory whose own `dirid.c9r` is then missing. Three rounds is the cap, and each
+  finding is attempted once per run — a fix that failed with `ENOTEMPTY` fails the same way next
+  round.
+- **A failed fix is a line in the log, not an exit code.** The exit code is what the *final* check
+  pass found; a script that reads it learns the state of the vault, not the history of the repair.
+- **An explicit `--report FILE` replaces an existing file, the automatic name never does.** The
+  path the user typed is the user's decision; a report nobody asked for must not overwrite the
+  evidence of the previous run, so it steps aside to `…-1.log`.
+- **The report timestamp is UTC**, not the system time zone: a time-zone database is a dependency,
+  and a report that says `20260908-120418` everywhere is comparable across machines.
+- **A report that cannot be written automatically is a warning**, and the checks still print — but
+  `--report FILE` failing is an error, because that file was asked for by name.
+- **`crypto migrate` retries a format 5 passphrase in NFD.** Every passphrase this CLI reads is
+  NFC-normalised, which is exactly what the 5 → 6 step is *for*, so a format 5 vault would
+  otherwise be unopenable by its own tool. The retry is confined to format 5, to
+  `InvalidPassphrase`, and to the state before anything is written.
+- **A migration that dies mid-chain says where it stopped.** The steps are separately durable, so
+  the error names the format the vault reached and the command that continues from there.
+- **`migrate --json` uses `from`/`to` and `renames[].{old, new}`** rather than the longer names the
+  plan sketched; the CLI tests pin them.
+- **The confirmation is our answer to Java's full-scan dialog.** Where the desktop app asks a
+  second question before it walks the whole vault directory, `crypto migrate` treats the one
+  confirmation (or `--yes`) as the answer.
+- **A cipher combo that can neither be detected nor given is exit `2`, not `5`.** It is a missing
+  argument — `--cipher-combo` fixes it — and not a vault in the wrong state.
+- **`detect_cipher_combo` skips more than Java does**: `dir.c9r`, `symlink.c9r`, `dirid.c9r` and
+  whole `.c9s` subtrees, so that "a vault with no user files cannot be detected" is a property one
+  can test. It costs the vault that holds nothing but directories and symlinks, which Java would
+  still detect and which needs `--cipher-combo` here.
+- **`restore` accepts an unregistered vault by path and does not register it.** A vault that lost
+  both key files cannot be added (`vault add` needs a readable config), so requiring registration
+  first would make the command unreachable in exactly the case it exists for. It prints the
+  `crypto vault add` hint instead of writing `settings.json` behind the user's back.
+- **A keychain that refuses after the fact is a warning.** The vault is migrated, or the password
+  reset; a non-zero exit would invite a script to roll back something that succeeded.
+- **No new runtime dependency.** `RecoveryDirectory` hand-rolls its temporary directory (mode
+  `0700`, 64 random bits, removed on `Drop`) rather than pulling `tempfile` into the core.
+- **`legacy_v5` is written by real cryptofs 1.3.2** instead of re-stamping a format 6 masterkey
+  file, which is what the plan had proposed: the genuine artefact is worth the extra Maven module.
+
+#### Known limitations and follow-ups
+
+- **`--fix` cannot make a damaged vault healthy again.** On `broken_health` three `CRITICAL`
+  findings survive every run: `DirIdCollision` (two directories claim one id — which one is the
+  real parent is not knowable), `UnknownType` (its fix deletes the node only when it is empty, and
+  the fixture's is not) and `MissingLongName` (a deleted `name.c9s` cannot be reconstructed from
+  anything the vault still holds; it has no fix at all). That is the point of the command, not a
+  defect — but nobody should read `--fix` as "repair".
+- **`FileNameTooLong` is unreachable on APFS**, and on ext4. The 6 → 7 migration checks whether the
+  storage can take the longer names, but no local file system refuses them, so only a unit test
+  covers the branch. Java's `REQUIRES_FULL_VAULT_DIR_SCAN` path — the one for storage below 220
+  characters — has never run under real conditions either.
+- **The migration has only ever run against generated fixtures**, never against a vault a person
+  actually used with Cryptomator 1.4/1.5. The fixtures come from the genuine cryptofs releases and
+  the results are verified with cryptofs 2.10.0, which is the closest thing to a real vault
+  available here.
+- **`FilePathMigration::parse` anchors the canonical name pattern at position 0** where Java's
+  `find()` searches at any offset. A ciphertext name with a prefix before the BASE32 block is
+  migrated by Java and skipped here; no such name is produced by any cryptofs release.
+- **The cross-device move in `restore` is covered on Linux only.** `$TMPDIR` and the vault share one
+  APFS volume on the development machine, so the `CrossesDevices` fallback is exercised where a
+  second file system (`/dev/shm`) exists and skipped otherwise.
+- **`restore --all` on a vault that lost both key files cannot verify the recovery key.** With no
+  config to check the signature against, a well-formed key for another vault produces a vault that
+  opens and decrypts nothing. `detect_cipher_combo` catches most of it; a vault with an empty `d/`
+  has nothing to catch it with. Java has the same hole.
+- **`restore --config` and `restore --masterkey` hard-wire `masterkey.cryptomator`**, as Java does:
+  a vault whose config named a different masterkey file cannot be rebuilt with them.
+- **The report always lands in the working directory** unless `--report` says otherwise, and its
+  timestamp is UTC. There is no `--report-dir`.
+- **`crypto health` is single-threaded.** Java streams results from an `ExecutorService` as they
+  arrive; here a large vault produces nothing until every check has finished, and there is no way
+  to stop a run half way.
+- **A vault migrated from format 7 reports `INFO MissingDirIdBackup` for every directory**, because
+  that format had no `dirid.c9r`. `crypto health <VAULT> --fix --fix-severity INFO` writes them,
+  and `crypto migrate` says so — but the migration does not do it by itself, as Java's does not.
+- **The `[y/N]` confirmation of `crypto migrate` is not covered end to end.** It needs a pty, which
+  this test suite has no harness for; both outcomes a test can reach (`--yes`, and the refusal
+  without a terminal) are covered.
+- Still open from earlier milestones: macFUSE is unverified (M4), `LinuxGioMounter` has never run
+  on a real GNOME desktop (M5), an entry written by the Cryptomator desktop app has never been read
+  back (M6, the macOS ACL dialog needs a person at the machine), the anonymous *internet* password
+  Java writes before the AppleScript mount is still M8, and coexistence with a running desktop app
+  is still a manual step nobody has taken.

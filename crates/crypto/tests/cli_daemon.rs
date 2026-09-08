@@ -163,6 +163,23 @@ fn unlock_mounts_the_vault_and_lock_takes_it_down() {
     // Locked again: `fs` works, and there is nothing left to lock.
     fx.crypto_daemon(&["fs", "ls", "v"]).assert().success();
     fx.crypto_daemon(&["lock", "v"]).assert().code(5);
+
+    // The detached daemon -- the normal case, unlike `--foreground` -- writes the same log file,
+    // and it stays behind after the lock so a mount that failed can still be read up on.
+    let log = std::fs::read_to_string(fx.state_file(".log")).expect("the detached daemon log");
+    assert!(
+        log.contains("INFO"),
+        "the daemon installed its logger: {log:?}"
+    );
+    assert!(
+        log.contains("mounted at"),
+        "the mount is in the log: {log:?}"
+    );
+    assert!(log.contains("stopped"), "and so is the shutdown: {log:?}");
+    assert!(
+        !log.contains(common::PW),
+        "no passphrase ever reaches the log"
+    );
 }
 
 /// Rewriting the masterkey of a vault a daemon is serving would leave that daemon holding a key

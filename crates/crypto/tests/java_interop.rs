@@ -180,43 +180,62 @@ fn java_opens_fixtures_after_a_password_change_by_crypto() {
     }
 }
 
-/// A vault migrated from format 6 to format 8 by `crypto` must be a vault cryptofs 2.10.0 reads —
-/// the 6 → 7 name migration (BASE32 → base64url, `.lng` → `.c9s`) is the one step of the chain
-/// that rewrites the ciphertext, so this is where a mistake would hide. The fixture is read-only,
-/// so the migration runs on a copy, and the migrated vault opens with the **NFC** passphrase.
+/// A vault `crypto migrate` lifted to format 8 must be a vault cryptofs 2.10.0 reads — the 6 → 7
+/// name migration (BASE32 → base64url, `.lng` → `.c9s`) is the one step of the chain that rewrites
+/// the ciphertext, so this is where a mistake would hide. All three legacy formats run here,
+/// because each enters the chain at a different step: 7 → 8 alone, 6 → 7 → 8, and 5 → 6 → 7 → 8
+/// with the NFD passphrase that only the 5 → 6 step normalises. The fixtures are read-only, so
+/// every migration runs on a copy, and the migrated vault opens with the **NFC** passphrase.
+///
+/// Only the committed fixtures and cryptofs 2.10.0 are needed here; the legacy cryptofs releases
+/// that *wrote* the fixtures are a regeneration concern (`tools/fixture-gen/legacy-v*`).
 #[test]
 #[ignore = "needs Java + Maven; run with --ignored"]
-fn java_reads_a_legacy_vault_migrated_by_crypto() {
-    let dir = tempfile::tempdir().unwrap();
-    let vault = dir.path().join("legacy_v6");
-    let fixture = repo_root().join("tests/fixtures/legacy_v6");
-    copy_dir(&fixture, &vault);
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(fixture.join("fixture.json")).unwrap()).unwrap();
-    let passphrase = meta["passphrase"].as_str().unwrap().to_owned();
-    let nfc = meta["passphraseNfc"]
-        .as_str()
-        .unwrap_or(&passphrase)
-        .to_owned();
+fn java_reads_vaults_migrated_from_legacy_formats() {
+    for (name, starts_at) in [
+        ("legacy_v7", cryptomator_core::VaultVersion::V7),
+        ("legacy_v6", cryptomator_core::VaultVersion::V6),
+        ("legacy_v5", cryptomator_core::VaultVersion::V5),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join(name);
+        let fixture = repo_root().join("tests/fixtures").join(name);
+        copy_dir(&fixture, &vault);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.join("fixture.json")).unwrap()).unwrap();
+        let passphrase = meta["passphrase"].as_str().unwrap().to_owned();
+        let nfc = meta["passphraseNfc"]
+            .as_str()
+            .unwrap_or(&passphrase)
+            .to_owned();
 
-    let reached = cryptomator_core::migration::migrate(
-        &vault,
-        &passphrase,
-        cryptomator_core::MigrationOptions {
-            full_scan_allowed: true,
-            dry_run: false,
-        },
-        &mut |_| {},
-    )
-    .expect("the 6 -> 8 chain");
-    assert_eq!(reached, cryptomator_core::VaultVersion::V8);
-    assert!(!vault.join("m").exists(), "the metadata directory is gone");
+        assert_eq!(
+            cryptomator_core::migration::detect_version(&vault).expect("the fixture's format"),
+            starts_at,
+            "{name} does not start where its manifest says it does"
+        );
+        let reached = cryptomator_core::migration::migrate(
+            &vault,
+            &passphrase,
+            cryptomator_core::MigrationOptions {
+                full_scan_allowed: true,
+                dry_run: false,
+            },
+            &mut |_| {},
+        )
+        .unwrap_or_else(|err| panic!("the chain to format 8 for {name}: {err}"));
+        assert_eq!(reached, cryptomator_core::VaultVersion::V8);
+        assert!(
+            !vault.join("m").exists(),
+            "{name}: the metadata directory is gone"
+        );
 
-    let manifest = verify_with_java(&vault, &nfc);
-    assert_eq!(
-        manifest, meta["expected"],
-        "cryptofs sees a different tree than the fixture manifest after the migration"
-    );
+        let manifest = verify_with_java(&vault, &nfc);
+        assert_eq!(
+            manifest, meta["expected"],
+            "{name}: cryptofs sees a different tree than the fixture manifest after the migration"
+        );
+    }
 }
 
 /// A vault whose `masterkey.cryptomator` **and** `vault.cryptomator` were rebuilt by
