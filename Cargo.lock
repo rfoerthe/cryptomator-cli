@@ -2559,6 +2559,8 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crypto",
+ "data-encoding",
+ "sha2",
  "tempfile",
 ]
 

@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Development-time tasks: manpages and shell completions"
+description = "Development-time tasks: manpages, completions and distribution archives"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,9 @@ clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
 anyhow.workspace = true
+# `dist` writes sha256sum-format lines for the release archives.
+sha2.workspace = true
+data-encoding.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
