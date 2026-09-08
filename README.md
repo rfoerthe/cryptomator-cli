@@ -139,6 +139,24 @@ restore on one is fine — it does the 7 → 8 step's job with new key files.
 to stderr when the app answers on its IPC socket (see [Settings file](#settings-file)); lock the
 vault in the app before restoring its key files.
 
+## Limits on the masterkey file
+
+`masterkey.cryptomator` decides how much memory unlocking a vault costs, and it is a file that can
+come from anywhere — a shared vault, a cloud folder, a mail attachment. scrypt's working set is
+`128 · N · r` bytes, so a file asking for `"scryptCostParam": 16777216` would make `crypto` request
+16 GiB before a password has even been read. Cryptomator itself puts no limit on the two values;
+`crypto` checks them when the file is *read*, before any key is derived:
+
+| Field | Accepted | What Cryptomator writes |
+|---|---|---|
+| `scryptCostParam` (`N`) | a power of two, `2` … `1048576` (`2^20`) | `32768` (`2^15`) |
+| `scryptBlockSize` (`r`) | `1` … `64` | `8` |
+| working set `128 · N · r` | at most 2 GiB | 32 MiB |
+
+A file outside these limits is an invalid masterkey file (exit `1`); rejecting it costs nothing but
+the JSON parse. No vault written by a Cryptomator release comes near them — the defaults are a
+factor of 64 below the memory limit — and the file's own values are named in the error message.
+
 ## Exit codes
 
 | Code | Meaning |

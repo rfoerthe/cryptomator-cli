@@ -1,5 +1,5 @@
 //! `masterkey.cryptomator` (`common/MasterkeyFile.java`, `common/MasterkeyFileAccess.java`).
-use crate::crypto::kdf::scrypt_kek;
+use crate::crypto::kdf::{check_scrypt_params, scrypt_kek};
 use crate::crypto::keywrap::{unwrap_key, wrap_key};
 use crate::crypto::masterkey::Masterkey;
 use crate::crypto::rng::Rng;
@@ -60,13 +60,28 @@ impl MasterkeyFile {
         serde_json::to_string_pretty(self).expect("MasterkeyFile serializes")
     }
 
+    /// What [`is_valid`](Self::is_valid) checks, with a message saying what is wrong. Called by
+    /// [`MasterkeyFileAccess::load_bytes`] before any key derivation, so an absurd
+    /// `scryptCostParam` costs nothing but a parse.
+    pub fn validate(&self) -> Result<()> {
+        if self.version == 0 {
+            return Err(CoreError::InvalidMasterkeyFile("version is 0".into()));
+        }
+        if self.primary_master_key.is_empty()
+            || self.hmac_master_key.is_empty()
+            || self.version_mac.is_empty()
+        {
+            return Err(CoreError::InvalidMasterkeyFile(
+                "a wrapped key or the version MAC is missing".into(),
+            ));
+        }
+        // The scrypt parameters decide how much memory unlocking this file costs, and the file may
+        // come from anywhere. See `crypto::kdf::check_scrypt_params`.
+        check_scrypt_params(self.scrypt_cost_param, self.scrypt_block_size)
+    }
+
     pub fn is_valid(&self) -> bool {
-        self.version != 0
-            && self.scrypt_cost_param > 1
-            && self.scrypt_block_size > 0
-            && !self.primary_master_key.is_empty()
-            && !self.hmac_master_key.is_empty()
-            && !self.version_mac.is_empty()
+        self.validate().is_ok()
     }
 }
 
@@ -98,9 +113,7 @@ impl MasterkeyFileAccess {
 
     pub fn load_bytes(&self, bytes: &[u8], passphrase: &str) -> Result<Masterkey> {
         let file = MasterkeyFile::parse(bytes)?;
-        if !file.is_valid() {
-            return Err(CoreError::InvalidMasterkeyFile("invalid key file".into()));
-        }
+        file.validate()?;
         self.unlock(&file, passphrase)
     }
 
@@ -212,9 +225,7 @@ impl MasterkeyFileAccess {
         rng: &mut dyn Rng,
     ) -> Result<Vec<u8>> {
         let original = MasterkeyFile::parse(bytes)?;
-        if !original.is_valid() {
-            return Err(CoreError::InvalidMasterkeyFile("invalid key file".into()));
-        }
+        original.validate()?;
         let key = self.unlock(&original, old_passphrase)?;
         let updated = self.lock(
             &key,
@@ -380,5 +391,65 @@ mod tests {
         assert!(!dir.path().join("masterkey.cryptomator.tmp").exists());
         let key = access.load(&path, PASSPHRASE).unwrap();
         assert_eq!(key.raw(), sequential_key().raw());
+    }
+
+    /// The file-level check runs before any key derivation, so the error names the file rather
+    /// than an "invalid argument", and the exit code is 1 (a broken file) rather than 2 (usage).
+    #[test]
+    fn a_masterkey_file_with_an_absurd_cost_parameter_is_refused_when_it_is_read() {
+        let hostile = JAVA_FILE_DEFAULT.replace(
+            "\"scryptCostParam\": 32768",
+            "\"scryptCostParam\": 16777216",
+        );
+        let err = MasterkeyFileAccess::new(Vec::new())
+            .load_bytes(hostile.as_bytes(), PASSPHRASE)
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidMasterkeyFile(_)),
+            "wrong error type: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("16777216"),
+            "the value is not in the message: {err}"
+        );
+    }
+
+    /// `is_valid` keeps its meaning: it is `validate().is_ok()`, so every caller that only wants a
+    /// boolean is unaffected.
+    #[test]
+    fn is_valid_agrees_with_validate() {
+        let good = MasterkeyFile::parse(JAVA_FILE_DEFAULT.as_bytes()).unwrap();
+        assert!(good.is_valid() && good.validate().is_ok());
+        for bad in [
+            MasterkeyFile {
+                scrypt_cost_param: 1 << 24,
+                ..good.clone()
+            },
+            MasterkeyFile {
+                scrypt_block_size: 128,
+                ..good.clone()
+            },
+            MasterkeyFile {
+                version: 0,
+                ..good.clone()
+            },
+            MasterkeyFile {
+                version_mac: Vec::new(),
+                ..good.clone()
+            },
+        ] {
+            assert!(!bad.is_valid() && bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    /// The fixtures and the Java-written reference files must still load: this is a limit on
+    /// absurdity, not a change to the format.
+    #[test]
+    fn the_java_reference_files_still_load() {
+        for text in [JAVA_FILE_N1024, JAVA_FILE_DEFAULT] {
+            let file = MasterkeyFile::parse(text.as_bytes()).unwrap();
+            file.validate()
+                .expect("a Java-written masterkey file is inside the limits");
+        }
     }
 }

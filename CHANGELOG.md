@@ -824,3 +824,23 @@
   back (M6, the macOS ACL dialog needs a person at the machine), the anonymous *internet* password
   Java writes before the AppleScript mount is still M8, and coexistence with a running desktop app
   is still a manual step nobody has taken.
+
+### M8 – Release
+
+#### Hardening
+
+- **The scrypt parameters of a masterkey file are capped before anything is derived from them.**
+  `masterkey.cryptomator` is a file someone else can hand you and cryptolib puts no limit on
+  `scryptCostParam` — `MasterkeyFileAccess.unlock` passes it straight to `Scrypt.scrypt`, so
+  `"scryptCostParam": 16777216` asks for 16 GiB of working set before a passphrase has been typed.
+  `N` is now capped at `2^20` (and must be a power of two), `r` at `64`, and the product
+  `128 · N · r` at 2 GiB. The check runs in `MasterkeyFile::validate`, i.e. when the file is read,
+  so a hostile file is an **invalid masterkey file (exit `1`)** that costs nothing but the JSON
+  parse. The defaults every Cryptomator release writes (`N = 2^15`, `r = 8`, 32 MiB) are a factor
+  of 64 below the memory limit; no real vault is affected. A deliberate deviation from Java —
+  see *Limits on the masterkey file* in the README.
+- Side effect of the same check: `MasterkeyFile::is_valid` is now `validate().is_ok()` and
+  therefore stricter — a `scryptCostParam` that is not a power of two (`1000`, say) was accepted by
+  the old `> 1` test and failed later inside the derivation with a usage error (exit `2`); it is
+  now refused as a broken file (exit `1`).
+
