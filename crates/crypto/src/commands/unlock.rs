@@ -4,7 +4,7 @@
 //! file: the parent derives it with scrypt, spawns the daemon detached and sends the key as the
 //! first request over the daemon's 0600 control socket.
 use crate::cli::UnlockArgs;
-use crate::commands::{daemon, keychain_source, locked_vault, store_passphrase_now, Ctx};
+use crate::commands::{daemon, keychain_source, locked_vault, store_passphrase_or_warn, Ctx};
 use crate::exit;
 use anyhow::{anyhow, Context, Result};
 use cryptomator_app::settings::{VaultSettingsJson, WhenUnlocked};
@@ -127,22 +127,13 @@ pub fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<u8> {
 /// Called only after [`report`] returned: at that point the daemon has answered `ready` and the
 /// mount point is known, so a keychain entry can no longer outlive a failed unlock. Nothing here
 /// is an exit code -- the vault *is* mounted, and telling a script otherwise would be a lie -- so
-/// both "there was no keychain after all" and "the provider refused" are warnings on stderr.
+/// both "there was no keychain after all" and "the provider refused" are warnings on stderr
+/// ([`store_passphrase_or_warn`], shared with `vault create --store-password`).
 fn store_after_report(ctx: &Ctx, vault: &VaultSettingsJson, to_store: Option<Zeroizing<String>>) {
     let Some(passphrase) = to_store else {
         return;
     };
-    match store_passphrase_now(ctx, vault, &passphrase) {
-        Ok(true) => {}
-        // Unreachable in practice: `unlock` checks `keychain_required()` before it opens the
-        // vault. It stays a warning rather than an `unreachable!()` because the provider is
-        // probed twice and a machine can lose its keyring in between.
-        Ok(false) => eprintln!(
-            "warning: --store-password had no effect: no keychain is in use \
-             (--no-keychain, useKeychain=false, or no supported provider)"
-        ),
-        Err(err) => eprintln!("warning: the password was not stored: {err:#}"),
-    }
+    store_passphrase_or_warn(ctx, vault, &passphrase);
 }
 
 /// Absolutizes `--mount-point`: `None` stays `None`, a relative path is resolved against this

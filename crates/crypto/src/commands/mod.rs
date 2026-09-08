@@ -3,6 +3,7 @@ pub mod config;
 pub mod daemon;
 pub mod events;
 pub mod fs;
+pub mod keychain;
 pub mod lock;
 pub mod mounters;
 pub mod name;
@@ -180,6 +181,37 @@ pub fn store_passphrase_now(
         keychain.store(&key, display_name.as_deref(), &secret)
     })?;
     Ok(true)
+}
+
+/// [`store_passphrase_now`] for the two commands that must not fail because of the keychain:
+/// `crypto unlock --store-password` and `crypto vault create --store-password`. Returns whether an
+/// entry was written.
+///
+/// Both call this only after the thing they are actually for has succeeded -- the vault is mounted,
+/// or created and registered -- so neither "there was no keychain after all" nor "the provider
+/// refused" may become an exit code: a non-zero exit would tell a script the unlock or the creation
+/// failed, which it did not. Both are one warning on stderr, in one place, so the two commands
+/// cannot drift apart in what they say.
+///
+/// The `Ok(false)` branch is close to unreachable for `unlock` (it checks
+/// [`Ctx::keychain_required`] before it opens the vault) and the ordinary answer for
+/// `vault create`, which never refuses to create a vault over a missing keychain.
+pub fn store_passphrase_or_warn(ctx: &Ctx, vault: &VaultSettingsJson, passphrase: &str) -> bool {
+    match store_passphrase_now(ctx, vault, passphrase) {
+        Ok(stored) => {
+            if !stored {
+                eprintln!(
+                    "warning: --store-password had no effect: no keychain is in use \
+                     (--no-keychain, useKeychain=false, or no supported provider)"
+                );
+            }
+            stored
+        }
+        Err(err) => {
+            eprintln!("warning: the password was not stored: {err:#}");
+            false
+        }
+    }
 }
 
 /// Runs one keychain call under [`cryptomator_app::KEYCHAIN_TIMEOUT`].

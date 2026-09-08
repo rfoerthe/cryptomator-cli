@@ -135,6 +135,21 @@ impl Sandbox {
             .env("CRYPTO_KEYCHAIN_FAKE", self.keychain_file());
         cmd
     }
+    /// [`Sandbox::crypto_keychain`] with a keychain that is *present but refuses*: `is_supported()`
+    /// stays true, so a provider is found and chosen, and every `store`/`load`/`delete` then fails
+    /// with `KeychainError::Locked`. That is the "the keyring is locked / the dialog was refused"
+    /// half of every keychain path, which no other switch can reach.
+    pub fn crypto_keychain_locked(&self, args: &[&str]) -> Command {
+        let mut cmd = self.crypto_keychain(args);
+        cmd.env("CRYPTO_KEYCHAIN_FAKE_LOCKED", "1");
+        cmd
+    }
+    /// [`Sandbox::crypto_daemon_keychain`] with the same locked keychain.
+    pub fn crypto_daemon_keychain_locked(&self, args: &[&str]) -> Command {
+        let mut cmd = self.crypto_daemon_keychain(args);
+        cmd.env("CRYPTO_KEYCHAIN_FAKE_LOCKED", "1");
+        cmd
+    }
     /// What the fake keychain currently holds; an empty object when nothing was stored.
     pub fn fake_keychain_json(&self) -> serde_json::Value {
         match std::fs::read(self.keychain_file()) {

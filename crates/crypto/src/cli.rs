@@ -76,9 +76,20 @@ pub enum Command {
     Events(EventsArgs),
     /// The mount services this build knows
     Mounters(MountersArgs),
+    /// Inspect and self-test the keychain
+    Keychain {
+        #[command(subcommand)]
+        command: KeychainCommand,
+    },
     /// The vault daemon itself; started by `crypto unlock`, never by hand.
     #[command(name = "__daemon", hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KeychainCommand {
+    /// Report the provider and do a store/load/delete round trip with a throwaway key
+    Test,
 }
 
 #[derive(Args, Debug)]
@@ -295,9 +306,9 @@ pub struct SetArgs {
 pub enum ConfigCommand {
     /// Print one or all settings
     Get {
-        /// settings.json: mountService | port | useKeychain | keychainProvider | debugMode;
-        /// cli.json: mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs |
-        /// webdavBind
+        /// settings.json: mountService | port | useKeychain | keychainProvider (alias: macos,
+        /// touchid, secret-service, gnome-keyring, kde) | debugMode; cli.json: mountPointsDir |
+        /// defaultMounter | logLevel | forceUnmountOnSignalAfterSecs | webdavBind
         key: Option<String>,
     },
     /// Change a setting

@@ -1750,3 +1750,36 @@ fn unlock_store_password_saves_only_after_the_mount_succeeded() {
         .stdout(predicates::str::contains("LOCKED"));
     assert_eq!(fx.fake_keychain_json(), serde_json::json!({}));
 }
+
+/// A keychain that is present but refuses at store time: the vault stays mounted and the run stays
+/// successful, because the unlock really did work -- only the saving of the password did not.
+#[test]
+fn unlock_store_password_warns_when_the_keychain_refuses() {
+    let fx = Fixture::new("v");
+
+    fx.crypto_daemon_keychain_locked(&[
+        "unlock",
+        "v",
+        "--mounter",
+        "null",
+        "--store-password",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .success()
+    .stderr(predicates::str::contains(
+        "warning: the password was not stored",
+    ));
+    // The vault is unlocked ...
+    fx.crypto_daemon(&["status", "v"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("UNLOCKED"));
+    // ... and nothing was written: `--store-password` warned instead of failing.
+    assert_eq!(fx.fake_keychain_json(), serde_json::json!({}));
+    fx.crypto_daemon(&["lock", "v"]).assert().success();
+    wait_until("the daemon to clean up its state files", || {
+        !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
+    });
+}

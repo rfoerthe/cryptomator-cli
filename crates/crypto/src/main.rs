@@ -6,7 +6,9 @@ mod output;
 
 use anyhow::Context;
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand};
+use cli::{
+    Cli, Command, ConfigCommand, KeychainCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand,
+};
 use commands::Ctx;
 use cryptomator_app::settings::SettingsStore;
 use cryptomator_app::StateDir;
@@ -127,6 +129,9 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Stats(args) => commands::stats::stats(&ctx, args),
         Command::Events(args) => commands::events::events(&ctx, args),
         Command::Mounters(args) => commands::mounters::mounters(&ctx, args),
+        Command::Keychain { command } => match command {
+            KeychainCommand::Test => commands::keychain::test(&ctx),
+        },
         Command::Daemon(args) => commands::daemon::run(&ctx, args),
     }
 }
@@ -158,6 +163,8 @@ fn writes_settings(command: &Command) -> bool {
         | Command::Stats(_)
         | Command::Events(_)
         | Command::Mounters(_)
+        // `keychain test` writes into the keychain, never into settings.json.
+        | Command::Keychain { .. }
         | Command::Daemon(_) => false,
     }
 }

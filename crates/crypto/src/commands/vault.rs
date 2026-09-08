@@ -1,6 +1,6 @@
 //! `crypto vault create|add|remove|list|info|set`
 use crate::cli::{AddArgs, CreateArgs, SetArgs};
-use crate::commands::{keychain_call, store_passphrase_now, Ctx};
+use crate::commands::{keychain_call, store_passphrase_or_warn, Ctx};
 use crate::exit;
 use anyhow::{Context, Result};
 use cryptomator_app::settings::{
@@ -224,20 +224,9 @@ fn store_new_password(
             );
             false
         }
-        (true, Some(vault)) => match store_passphrase_now(ctx, vault, passphrase) {
-            Ok(true) => true,
-            Ok(false) => {
-                eprintln!(
-                    "warning: --store-password had no effect: no keychain is in use \
-                     (--no-keychain, useKeychain=false, or no supported provider)"
-                );
-                false
-            }
-            Err(err) => {
-                eprintln!("warning: the password was not stored: {err:#}");
-                false
-            }
-        },
+        // Every way the keychain can disappoint is one warning on stderr, shared with
+        // `unlock --store-password` so the two cannot drift apart.
+        (true, Some(vault)) => store_passphrase_or_warn(ctx, vault, passphrase),
     }
 }
 

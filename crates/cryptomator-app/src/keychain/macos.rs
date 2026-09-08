@@ -90,7 +90,8 @@ pub fn legacy_service_name(service: &str) -> String {
     format!("{service}\0")
 }
 
-/// What [`Keychain::store`] does after `SecItemAdd` + `SecItemUpdate` failed.
+/// What [`Keychain::store`] does after `SecItemAdd` + `SecItemUpdate` failed. [`Keychain::change`]
+/// goes through the same path: it never deletes and re-adds either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreFallback {
     /// Rewrite `kSecValueData` on the item that is already there, label untouched.
@@ -334,9 +335,20 @@ impl Keychain for MacKeychain {
         display_name: Option<&str>,
         passphrase: &str,
     ) -> KeychainResult<bool> {
-        // `MacSystemKeychainAccess.changePassphrase`: delete, and store only if the delete found
-        // something. "Noop, if there is no item for the given key."
-        if !self.delete(key)? {
+        // `MacSystemKeychainAccess.changePassphrase` is `if (deletePassword(...)) storePassword(...)`.
+        // The *decision* is kept -- "Noop, if there is no item for the given key" -- but not the
+        // delete: recreating an item throws away its ACL and its partition list, and the item this
+        // most often belongs to is the desktop app's, which would then start prompting for a row
+        // it used to read silently. So the existence check is a lookup, and the write goes through
+        // [`Keychain::store`], whose fallback rewrites `kSecValueData` in place through a
+        // label-less query ([`store_fallback`]).
+        //
+        // The lookup reads the old passphrase (into a `Zeroizing` buffer that is dropped right
+        // here) rather than only its attributes, because that is the read `security-framework`
+        // exposes -- and it is no more of a prompt than Javas `deletePassword` was. Like Java, it
+        // looks under the current service only: an item still living under the legacy service name
+        // is not "there" for a change, and any `load` migrates it first anyway.
+        if self.load_from(&self.service, key)?.is_none() {
             return Ok(false);
         }
         self.store(key, display_name, passphrase)?;
@@ -434,7 +446,8 @@ mod tests {
         // so an item written by the desktop app (label = the service name) makes it answer
         // `errSecItemNotFound`. That is the one status that means "it is there, our query just
         // cannot see it", and the answer is a label-less update -- never a delete and re-add,
-        // which would throw the item's ACL and partition list away.
+        // which would throw the item's ACL and partition list away. `change` writes through this
+        // same `store`, so it does not recreate an item either; its own delete is gone.
         assert_eq!(
             store_fallback(ERR_SEC_ITEM_NOT_FOUND),
             StoreFallback::UpdateValueInPlace

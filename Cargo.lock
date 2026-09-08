@@ -457,6 +457,7 @@ dependencies = [
  "cryptomator-core",
  "cryptomator-mount",
  "data-encoding",
+ "getrandom 0.4.3",
  "libc",
  "log",
  "predicates",

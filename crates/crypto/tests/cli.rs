@@ -1400,7 +1400,11 @@ fn password_store_never_reads_the_keychain_as_a_source() {
     let before = sb.fake_keychain_json();
     sb.crypto_keychain(&["password", "store", "v", "--password-keychain"])
         .assert()
-        .code(8);
+        .code(8)
+        .stderr(predicate::str::contains(
+            "--password-keychain is not a source for `password store`",
+        ))
+        .stderr(predicate::str::contains("give the password another way"));
     assert_eq!(sb.fake_keychain_json(), before);
 }
 
@@ -1555,4 +1559,251 @@ fn store_and_no_store_password_are_mutually_exclusive() {
     sb.crypto(&["unlock", "v", "--store-password", "--password-keychain"])
         .assert()
         .code(2);
+}
+
+#[test]
+fn keychain_test_reports_the_provider_and_does_a_round_trip() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto_keychain(&["--json", "keychain", "test"])
+        .assert()
+        .success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("json output");
+    assert_eq!(json["provider"], "org.cryptomator.cli.FakeKeychainAccess");
+    assert_eq!(json["displayName"], "Fake keychain (file)");
+    assert_eq!(json["supported"], true);
+    assert_eq!(json["locked"], false);
+    assert_eq!(json["roundTrip"], "ok");
+    // The self-test key never stays behind, and what it stored is never printed either.
+    assert_eq!(
+        sb.fake_keychain_json(),
+        serde_json::json!({}),
+        "the self-test cleans up after itself"
+    );
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf-8");
+    assert!(!stdout.contains("selftest"), "{stdout}");
+
+    // Human output names the same things.
+    sb.crypto_keychain(&["keychain", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Fake keychain (file)"))
+        .stdout(predicate::str::contains(
+            "provider:   org.cryptomator.cli.FakeKeychainAccess",
+        ))
+        .stdout(predicate::str::contains("round trip: ok"));
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+}
+
+#[test]
+fn keychain_test_is_exit_eight_when_there_is_nothing_to_test() {
+    let sb = Sandbox::new();
+    // Switched off for this run: there is no provider to describe, so the error is the whole
+    // answer.
+    sb.crypto_keychain(&["--no-keychain", "keychain", "test"])
+        .assert()
+        .code(8)
+        .stderr(predicate::str::contains("--no-keychain"));
+    // Switched off in settings.json: same.
+    sb.crypto(&["config", "set", "useKeychain", "false"])
+        .assert()
+        .success();
+    sb.crypto_keychain(&["keychain", "test"])
+        .assert()
+        .code(8)
+        .stderr(predicate::str::contains("useKeychain"));
+    sb.crypto(&["config", "set", "useKeychain", "true"])
+        .assert()
+        .success();
+    // A provider that is there but says it cannot work here *is* described -- that is the whole
+    // point of the diagnosis -- and the command still fails.
+    let out = sb
+        .crypto_keychain(&["--json", "keychain", "test"])
+        .env("CRYPTO_KEYCHAIN_FAKE_UNSUPPORTED", "1")
+        .assert()
+        .code(8);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("json output");
+    assert_eq!(json["provider"], "org.cryptomator.cli.FakeKeychainAccess");
+    assert_eq!(json["supported"], false);
+    assert!(
+        json["roundTrip"]
+            .as_str()
+            .expect("roundTrip")
+            .starts_with("error"),
+        "{json}"
+    );
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+}
+
+#[test]
+fn keychain_test_reports_a_locked_keyring_without_pretending_it_worked() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto_keychain_locked(&["--json", "keychain", "test"])
+        .assert()
+        .code(8);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("json output");
+    // The provider is there and supported; it simply refuses every call.
+    assert_eq!(json["supported"], true);
+    assert_eq!(json["locked"], true);
+    assert!(
+        json["roundTrip"]
+            .as_str()
+            .expect("roundTrip")
+            .starts_with("error"),
+        "{json}"
+    );
+    assert_eq!(
+        sb.fake_keychain_json(),
+        serde_json::json!({}),
+        "a refused round trip writes nothing"
+    );
+}
+
+#[test]
+fn config_set_keychain_provider_accepts_aliases_and_stores_class_names() {
+    let sb = Sandbox::new();
+    sb.crypto(&["config", "set", "keychainProvider", "gnome-keyring"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess",
+        ));
+    assert_eq!(
+        sb.settings_json()["keychainProvider"],
+        "org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess",
+        "settings.json keeps the Java class name, so the desktop app still reads its own setting"
+    );
+    // `config get` prints the class name and, for a human, the alias that would set it again.
+    sb.crypto(&["config", "get", "keychainProvider"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess (alias: gnome-keyring)",
+        ));
+    let out = sb
+        .crypto(&["--json", "config", "get", "keychainProvider"])
+        .assert()
+        .success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("json output");
+    assert_eq!(
+        json["keychainProvider"], "org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess",
+        "the JSON is the class name alone"
+    );
+
+    sb.crypto(&["config", "set", "keychainProvider", "macos"])
+        .assert()
+        .success();
+    assert_eq!(
+        sb.settings_json()["keychainProvider"],
+        "org.cryptomator.macos.keychain.MacSystemKeychainAccess"
+    );
+    // Case does not matter for an alias ...
+    sb.crypto(&["config", "set", "keychainProvider", "TouchID"])
+        .assert()
+        .success();
+    assert_eq!(
+        sb.settings_json()["keychainProvider"],
+        "org.cryptomator.macos.keychain.TouchIdKeychainAccess"
+    );
+    // ... a fully qualified name still passes through unchanged ...
+    sb.crypto(&["config", "set", "keychainProvider", "org.example.Keychain"])
+        .assert()
+        .success();
+    assert_eq!(
+        sb.settings_json()["keychainProvider"],
+        "org.example.Keychain"
+    );
+    // ... and something that is neither is a usage error that lists the aliases.
+    sb.crypto(&["config", "set", "keychainProvider", "nonsense"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("gnome-keyring"));
+    assert_eq!(
+        sb.settings_json()["keychainProvider"],
+        "org.example.Keychain",
+        "a refused value changes nothing"
+    );
+    // The empty value keeps its own message.
+    sb.crypto(&["config", "set", "keychainProvider", ""])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("must not be empty"));
+
+    // The other keychain setting is a plain boolean, both ways.
+    sb.crypto(&["config", "set", "useKeychain", "false"])
+        .assert()
+        .success();
+    assert_eq!(sb.settings_json()["useKeychain"], false);
+    sb.crypto(&["config", "set", "useKeychain", "true"])
+        .assert()
+        .success();
+    assert_eq!(sb.settings_json()["useKeychain"], true);
+    sb.crypto(&["config", "set", "useKeychain", "maybe"])
+        .assert()
+        .code(2);
+}
+
+/// The keychain is there, and it refuses: `vault create --store-password` still creates the vault.
+#[test]
+fn vault_create_with_a_refusing_keychain_still_creates_the_vault() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto_keychain_locked(&[
+            "--json",
+            "vault",
+            "create",
+            sb.path("v").to_str().unwrap(),
+            "--store-password",
+            "--password-stdin",
+        ])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: the password was not stored",
+        ));
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("json output");
+    assert_eq!(json["stored"], false, "{json}");
+    assert!(sb.path("v").join("vault.cryptomator").exists());
+    assert!(
+        sb.settings_json()["directories"][0]["id"].is_string(),
+        "the vault is registered even though the keychain refused"
+    );
+    assert_eq!(sb.fake_keychain_json(), serde_json::json!({}));
+}
+
+/// The same refusal on the way out: `vault remove --forget-password` is all or nothing.
+#[test]
+fn vault_remove_forget_password_keeps_the_vault_when_the_keychain_refuses() {
+    let sb = Sandbox::new();
+    sb.crypto(&["vault", "create", sb.path("v").to_str().unwrap()])
+        .assert()
+        .success();
+    let id = sb.vault_id(0);
+    sb.seed_keychain(&id, "v", common::PW);
+    let before = sb.fake_keychain_json();
+    sb.crypto_keychain_locked(&["vault", "remove", "v", "--forget-password"])
+        .assert()
+        .code(8);
+    assert_eq!(
+        sb.vault_id(0),
+        id,
+        "the vault stays registered when its entry could not be removed"
+    );
+    assert_eq!(sb.fake_keychain_json(), before);
+    // Without the flag the keychain is never touched, so the removal works anyway.
+    sb.crypto_keychain_locked(&["vault", "remove", "v"])
+        .assert()
+        .success();
+    assert!(sb.settings_json()["directories"]
+        .as_array()
+        .expect("directories")
+        .is_empty());
+    assert_eq!(sb.fake_keychain_json(), before);
 }

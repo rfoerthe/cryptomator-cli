@@ -6,7 +6,7 @@ use anyhow::Result;
 use cryptomator_app::settings::{resolve_vault_index, VaultSettingsJson};
 use cryptomator_app::{
     min_password_length, read_new_passphrase_no_env_fallback, read_passphrase,
-    read_passphrase_with_keychain, AppError, PasswordArgs, SystemIo,
+    read_passphrase_with_keychain, AppError, KeychainError, PasswordArgs, SystemIo,
 };
 use cryptomator_core::{
     change_password, open_vault, read_vault_config, BackupStatus, MasterkeyFileAccess, OsRng,
@@ -110,8 +110,9 @@ fn vault_for_keychain(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, 
 /// steps ([`read_passphrase`], not `read_passphrase_with_keychain`): storing what is already
 /// stored is not a thing. `--password-keychain` therefore ends in
 /// [`AppError::Keychain`] (exit code **8**, not 2): the flag is grammatically fine -- it comes
-/// with the flattened [`PasswordArgs`] -- but the keychain is not a source for `password store`,
-/// so from `read_passphrase`'s point of view there is no keychain to read from here.
+/// with the flattened [`PasswordArgs`] -- but the keychain is where this command *writes*, never
+/// where it reads, and the message says exactly that instead of `read_passphrase`'s "no keychain
+/// is in use here", which would be untrue one line after a provider was found.
 ///
 /// # Errors
 /// [`AppError::VaultNotFound`] (3), [`cryptomator_core::CoreError::InvalidPassphrase`] (4),
@@ -119,6 +120,18 @@ fn vault_for_keychain(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, 
 pub fn store(ctx: &Ctx, args: StorePasswordArgs) -> Result<u8> {
     // First: a run without a keychain must not ask for a passphrase it could never store.
     let keychain = ctx.keychain_required()?;
+    if args.password.password_keychain {
+        // Refused here, by name, rather than further down in `read_passphrase`: there *is* a
+        // keychain in this run (the line above found one), it is simply not a source for the one
+        // command whose job is to fill it.
+        return Err(AppError::Keychain(KeychainError::Unsupported {
+            provider: keychain.display_name().to_string(),
+            hint: "--password-keychain is not a source for `password store`; give the password \
+                   another way"
+                .to_string(),
+        })
+        .into());
+    }
     let (vault, path) = vault_for_keychain(ctx, &args.vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
