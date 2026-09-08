@@ -32,7 +32,10 @@ pub fn completions(out: &mut dyn Write, shell: Shell) -> Result<u8> {
 /// takes over the arguments (globals included, they propagate again at build time) and the visible
 /// subcommands. Only the root is filtered; `the_grammar_hides_nothing_below_the_root` below fails
 /// if a hidden command is ever nested deeper, where this would not catch it.
-fn public_command() -> clap::Command {
+///
+/// Public because `xtask` renders both the packaged completion scripts and the manpages from it:
+/// `clap_mangen` walks hidden subcommands too, so this is the one command a generator may see.
+pub fn public_command() -> clap::Command {
     let base = Cli::command();
     let mut command = clap::Command::new(base.get_name().to_string());
     if let Some(about) = base.get_about() {

@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+description = "Development-time tasks: manpages and shell completions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Never goes to crates.io: it is the repository's build tooling, not a library.
+publish = false
+
+[dependencies]
+crypto = { path = "../crates/crypto" }
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

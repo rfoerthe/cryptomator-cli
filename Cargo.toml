@@ -5,6 +5,8 @@ members = [
     "crates/cryptomator-app",
     "crates/cryptomator-mount",
     "crates/crypto",
+    # Development-time tooling (manpages, shell completions). Not published.
+    "xtask",
     # Vendored fork; see vendor/fuser/README-VENDORED.md.
     "vendor/fuser",
 ]
@@ -42,6 +44,7 @@ anyhow = "1"
 # into the rebuilt command instead of repeating them as literals.
 clap = { version = "4.6", features = ["derive", "env", "wrap_help", "string"] }
 clap_complete = "4.6"
+clap_mangen = "0.2"
 fuser = { version = "0.18", default-features = false, features = ["macos-no-mount"] }
 libloading = "0.9"
 tempfile = "3"
