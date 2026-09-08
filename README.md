@@ -472,8 +472,9 @@ command line:
 6. an interactive prompt, but only when standard input is a terminal
 
 `$CRYPTO_PASSWORD` deliberately outranks the implicit keychain step: it is a source a script sets on
-purpose, and it can never make the operating system open a dialog. `--no-keychain` removes steps 0
-and 5 from the list for one run, whatever `settings.json` says — and the flags are mutually
+purpose, and it can never make the operating system open a dialog. `--no-keychain` removes step 5
+from the list for one run and turns step 0 into exit `8` (there is no keychain to read), whatever
+`settings.json` says — and the flags are mutually
 exclusive, so `--password-keychain` together with any other `--password-*` flag is a usage error.
 
 Without a usable source the command fails with a usage error instead of hanging. Passwords are NFC
@@ -567,7 +568,11 @@ vault's own entry.
 - **Every keychain call gives up after 30 seconds**, and choosing a provider gives each candidate 5
   seconds to say whether it works at all. A call that runs out of time reports exit `8` with *the
   keychain did not answer within 30 s; a system dialog may be waiting for you*. Without that, a
-  dialog nobody is looking at would hang the command forever. Both budgets are compiled in.
+  dialog nobody is looking at would hang the command forever. Both budgets are compiled in. Giving
+  up is not cancelling: the worker that made the call keeps running with its copy of the password
+  until the backend answers, so a `store` that timed out — and was reported as *not stored* — may
+  still land seconds later. Run `crypto keychain test` and, if in doubt, `crypto password
+  store <VAULT>` again; the entry is overwritten, never doubled.
 - **macOS asks the first time.** An entry written by Cryptomator.app belongs, as far as the keychain
   ACL is concerned, to Cryptomator.app; `crypto` is a different program, so macOS puts up a dialog
   asking whether it may be read. Choose **“Always Allow”** and it asks once. Until release binaries
@@ -593,6 +598,10 @@ vault's own entry.
 - **`$CRYPTO_KEYCHAIN_FAKE=<file>` is for tests only.** It replaces every real backend with a JSON
   file (mode 0600) and, while it is set, it is the *only* provider — nothing can reach the real
   keychain by accident. It stores passwords in the clear; do not point it at anything you keep.
+  Every run that uses it says so on standard error, naming the file.
+- **Warnings go to standard error.** Anything the keychain layer reports on the way — a provider
+  whose probe did not answer in 5 seconds, an entry that could not be cleaned up — is printed as
+  `warning: …`, so `--json` output on standard output stays one machine-readable document.
 
 ## Settings file
 

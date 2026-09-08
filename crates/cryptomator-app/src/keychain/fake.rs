@@ -34,6 +34,7 @@ use std::fs::{DirBuilder, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use zeroize::Zeroizing;
 
 /// Points at the JSON file that holds the fake entries.
@@ -54,12 +55,24 @@ const FILE_MODE: u32 = 0o600;
 /// A directory created for the file is not world-traversable either.
 const DIR_MODE: u32 = 0o700;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
     password: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
+}
+
+/// Hand-written, because the derived one would print the passphrase. Nothing formats an `Entry`
+/// today; the rule is that nothing *could* -- a `{:?}` added later (a `dbg!`, an error context, a
+/// panic message from an assertion in a test) must not be the place a passphrase escapes.
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("password", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .finish()
+    }
 }
 
 /// `BTreeMap` rather than `HashMap`, so the file is stable across runs and a diff is readable.
@@ -73,11 +86,36 @@ pub struct FakeKeychain {
 
 impl FakeKeychain {
     /// The fake for `$CRYPTO_KEYCHAIN_FAKE`, or `None` when the variable is unset or empty.
+    ///
+    /// Selecting it is announced once per process, exactly once -- on standard
+    /// error for anything that runs the CLI's logger: a release binary that silently swaps the
+    /// operating system's keychain for a cleartext file over an environment variable is a
+    /// footgun, and the warning is what keeps it a *test* switch.
     pub fn from_env() -> Option<Self> {
         match std::env::var(FAKE_ENV) {
-            Ok(path) if !path.is_empty() => Some(Self::at(path)),
+            Ok(path) if !path.is_empty() => {
+                let fake = Self::at(path);
+                fake.announce();
+                Some(fake)
+            }
             _ => None,
         }
+    }
+
+    /// Warns, once per process, that the passphrases of this run are in a file in the clear.
+    ///
+    /// `log::warn!` rather than `eprintln!`, so it reads like every other warning of the run
+    /// (`warning: ...` through `crate::daemon::logging`) and so a library user who wants it in
+    /// their own log gets it there. The path is named -- it is what has to be deleted afterwards
+    /// -- and nothing else about the file is.
+    fn announce(&self) {
+        static ANNOUNCED: Once = Once::new();
+        ANNOUNCED.call_once(|| {
+            let path = self.path.display();
+            log::warn!(
+                "${FAKE_ENV} is set; passwords are stored in the clear in {path} - test use only"
+            );
+        });
     }
 
     /// The fake backed by `path`. The file does not have to exist yet; a missing file is an empty
@@ -272,6 +310,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let keychain = FakeKeychain::at(dir.path().join("keychain.json"));
         (guard, dir, keychain)
+    }
+
+    #[test]
+    fn an_entrys_debug_output_never_carries_the_passphrase() {
+        let entry = Entry {
+            password: "s3cret-passphrase".to_string(),
+            display_name: Some("Vault".to_string()),
+        };
+        let shown = format!("{entry:?}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(!shown.contains("s3cret-passphrase"), "{shown}");
+        // The rest of the entry is still there: redacting is not the same as saying nothing.
+        assert!(shown.contains("Vault"), "{shown}");
     }
 
     #[test]

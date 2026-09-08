@@ -270,6 +270,31 @@ fn round_trip_inner(keychain: &Arc<dyn Keychain>, key: &str) -> RoundTrip {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises the tests that set a `$CRYPTO_KEYCHAIN_FAKE_*` switch. The variable is
+    /// process-wide, so without this a second test (or a future one) would see a switch it never
+    /// set -- the same rule `keychain::ENV_LOCK` and `settings::store::ENV_LOCK` follow in the
+    /// library, which this binary cannot reach.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Sets an environment variable for as long as it lives, and removes it afterwards --
+    /// including when the test panics in between, which a bare `remove_var` at the end of the
+    /// test body would skip.
+    struct EnvVarGuard(&'static str);
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            std::env::set_var(name, value);
+            Self(name)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
 
     #[test]
     fn the_self_test_key_is_random_and_recognisable() {
@@ -287,17 +312,18 @@ mod tests {
     /// round trip has already failed at `store`. That second failure must not replace the first
     /// (the store error is what actually explains things) and, since the fix above, must not
     /// vanish silently either -- covered here by checking the returned error stays the original
-    /// one; the `log::warn!` itself has no capturing harness in this crate, so it is exercised but
-    /// not asserted on.
+    /// one. That the `log::warn!` really reaches the user is a CLI test
+    /// (`a_failed_round_trip_says_on_stderr_what_it_could_not_clean_up`), which is where a logger
+    /// is installed.
     #[test]
     fn a_failed_round_trip_whose_cleanup_also_fails_still_reports_the_original_error() {
         use cryptomator_app::keychain::fake::{FakeKeychain, FAKE_LOCKED_ENV};
-        // Process-wide, like every other `CRYPTO_KEYCHAIN_FAKE_*` switch -- but this is the only
-        // test in this crate that touches it, so there is nothing to race with.
-        std::env::set_var(FAKE_LOCKED_ENV, "1");
+        // The switch is process-wide, so it is held under the lock and removed on the way out,
+        // panic or not.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _locked = EnvVarGuard::set(FAKE_LOCKED_ENV, "1");
         let keychain: Arc<dyn Keychain> = Arc::new(FakeKeychain::at("/nonexistent/keychain.json"));
         let result = round_trip(&keychain, "crypto-selftest-does-not-matter");
-        std::env::remove_var(FAKE_LOCKED_ENV);
         let err =
             result.expect_err("a locked keychain refuses the store, and then the cleanup too");
         assert_eq!(

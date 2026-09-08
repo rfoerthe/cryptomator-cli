@@ -520,7 +520,8 @@
   runs under a 5-second budget, so choosing a provider cannot cost 30 seconds per candidate.
 - **Password sources gained two steps**: `--password-keychain` (the keychain and nothing else,
   checked ahead of every other source; a missing entry is exit `8`) and an implicit keychain lookup
-  between `$CRYPTO_PASSWORD` and the prompt. `--no-keychain` removes both for one run.
+  between `$CRYPTO_PASSWORD` and the prompt. `--no-keychain` removes the implicit step for one run
+  and makes `--password-keychain` exit `8`.
 - **New commands and flags**: `crypto password store|forget <VAULT>`, `crypto keychain test`,
   `crypto unlock --store-password|--no-store-password`, `crypto vault create --store-password`,
   `crypto vault remove --forget-password`, and `crypto config set keychainProvider` with the
@@ -533,6 +534,15 @@
   warning rather than a failed password change.
 - **Exit code `8` is live**: no usable provider, `--no-keychain`/`useKeychain false` on a keychain
   command, a locked keyring, a 30-second timeout, or `--password-keychain` with nothing stored.
+- **The CLI installs a logger**, so what the library reports through `log::warn!` reaches standard
+  error as `warning: …`: a provider whose probe did not answer, a Secret Service item that could
+  not be cleaned up, a `keychain test` entry that may have been left behind. It is a *delegating*
+  logger — `crypto unlock --foreground` runs a daemon in the same process, and `log` accepts one
+  logger per process, so the daemon's log file is swapped in behind the same handle instead of
+  losing the race (`daemon::logging`).
+- **`$CRYPTO_KEYCHAIN_FAKE` announces itself** once per run, naming the file the passphrases sit in
+  in the clear. It stays enabled in release builds — the CLI tests run the shipped binary — so
+  saying so is what keeps it a test switch.
 - **Every keychain call runs on a worker thread with a 30-second `recv_timeout`**, so a macOS ACL
   dialog nobody answers ends the command instead of hanging it (spike B). The worker is detached
   rather than cancelled — a thread blocked in `securityd` cannot be interrupted — and it holds its

@@ -118,7 +118,11 @@ fn vault_for_keychain(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, 
 /// [`AppError::VaultNotFound`] (3), [`cryptomator_core::CoreError::InvalidPassphrase`] (4),
 /// [`AppError::Keychain`] (8) when there is no keychain or it refuses.
 pub fn store(ctx: &Ctx, args: StorePasswordArgs) -> Result<u8> {
-    // First: a run without a keychain must not ask for a passphrase it could never store.
+    // The vault first, so a name nobody knows is exit 3 here as it is everywhere else -- a machine
+    // without a keychain must not answer `crypto password store does-not-exist` with "no
+    // keychain", which sends the user after the wrong problem.
+    let (vault, path) = vault_for_keychain(ctx, &args.vault)?;
+    // Then the keychain: a run without one must not ask for a passphrase it could never store.
     let keychain = ctx.keychain_required()?;
     if args.password.password_keychain {
         // Refused here, by name, rather than further down in `read_passphrase`: there *is* a
@@ -132,7 +136,6 @@ pub fn store(ctx: &Ctx, args: StorePasswordArgs) -> Result<u8> {
         })
         .into());
     }
-    let (vault, path) = vault_for_keychain(ctx, &args.vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?
@@ -170,8 +173,9 @@ pub fn store(ctx: &Ctx, args: StorePasswordArgs) -> Result<u8> {
 /// # Errors
 /// [`AppError::VaultNotFound`] (3), [`AppError::Keychain`] (8).
 pub fn forget(ctx: &Ctx, reference: &str) -> Result<u8> {
-    let keychain = ctx.keychain_required()?;
+    // The vault first, so an unknown one is exit 3 rather than exit 8 (see `store`).
     let (vault, _path) = vault_for_keychain(ctx, reference)?;
+    let keychain = ctx.keychain_required()?;
     let key = vault.id.clone();
     let forgotten = keychain_call(&keychain, move |keychain| keychain.delete(&key))?;
     let label = vault_label(&vault);

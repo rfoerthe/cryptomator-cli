@@ -257,10 +257,18 @@ pub fn add(ctx: &Ctx, args: AddArgs) -> Result<u8> {
 /// [`AppError::VaultNotFound`] (exit code 3), [`AppError::Keychain`] (8) when `--forget-password`
 /// was given and there is no keychain or it refuses.
 pub fn remove(ctx: &Ctx, reference: &str, forget_password: bool) -> Result<u8> {
+    // `--forget-password` has to resolve the vault to know which keychain key to delete. What is
+    // removed from `settings.json` below is then addressed by that vault's *id*, not by resolving
+    // the user's reference a second time: a display name or a path is not unique the way an id is,
+    // so two resolutions could name two vaults -- one whose password was forgotten and one that
+    // was unregistered. Without the flag nothing has been resolved yet and the reference itself is
+    // what the closure looks up, under the settings lock.
+    let mut resolved_id = None;
     let forgotten = if forget_password {
         let settings = ctx.store.load()?;
         let index = resolve_vault_index(&settings, reference)?;
         let key = settings.directories[index].id.clone();
+        resolved_id = Some(key.clone());
         let keychain = ctx.keychain_required()?;
         // Only if present: `delete` reports `false` for a vault that never had a stored password,
         // which is the end state the user asked for either way.
@@ -268,8 +276,9 @@ pub fn remove(ctx: &Ctx, reference: &str, forget_password: bool) -> Result<u8> {
     } else {
         false
     };
+    let target = resolved_id.as_deref().unwrap_or(reference);
     let removed = ctx.store.update(|settings| {
-        let index = resolve_vault_index(settings, reference)?;
+        let index = resolve_vault_index(settings, target)?;
         Ok(settings.directories.remove(index))
     })?;
     ctx.out.emit(

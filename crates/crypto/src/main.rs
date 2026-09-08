@@ -48,6 +48,13 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
+    // Before anything can log: the library warns through `log` (a keychain provider that had to
+    // be skipped, a self-test entry that could not be removed), and without a logger installed
+    // every one of those lines is dropped. `warn` is the CLI's level -- the console is for what
+    // the user has to know, not for a trace. `unlock --foreground` later swaps the daemon's log
+    // file in behind this same logger (`daemon::logging`), which is why it is installed here
+    // rather than fought over there.
+    cryptomator_app::daemon::init_stderr_logger(log::LevelFilter::Warn);
     // Absolutized once, here, rather than wherever each value is later used: a detached daemon
     // runs with its cwd at `/` (see `commands::unlock::spawn_daemon`), so a relative `--settings`
     // or `--state-dir` would resolve to the wrong place in the child even though it was correct

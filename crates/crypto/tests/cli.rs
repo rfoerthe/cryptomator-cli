@@ -1663,6 +1663,127 @@ fn keychain_test_reports_a_locked_keyring_without_pretending_it_worked() {
     );
 }
 
+/// The library warns through `log`, and the CLI installs a logger for it, so the reason a keychain
+/// call went wrong reaches the person who ran the command. Before that, every one of these lines
+/// was dropped -- and `keychain test`, the one command whose job is diagnosis, was the worst place
+/// for it.
+#[test]
+fn a_failed_round_trip_says_on_stderr_what_it_could_not_clean_up() {
+    let sb = Sandbox::new();
+    let out = sb
+        .crypto_keychain_locked(&["keychain", "test"])
+        .assert()
+        .code(8);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).expect("utf-8");
+    assert!(
+        stderr.contains("warning: crypto-selftest-"),
+        "the leftover entry is named on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("may still be there after a failed round trip"),
+        "{stderr}"
+    );
+    // The diagnosis itself is still on stdout, exit code or not.
+    assert!(
+        String::from_utf8_lossy(&out.get_output().stdout).contains("round trip: error"),
+        "the document is printed before the command fails"
+    );
+}
+
+/// The fake keychain is enabled in release builds (the CLI tests run the shipped binary), so the
+/// one thing that keeps it a test switch is that it says so.
+#[test]
+fn the_fake_keychain_says_that_it_is_a_fake() {
+    let sb = Sandbox::new();
+    let out = sb.crypto_keychain(&["keychain", "test"]).assert().success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).expect("utf-8");
+    assert!(
+        stderr.contains("warning: $CRYPTO_KEYCHAIN_FAKE is set"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("stored in the clear"), "{stderr}");
+    assert!(stderr.contains("test use only"), "{stderr}");
+    assert!(
+        stderr.contains(sb.keychain_file().to_str().expect("utf-8 path")),
+        "the file that has to be deleted afterwards is named: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("$CRYPTO_KEYCHAIN_FAKE is set").count(),
+        1,
+        "once per process, however often a provider is looked up: {stderr}"
+    );
+    // A run without the variable says nothing of the sort.
+    let out = sb.crypto(&["vault", "list"]).assert().success();
+    assert!(
+        !String::from_utf8_lossy(&out.get_output().stderr).contains("CRYPTO_KEYCHAIN_FAKE"),
+        "the warning belongs to the runs that actually use the fake"
+    );
+}
+
+/// A vault nobody knows is exit 3 in every command that takes one -- including the two whose whole
+/// purpose is the keychain. Answering "no keychain" (exit 8) there would send the user after a
+/// problem they do not have.
+#[test]
+fn password_store_and_forget_report_an_unknown_vault_before_the_keychain() {
+    let sb = Sandbox::new();
+    sb.crypto_keychain(&["password", "store", "nope", "--password-stdin"])
+        .write_stdin(format!("{}\n", common::PW))
+        .assert()
+        .code(3);
+    sb.crypto_keychain(&["password", "forget", "nope"])
+        .assert()
+        .code(3);
+    // Without a keychain the answer is the same one, not exit 8 -- and it is what
+    // `vault remove --forget-password` has always given.
+    sb.crypto_keychain(&[
+        "--no-keychain",
+        "password",
+        "store",
+        "nope",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{}\n", common::PW))
+    .assert()
+    .code(3);
+    sb.crypto_keychain(&["--no-keychain", "password", "forget", "nope"])
+        .assert()
+        .code(3);
+    sb.crypto_keychain(&[
+        "--no-keychain",
+        "vault",
+        "remove",
+        "nope",
+        "--forget-password",
+    ])
+    .assert()
+    .code(3);
+}
+
+/// `--help` is the only place a user finds the aliases without reading the README, so it lists all
+/// six -- `kwallet` included, which the generated text used to leave out.
+#[test]
+fn config_help_names_every_keychain_provider_alias() {
+    let sb = Sandbox::new();
+    for command in [["config", "get", "--help"], ["config", "set", "--help"]] {
+        let out = sb.crypto(&command).assert().success();
+        let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf-8");
+        for alias in [
+            "macos",
+            "touchid",
+            "secret-service",
+            "gnome-keyring",
+            "kde",
+            "kwallet",
+        ] {
+            assert!(
+                stdout.contains(alias),
+                "`{}` does not mention the alias {alias}: {stdout}",
+                command.join(" ")
+            );
+        }
+    }
+}
+
 #[test]
 fn config_set_keychain_provider_accepts_aliases_and_stores_class_names() {
     let sb = Sandbox::new();

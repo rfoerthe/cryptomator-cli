@@ -307,11 +307,12 @@ pub enum ConfigCommand {
     /// Print one or all settings
     Get {
         /// settings.json: mountService | port | useKeychain | keychainProvider (alias: macos,
-        /// touchid, secret-service, gnome-keyring, kde) | debugMode; cli.json: mountPointsDir |
-        /// defaultMounter | logLevel | forceUnmountOnSignalAfterSecs | webdavBind
+        /// touchid, secret-service, gnome-keyring, kde, kwallet) | debugMode; cli.json:
+        /// mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs | webdavBind
         key: Option<String>,
     },
-    /// Change a setting
+    /// Change a setting (keychainProvider takes the aliases macos, touchid, secret-service,
+    /// gnome-keyring, kde, kwallet or a Java class name)
     // Values may start with a dash (a negative number is refused later, with a reason).
     Set {
         key: String,

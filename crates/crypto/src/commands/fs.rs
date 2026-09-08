@@ -63,7 +63,7 @@ pub fn open_fs(
     }
     // Lazy: probing the keychain provider is skipped entirely when `password` already answers
     // (e.g. `--password-stdin`), so a headless run that opted out of the keychain never pays the
-    // Secret Service probe (and its stderr warning on a provider that turns out unsupported).
+    // Secret Service probe (nor the `warning:` line a probe that does not answer prints).
     let passphrase = read_passphrase_with_keychain(
         password,
         "Password: ",

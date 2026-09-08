@@ -269,6 +269,16 @@ fn a_foreground_unlock_serves_until_it_is_locked() {
     let status = wait_for_exit(&mut child);
     assert_eq!(status.code(), Some(0), "the foreground unlock ends cleanly");
     assert!(!fx.mount_points_dir().join("f").join(MARKER).exists());
+
+    // `--foreground` runs the daemon inside the CLI process, which already has a logger installed
+    // for its own warnings. The daemon's log file has to take that logger over -- a second
+    // `set_boxed_logger` would be refused and this file would stay empty.
+    let log = std::fs::read_to_string(fx.state_file(".log")).expect("the daemon log");
+    assert!(
+        log.contains("INFO") && log.contains("mounted at"),
+        "the foreground daemon writes its own log file: {log:?}"
+    );
+    assert!(log.contains("stopped"), "including the shutdown: {log:?}");
 }
 
 /// Waits [`DEADLINE`] for `child` to exit and kills it rather than leaving it behind.
