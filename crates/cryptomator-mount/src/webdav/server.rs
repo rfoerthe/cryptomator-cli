@@ -296,7 +296,8 @@ pub fn host_header_allowed(host: &str) -> bool {
             return false;
         };
         let port_is_sane = match after.strip_prefix(':') {
-            Some(port) => port.chars().all(|c| c.is_ascii_digit()),
+            // RFC 7230 `authority`: the colon may only be there when a port follows it.
+            Some(port) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
             None => after.is_empty(),
         };
         if !port_is_sane {
@@ -306,7 +307,9 @@ pub fn host_header_allowed(host: &str) -> bool {
     } else if host.matches(':').count() == 1 {
         // `localhost:42427`, `127.0.0.1:42427`.
         match host.split_once(':') {
-            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+            Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                name
+            }
             _ => return false,
         }
     } else {
@@ -560,5 +563,29 @@ mod tests {
         };
         assert_eq!(handle.root_uri(), "http://[::1]:4711/v");
         assert!(!handle.is_running());
+    }
+
+    #[test]
+    fn a_host_header_with_an_empty_port_is_refused() {
+        // RFC 7230: `host [ ":" port ]` -- if the colon is there, a port has to follow. The old
+        // check accepted it because `"".chars().all(is_ascii_digit)` is vacuously true.
+        assert!(
+            !host_header_allowed("localhost:"),
+            "empty port after a name"
+        );
+        assert!(
+            !host_header_allowed("127.0.0.1:"),
+            "empty port after a literal"
+        );
+        assert!(
+            !host_header_allowed("[::1]:"),
+            "empty port after a bracketed literal"
+        );
+        // The valid forms keep working.
+        assert!(host_header_allowed("localhost:42427"));
+        assert!(host_header_allowed("127.0.0.1:42427"));
+        assert!(host_header_allowed("[::1]:42427"));
+        assert!(host_header_allowed("[::1]"));
+        assert!(host_header_allowed("localhost"));
     }
 }

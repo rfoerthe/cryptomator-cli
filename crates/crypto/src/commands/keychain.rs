@@ -185,8 +185,10 @@ fn round_trip(keychain: &Arc<dyn Keychain>, key: &str) -> RoundTrip {
     let cleanup_key = key.to_string();
     let cleanup = call(keychain, move |keychain| keychain.delete(&cleanup_key));
     if let Err(err) = cleanup {
-        // Only interesting when the round trip itself was fine; otherwise the first error is the
-        // one that explains everything, including why the cleanup could not work either.
+        // Only interesting on its own when the round trip itself was fine; otherwise the first
+        // error is the one that explains everything, including why the cleanup could not work
+        // either -- but it must not vanish silently, so it is logged (the key name only, never
+        // the self-test value) for whoever has to explain a leftover entry later.
         if result.is_ok() {
             return Err(RoundTripError {
                 what: "the self-test entry could not be removed",
@@ -196,6 +198,7 @@ fn round_trip(keychain: &Arc<dyn Keychain>, key: &str) -> RoundTrip {
                 },
             });
         }
+        log::warn!("{key} may still be there after a failed round trip: {err}");
     }
     result
 }
@@ -233,13 +236,13 @@ fn round_trip_inner(keychain: &Arc<dyn Keychain>, key: &str) -> RoundTrip {
         // be.
         Some(_) => {
             return Err(wrong(
-                "load failed",
+                "load mismatch",
                 "what came back is not what store wrote",
             ))
         }
         None => {
             return Err(wrong(
-                "load",
+                "load mismatch",
                 "store reported success but nothing was stored",
             ))
         }
@@ -257,7 +260,7 @@ fn round_trip_inner(keychain: &Arc<dyn Keychain>, key: &str) -> RoundTrip {
         .map_err(refused("load after delete failed"))?;
     if gone.is_some() {
         return Err(wrong(
-            "load after delete",
+            "load after delete failed",
             "the entry survived its own deletion",
         ));
     }
@@ -278,5 +281,33 @@ mod tests {
         // A vault id is base64url and never carries this prefix, so the key cannot collide with a
         // real entry -- and two runs cannot collide with each other either.
         assert_ne!(key, selftest_key().expect("randomness"));
+    }
+
+    /// A locked provider refuses every call, including the best-effort cleanup delete after the
+    /// round trip has already failed at `store`. That second failure must not replace the first
+    /// (the store error is what actually explains things) and, since the fix above, must not
+    /// vanish silently either -- covered here by checking the returned error stays the original
+    /// one; the `log::warn!` itself has no capturing harness in this crate, so it is exercised but
+    /// not asserted on.
+    #[test]
+    fn a_failed_round_trip_whose_cleanup_also_fails_still_reports_the_original_error() {
+        use cryptomator_app::keychain::fake::{FakeKeychain, FAKE_LOCKED_ENV};
+        // Process-wide, like every other `CRYPTO_KEYCHAIN_FAKE_*` switch -- but this is the only
+        // test in this crate that touches it, so there is nothing to race with.
+        std::env::set_var(FAKE_LOCKED_ENV, "1");
+        let keychain: Arc<dyn Keychain> = Arc::new(FakeKeychain::at("/nonexistent/keychain.json"));
+        let result = round_trip(&keychain, "crypto-selftest-does-not-matter");
+        std::env::remove_var(FAKE_LOCKED_ENV);
+        let err =
+            result.expect_err("a locked keychain refuses the store, and then the cleanup too");
+        assert_eq!(
+            err.what, "store failed",
+            "the store step is what really failed"
+        );
+        assert!(
+            matches!(err.cause, KeychainError::Locked { .. }),
+            "{:?}",
+            err.cause
+        );
     }
 }

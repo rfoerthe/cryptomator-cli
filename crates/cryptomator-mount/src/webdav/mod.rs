@@ -18,8 +18,8 @@ pub use fallback::{FallbackMount, FallbackMounter, MountFinisher, WebDavMountBui
 pub use fs::{fs_error, CryptoDavEntry, CryptoDavFile, CryptoDavFs, CryptoDavMeta};
 pub use os_mount::{LinuxGioMounter, MacAppleScriptMounter};
 pub use server::{
-    probe_context_root, strip_prefix_for, WebDavServerConfig, WebDavServerError,
-    WebDavServerHandle, HEALTH_TIMEOUT,
+    host_header_allowed, probe_context_root, strip_prefix_for, WebDavServerConfig,
+    WebDavServerError, WebDavServerHandle, HEALTH_TIMEOUT,
 };
 
 /// Set to `1` to let [`set_bind_address`] accept an address the rest of the network can reach.
