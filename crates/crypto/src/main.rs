@@ -45,6 +45,12 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
+    // Before the logger, before `settings.json`, before anything that can fail: this command
+    // prints a static script and is typically run from a shell's startup file, where a hang or a
+    // stray warning on stderr would be the user's problem for every new terminal.
+    if let Command::Completions(args) = &cli.command {
+        return commands::completions::completions(&mut std::io::stdout(), args.shell);
+    }
     // Before anything can log: the library warns through `log` (a keychain provider that had to
     // be skipped, a self-test entry that could not be removed), and without a logger installed
     // every one of those lines is dropped. `warn` is the CLI's level -- the console is for what
@@ -153,6 +159,12 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             KeychainCommand::Test => commands::keychain::test(&ctx),
         },
         Command::Daemon(args) => commands::daemon::run(&ctx, args),
+        // Unreachable: `run` returns above, before the settings store is built. The arm exists
+        // because the dispatch is exhaustive on purpose, and it does the same thing rather than
+        // panicking, so a future edit to the early return cannot turn into a crash.
+        Command::Completions(args) => {
+            commands::completions::completions(&mut std::io::stdout(), args.shell)
+        }
     }
 }
 
@@ -191,6 +203,9 @@ fn writes_settings(command: &Command) -> bool {
         | Command::Migrate(_)
         // `keychain test` writes into the keychain, never into settings.json.
         | Command::Keychain { .. }
+        // `completions` never reaches this function (it returns early in `run`); the arm is here
+        // because the match is exhaustive on purpose.
+        | Command::Completions(_)
         | Command::Daemon(_) => false,
     }
 }

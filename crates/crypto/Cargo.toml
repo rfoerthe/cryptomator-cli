@@ -20,6 +20,7 @@ cryptomator-core = { path = "../cryptomator-core" }
 cryptomator-app = { path = "../cryptomator-app" }
 cryptomator-mount = { path = "../cryptomator-mount" }
 clap.workspace = true
+clap_complete.workspace = true
 anyhow.workspace = true
 zeroize.workspace = true
 serde_json.workspace = true
