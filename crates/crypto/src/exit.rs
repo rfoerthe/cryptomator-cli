@@ -39,7 +39,10 @@ fn core_code(err: &CoreError) -> u8 {
         // Not a broken vault: the tool simply cannot work the cipher combo out from what is
         // there, and the user has to name it with `--cipher-combo`. The restore command turns
         // this into an `InvalidValue` naming that flag; this arm is the fallback.
-        CoreError::InvalidArgument(_) | CoreError::CipherComboUndetectable(_) => USAGE,
+        // Same for a `--cipher-combo` the vault contradicts: the vault is fine, the flag is wrong.
+        CoreError::InvalidArgument(_)
+        | CoreError::CipherComboUndetectable(_)
+        | CoreError::CipherComboMismatch { .. } => USAGE,
         CoreError::InvalidMasterkeyFile(_)
         | CoreError::VaultConfigLoad(_)
         | CoreError::UnsupportedKeyId(_)

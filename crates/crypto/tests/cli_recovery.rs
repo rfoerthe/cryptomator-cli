@@ -515,3 +515,184 @@ fn a_legacy_vault_points_at_the_migrate_command() {
         .code(5)
         .stderr(predicate::str::contains("crypto migrate legacy_v7"));
 }
+
+/// `--config` needs `masterkey.cryptomator` to sign the new config with. A vault that lost both
+/// files is accepted by the state check (it is ALL_MISSING, one of the states this command ends),
+/// so the mode itself has to say what is missing and which mode can rebuild it -- instead of dying
+/// on a bare "No such file or directory".
+#[test]
+fn restore_config_without_a_masterkey_file_points_at_all() {
+    let fx = Sandbox::new();
+    let path = fx.add_fixture("siv_gcm_basic");
+    for name in ["masterkey.cryptomator", "vault.cryptomator"] {
+        delete_key_file(&path, name);
+    }
+
+    fx.crypto(&[
+        "recovery-key",
+        "restore",
+        "siv_gcm_basic",
+        "--config",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{PW}\n"))
+    .assert()
+    .code(2)
+    .stderr(
+        predicate::str::contains("masterkey.cryptomator").and(predicate::str::contains("--all")),
+    );
+    assert!(!path.join("vault.cryptomator").exists());
+}
+
+/// The vault password is what `--config` unwraps the masterkey file with; a wrong one is exit 4
+/// and leaves the vault as it was.
+#[test]
+fn restore_config_with_a_wrong_password_is_exit_four() {
+    let fx = Sandbox::new();
+    let path = fx.add_fixture("siv_gcm_basic");
+    delete_key_file(&path, "vault.cryptomator");
+
+    fx.crypto(&[
+        "recovery-key",
+        "restore",
+        "siv_gcm_basic",
+        "--config",
+        "--password-stdin",
+    ])
+    .write_stdin("not-the-vault-password\n")
+    .assert()
+    .code(4);
+    assert!(
+        !path.join("vault.cryptomator").exists(),
+        "a refused password must not write a config"
+    );
+}
+
+/// A `--cipher-combo` the vault's own files contradict is a typo, not an override: writing it
+/// would produce a config the vault cannot be opened with, and nothing afterwards would say so.
+#[test]
+fn a_cipher_combo_the_vault_contradicts_is_refused() {
+    let fx = Sandbox::new();
+    let path = fx.add_fixture("siv_gcm_basic");
+    delete_key_file(&path, "vault.cryptomator");
+
+    fx.crypto(&[
+        "recovery-key",
+        "restore",
+        "siv_gcm_basic",
+        "--config",
+        "--cipher-combo",
+        "SIV_CTRMAC",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{PW}\n"))
+    .assert()
+    .code(2)
+    // The vault is asked, so the message can name what it actually holds.
+    .stderr(predicate::str::contains("SIV_GCM"));
+    assert!(!path.join("vault.cryptomator").exists());
+}
+
+/// A vault that lost *both* key files cannot be registered -- `crypto vault add` refuses it -- so
+/// `restore` takes its directory path directly, without touching `settings.json`, and says how to
+/// register it once it is whole again.
+#[test]
+fn restore_all_works_on_a_vault_that_is_not_registered() {
+    let fx = Sandbox::new();
+    // A registered copy of the same fixture, only to read the recovery key from: the loose copy
+    // below is byte-identical, so it is the same masterkey and the same recovery key.
+    fx.add_fixture("siv_gcm_basic");
+    let key = recovery_key(&fx, "siv_gcm_basic");
+
+    let loose = fx.path("loose");
+    std::fs::create_dir(&loose).unwrap();
+    common::copy_recursively(&common::fixtures_root().join("siv_gcm_basic"), &loose);
+    for name in ["masterkey.cryptomator", "vault.cryptomator"] {
+        delete_key_file(&loose, name);
+    }
+    // The gap this closes: in this state the vault cannot be added to the settings at all.
+    fx.crypto(&["vault", "add"]).arg(&loose).assert().code(12);
+
+    let out = fx
+        .crypto(&[
+            "--json",
+            "recovery-key",
+            "restore",
+            loose.to_str().unwrap(),
+            "--all",
+            "--recovery-key-stdin",
+            "--new-password-env",
+            "NP",
+        ])
+        .env("NP", NEW_PW)
+        .write_stdin(format!("{key}\n"))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("crypto vault add"))
+        .get_output()
+        .stdout
+        .clone();
+    let value = json_of(&out);
+    assert_eq!(value["registered"], false);
+    assert!(value["vault"].is_null(), "an unregistered vault has no id");
+    assert_eq!(
+        value["restored"],
+        serde_json::json!(["masterkey", "config"])
+    );
+    assert_eq!(value["cipherCombo"], "SIV_GCM");
+    assert_eq!(
+        fx.settings_json()["directories"].as_array().unwrap().len(),
+        1,
+        "restoring must not register anything"
+    );
+
+    // And now it can be registered, and it opens with the new password.
+    fx.crypto(&["vault", "add"]).arg(&loose).assert().success();
+    fx.crypto(&["fs", "ls", "loose", "/"])
+        .env("CRYPTO_PASSWORD", NEW_PW)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt"));
+}
+
+/// A registered vault keeps saying so, and a reference that names neither a vault nor a vault
+/// directory is still "no vault matches" (exit 3) rather than a restore into a fresh directory.
+#[test]
+fn a_registered_vault_reports_registered_and_a_stray_path_is_still_not_found() {
+    let fx = Sandbox::new();
+    let path = fx.add_fixture("siv_gcm_basic");
+    delete_key_file(&path, "vault.cryptomator");
+
+    let out = fx
+        .crypto(&[
+            "--json",
+            "recovery-key",
+            "restore",
+            "siv_gcm_basic",
+            "--config",
+            "--password-stdin",
+        ])
+        .write_stdin(format!("{PW}\n"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value = json_of(&out);
+    assert_eq!(value["registered"], true);
+    assert_eq!(value["vault"], fx.vault_id(0));
+
+    // An ordinary directory without `d/` is not a vault reference.
+    let empty = fx.path("empty");
+    std::fs::create_dir(&empty).unwrap();
+    fx.crypto(&[
+        "recovery-key",
+        "restore",
+        empty.to_str().unwrap(),
+        "--config",
+        "--password-stdin",
+    ])
+    .write_stdin(format!("{PW}\n"))
+    .assert()
+    .code(3);
+}

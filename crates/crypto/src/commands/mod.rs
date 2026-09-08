@@ -18,11 +18,14 @@ pub mod vault;
 
 use crate::output::Output;
 use anyhow::Result;
-use cryptomator_app::settings::{resolve_vault_index, SettingsStore, VaultSettingsJson};
+use cryptomator_app::settings::{
+    normalize_vault_path, resolve_vault_index, SettingsStore, VaultSettingsJson,
+};
 use cryptomator_app::{
     AppError, ErrorBody, Keychain, KeychainError, KeychainSource, RuntimeState, StateDir,
     VaultInfo, VaultRegistry,
 };
+use cryptomator_core::constants::DATA_DIR_NAME;
 use cryptomator_core::{determine_vault_state, VaultState};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -327,7 +330,18 @@ fn vault_in_state(
         key: "path".to_string(),
         message: format!("vault {} has no path", vault.id),
     })?;
-    let state = determine_vault_state(&path)?;
+    require_state(&path, allowed, reference)?;
+    ctx.registry().require_locked(&vault)?;
+    Ok((vault, path))
+}
+
+/// The on-disk half of [`vault_in_state`], also used for a vault that is not in `settings.json` at
+/// all (see [`restorable_vault`]) and therefore has no runtime half.
+///
+/// # Errors
+/// [`AppError::WrongState`] (exit code 5) for a state outside `allowed`.
+fn require_state(path: &Path, allowed: &[VaultState], reference: &str) -> Result<VaultState> {
+    let state = determine_vault_state(path)?;
     if !allowed.contains(&state) {
         return Err(AppError::WrongState {
             expected: allowed
@@ -346,8 +360,7 @@ fn vault_in_state(
         }
         .into());
     }
-    ctx.registry().require_locked(&vault)?;
-    Ok((vault, path))
+    Ok(state)
 }
 
 /// The vault must be LOCKED -- both on disk (config + masterkey present, no partial state) and at
@@ -370,23 +383,62 @@ pub fn migratable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson
     )
 }
 
-/// [`locked_vault`] for `crypto recovery-key restore`: a vault whose `vault.cryptomator` or whose
-/// key files are gone is `VAULT_CONFIG_MISSING` or `ALL_MISSING`, and those are the states this
+/// The states `crypto recovery-key restore` accepts: a vault whose `vault.cryptomator` or whose
+/// key files are gone is `VAULT_CONFIG_MISSING` or `ALL_MISSING`, and those are the states the
 /// command exists to end. (A vault that has only lost its *masterkey* file still reports LOCKED:
 /// `determine_vault_state` stops at the readable config.)
 ///
 /// `MISSING` -- the directory is not there, or holds no `d/` at all -- and `NEEDS_MIGRATION` stay
 /// refused: neither has key files this command could rebuild.
-pub fn restorable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
-    vault_in_state(
-        ctx,
-        reference,
-        &[
-            VaultState::Locked,
-            VaultState::VaultConfigMissing,
-            VaultState::AllMissing,
-        ],
-    )
+const RESTORABLE_STATES: &[VaultState] = &[
+    VaultState::Locked,
+    VaultState::VaultConfigMissing,
+    VaultState::AllMissing,
+];
+
+/// [`locked_vault`] for `crypto recovery-key restore`, in the states of [`RESTORABLE_STATES`] --
+/// and, unlike every other resolver here, for a vault that is **not registered** at all. `None`
+/// then stands for "there is no `settings.json` entry".
+///
+/// A vault that lost both key files cannot be registered: `crypto vault add` refuses it
+/// (`MISSING_VAULT_CONFIG`, exit code 12), so requiring an entry would lock the very vault this
+/// command is for out of it -- the entry would have had to be made while the vault was still
+/// healthy. Java has no such gap; `RecoveryKeyResetPasswordController.restorePasswordAsync` adds
+/// the vault to the list *after* the restore, and this is the same order: restore first, and the
+/// command tells the user to run `crypto vault add` afterwards. Nothing here writes
+/// `settings.json` -- a command that rebuilds key files must not also change the user's vault list
+/// behind their back.
+///
+/// The reference has to be an existing directory holding `d/` for that: without it every typo
+/// would turn from "no vault matches" into a restore into a fresh directory. The runtime check
+/// ("is a daemon serving this?") is skipped for an unregistered vault, because a daemon only ever
+/// serves vaults from `settings.json`, keyed by an id this one does not have.
+pub fn restorable_vault(
+    ctx: &Ctx,
+    reference: &str,
+) -> Result<(Option<VaultSettingsJson>, PathBuf)> {
+    let not_found = match vault_in_state(ctx, reference, RESTORABLE_STATES) {
+        Ok((vault, path)) => return Ok((Some(vault), path)),
+        // Every other failure -- an ambiguous name, a wrong state, unreadable settings -- is the
+        // answer, and looking at the file system afterwards could only make it worse.
+        Err(err) if !matches!(downcast_app(&err), Some(AppError::VaultNotFound(_))) => {
+            return Err(err)
+        }
+        Err(err) => err,
+    };
+    let path = normalize_vault_path(Path::new(reference));
+    if !path.join(DATA_DIR_NAME).is_dir() {
+        // Not a vault directory either: the original "no vault matches …" is the better message.
+        return Err(not_found);
+    }
+    require_state(&path, RESTORABLE_STATES, reference)?;
+    Ok((None, path))
+}
+
+/// The typed [`AppError`] behind an `anyhow` error, wherever in the chain it sits.
+fn downcast_app(err: &anyhow::Error) -> Option<&AppError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<AppError>())
 }
 
 /// The `*.bkup` files sitting directly in `vault_path`, as a set that can be diffed around an

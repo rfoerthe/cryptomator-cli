@@ -229,8 +229,6 @@ fn stopped_at(err: anyhow::Error, path: &Path, reference: &str) -> anyhow::Error
     }
 }
 
-/// The `*.bkup` files directly in the vault directory. Unreadable directory: an empty set, because
-/// this only ever feeds a message -- the migration itself has long since said whether it worked.
 /// The steps from `from` up to [`VaultVersion::LATEST`]; empty when there is nothing to do.
 ///
 /// Computed here rather than through [`migration::plan`] on purpose: naming the chain needs no

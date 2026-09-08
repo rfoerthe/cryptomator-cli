@@ -57,6 +57,14 @@ pub enum CoreError {
     /// The caller has to be told which combo to use instead of guessing one.
     #[error("cannot detect the cipher combo of {0}: no encrypted file it could be read from")]
     CipherComboUndetectable(std::path::PathBuf),
+    /// A cipher combo was given explicitly, but the vault's own files were written with another
+    /// one. Writing the given one would produce a config the vault cannot be opened with, so the
+    /// caller is told what the vault actually says instead.
+    #[error("the vault was written with {detected}, not {given}")]
+    CipherComboMismatch {
+        given: crate::crypto::cryptor::CipherCombo,
+        detected: crate::crypto::cryptor::CipherCombo,
+    },
     /// A vault format outside 5..=8: either older than any migrator this tool has
     /// (`NoApplicableMigratorException`) or newer than it knows.
     #[error("vault format {version} cannot be migrated by this version of the tool")]

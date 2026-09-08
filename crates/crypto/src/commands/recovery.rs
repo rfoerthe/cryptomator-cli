@@ -142,14 +142,23 @@ pub fn reset_password_cmd(ctx: &Ctx, args: ResetPasswordArgs) -> Result<u8> {
 /// [`cryptomator_core::recovery::restore`]), and a file that is replaced is copied to a `.bkup`
 /// first.
 ///
+/// The vault reference may name a directory that is not in `settings.json` (see
+/// [`restorable_vault`]) -- a vault that lost both key files cannot be registered, so requiring an
+/// entry would shut this command out of the case it exists for. Nothing is registered here; the
+/// hint after a successful restore says how.
+///
 /// # Errors
-/// Exit code 2 for a mode/flag combination that cannot work and for a cipher combo that can
-/// neither be given nor detected, 3 for an unknown vault, 4 for a wrong recovery key or password,
-/// 5 for a vault that is not in a restorable state (or that a daemon is serving), 1 for I/O.
+/// Exit code 2 for a mode/flag combination that cannot work, for a cipher combo that can neither
+/// be given nor detected and for one the vault contradicts, 3 for an unknown vault, 4 for a wrong
+/// recovery key or password, 5 for a vault that is not in a restorable state (or that a daemon is
+/// serving), 1 for I/O.
 pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
     // Not `locked_vault`: a vault that lost its config is VAULT_CONFIG_MISSING or ALL_MISSING --
     // exactly the states this command exists to end.
     let (vault, path) = restorable_vault(ctx, &args.vault)?;
+    // An unregistered vault has no id and no keychain entry; the hint at the end says how to give
+    // it one.
+    let registered = vault.is_some();
     // `--masterkey` writes no config, so the two settings that only describe one would be quietly
     // ignored. Saying so beats letting somebody believe they changed the vault's cipher combo.
     if args.masterkey {
@@ -186,6 +195,19 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
     let backups_before = backup_files(&path);
 
     let outcome = if args.config {
+        // `restorable_vault` admits ALL_MISSING, where there is no masterkey file to unwrap the
+        // key from -- and `restore_config` would then fail with a bare "No such file or
+        // directory". Naming the file and the mode that *can* rebuild it is the whole answer.
+        if !path.join(MASTERKEY_FILENAME).exists() {
+            return Err(AppError::InvalidValue {
+                key: "--config".to_string(),
+                message: format!(
+                    "{MASTERKEY_FILENAME} is gone too, so there is no key to sign a new \
+                     config with; use --all with the recovery key"
+                ),
+            }
+            .into());
+        }
         if args.recovery_key_stdin || args.recovery_key_file.is_some() {
             return Err(AppError::InvalidValue {
                 key: "--config".to_string(),
@@ -200,7 +222,12 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
         let passphrase = read_passphrase_with_keychain(
             &args.password,
             "Password: ",
-            || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
+            || match &vault {
+                Some(vault) => Ok(keychain_source(ctx.keychain()?.as_ref(), vault)),
+                // Keychain entries are keyed by the vault id, which an unregistered vault has not
+                // got: there is nothing to look up and nothing to store.
+                None => Ok(None),
+            },
             &mut io,
         )?;
         let config =
@@ -265,8 +292,10 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
         // Same reasoning as `password change` and `reset-password`: a stored passphrase follows the
         // new one, because a stale entry would make every later unlock fail. The masterkey file is
         // already written, so a keychain that refuses is a warning, not an exit code.
-        let keychain_updated =
-            update_keychain_entry_or_warn(ctx, &vault, &new, &args.vault, "restored");
+        let keychain_updated = match &vault {
+            Some(vault) => update_keychain_entry_or_warn(ctx, vault, &new, &args.vault, "restored"),
+            None => false,
+        };
         Restored {
             files,
             config,
@@ -283,8 +312,9 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
         .collect();
     ctx.out.emit(
         json!({
-            "vault": vault.id,
+            "vault": vault.as_ref().map(|v| v.id.clone()),
             "path": path,
+            "registered": registered,
             "restored": outcome.restored_names(),
             "cipherCombo": outcome.config.as_ref().map(|c| c.cipher_combo.as_str()),
             "shorteningThreshold": outcome.config.as_ref().map(|c| c.shortening_threshold),
@@ -293,6 +323,15 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
         }),
         || outcome.human(&path, &backups),
     )?;
+    // On stderr, so `--json` keeps a parseable stdout, and after the result, so it reads as the
+    // next step it is: the vault is whole again but still unknown to `crypto vault list`, to the
+    // keychain and to `crypto unlock`.
+    if !registered {
+        eprintln!(
+            "hint: register it with `crypto vault add {}`",
+            path.display()
+        );
+    }
     Ok(exit::OK)
 }
 

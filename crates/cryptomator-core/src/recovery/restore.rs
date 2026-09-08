@@ -58,11 +58,34 @@ impl Default for ConfigOptions {
 }
 
 impl ConfigOptions {
-    /// The combo to write: the given one, or the one detected from the vault.
+    /// The combo to write: the given one -- checked against the vault -- or the one detected from
+    /// it.
+    ///
+    /// A given combo is *not* taken on trust: a typo would write a config the vault cannot be
+    /// opened with, and nothing afterwards would say so (the old config is backed up, but the
+    /// vault is broken until somebody finds that out). So the vault is asked as well whenever it
+    /// can answer, and a disagreement is [`CoreError::CipherComboMismatch`]. The flag stays
+    /// authoritative exactly where it is the only source: a vault
+    /// [`detect_cipher_combo`] finds nothing to read the combo from -- which is what the flag
+    /// exists for.
+    ///
+    /// # Errors
+    /// [`CoreError::CipherComboMismatch`] for a given combo the vault contradicts,
+    /// [`CoreError::CipherComboUndetectable`] when none was given and none can be read, and
+    /// whatever reading the candidate file reports.
     fn combo(&self, vault_path: &Path, masterkey: &Masterkey) -> Result<CipherCombo> {
-        match self.cipher_combo {
-            Some(combo) => Ok(combo),
-            None => detect_cipher_combo(vault_path, masterkey),
+        let Some(given) = self.cipher_combo else {
+            return detect_cipher_combo(vault_path, masterkey);
+        };
+        match detect_cipher_combo(vault_path, masterkey) {
+            Ok(detected) if detected != given => {
+                Err(CoreError::CipherComboMismatch { given, detected })
+            }
+            Ok(_) => Ok(given),
+            // Nothing in the vault to check against -- or a masterkey that does not belong to it,
+            // which looks the same from here and is caught by the callers that can tell.
+            Err(CoreError::CipherComboUndetectable(_)) => Ok(given),
+            Err(other) => Err(other),
         }
     }
 }
@@ -118,21 +141,25 @@ impl RecoveryDirectory {
 
     /// Java's `moveRecoveredFile`: `Files.move(..., REPLACE_EXISTING)`.
     ///
-    /// The temp directory usually lives on another file system than the vault, where `rename`
-    /// fails with `EXDEV`; the fallback copies and then removes the source, which is the same
-    /// thing `Files.move` does internally.
+    /// The temp directory often lives on another file system than the vault (`$TMPDIR` is tmpfs on
+    /// most Linux systems), where `rename` fails with `EXDEV`; [`copy_then_rename`] then does the
+    /// same thing `Files.move` does internally -- but through a temporary file *inside the vault*,
+    /// so the file the vault already has is replaced by one `rename`, never truncated and rewritten
+    /// in place. Every other `rename` failure is returned as it came: only `EXDEV` says "try the
+    /// other way round", and a permission or read-only error must not be retried as a copy.
     ///
     /// # Errors
     /// Whatever the rename, the copy or the removal of the staged file reports.
     pub fn move_recovered_file(&self, file_name: &str) -> Result<()> {
         let from = self.path.join(file_name);
         let to = self.vault_path.join(file_name);
-        if std::fs::rename(&from, &to).is_ok() {
-            return Ok(());
+        match std::fs::rename(&from, &to) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_then_rename(&from, &to)
+            }
+            Err(e) => Err(e.into()),
         }
-        std::fs::copy(&from, &to)?;
-        std::fs::remove_file(&from)?;
-        Ok(())
     }
 }
 
@@ -147,6 +174,39 @@ impl Drop for RecoveryDirectory {
             );
         }
     }
+}
+
+/// The suffix of the in-vault staging file [`copy_then_rename`] writes.
+const RESTORE_TMP_SUFFIX: &str = ".restore-tmp";
+
+/// The cross-device half of [`RecoveryDirectory::move_recovered_file`]: copy `from` to
+/// `<to>.restore-tmp` -- which is next to `to` and therefore on `to`'s own file system -- and
+/// `rename` that over `to`.
+///
+/// A plain `fs::copy` onto `to` truncates the vault's live key file and fills it again: a crash or
+/// a full disk half way through leaves a truncated file, and `restore_if_backup_present` does not
+/// rescue that (it only replaces files that are *missing*). Through the staging file the vault
+/// either still has its old file or has the whole new one.
+///
+/// The staging file is removed again when the copy or the rename fails, so a failed restore leaves
+/// nothing behind; that removal is best effort, because the error worth reporting is the first one.
+///
+/// # Errors
+/// Whatever the copy, the rename or the removal of the source reports.
+fn copy_then_rename(from: &Path, to: &Path) -> Result<()> {
+    let mut staged = to.as_os_str().to_os_string();
+    staged.push(RESTORE_TMP_SUFFIX);
+    let staged = PathBuf::from(staged);
+    if let Err(e) = std::fs::copy(from, &staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&staged, to) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e.into());
+    }
+    std::fs::remove_file(from)?;
+    Ok(())
 }
 
 /// The first encrypted file below `d/` that a file header can be read from, or `None`.
@@ -192,34 +252,46 @@ fn first_encrypted_file(dir: &Path) -> Option<PathBuf> {
 /// Which cipher combo the vault's files were written with (`MasterkeyService.detect` plus
 /// `determineScheme`).
 ///
-/// The first candidate file below `d/` (see [`first_encrypted_file`]) is opened once per scheme
-/// and its file header decrypted; the first scheme that succeeds wins. The order is the one of
-/// Java's `CryptorProvider.Scheme.values()`, i.e. [`CipherCombo::ALL`]: `SIV_CTRMAC` before
-/// `SIV_GCM`. Like Java, only the *first* candidate is tried -- a vault whose first file is
-/// damaged is undetectable rather than searched through.
+/// The first candidate file below `d/` (see [`first_encrypted_file`]) is opened **once**, the
+/// longest header any scheme could have is read from it, and every scheme is tried on those bytes;
+/// the first that decrypts wins. The order is the one of Java's `CryptorProvider.Scheme.values()`,
+/// i.e. [`CipherCombo::ALL`]: `SIV_CTRMAC` before `SIV_GCM`. Like Java, only the *first* candidate
+/// is tried -- a vault whose first file is damaged is undetectable rather than searched through.
+///
+/// A candidate that cannot be opened or read is an I/O error, not "undetectable": the difference
+/// between "this vault says nothing about its combo" (which `--cipher-combo` answers) and "this
+/// vault could not be read" (which it does not) is one the caller has to see.
 ///
 /// # Errors
 /// [`CoreError::CipherComboUndetectable`] when there is no candidate file or neither scheme
 /// decrypts its header -- which is also what a masterkey belonging to a different vault looks
-/// like.
+/// like -- and [`CoreError::Io`] when the candidate cannot be read.
 pub fn detect_cipher_combo(vault_path: &Path, masterkey: &Masterkey) -> Result<CipherCombo> {
     let undetectable = || CoreError::CipherComboUndetectable(vault_path.to_path_buf());
     let candidate =
         first_encrypted_file(&vault_path.join(DATA_DIR_NAME)).ok_or_else(undetectable)?;
-    for combo in CipherCombo::ALL {
-        let cryptor = Cryptor::new(combo, masterkey);
+    let cryptors: Vec<_> = CipherCombo::ALL
+        .into_iter()
+        .map(|combo| (combo, Cryptor::new(combo, masterkey)))
+        .collect();
+    let longest = cryptors
+        .iter()
+        .map(|(_, cryptor)| cryptor.file_header_cryptor().header_size())
+        .fold(0usize, usize::max);
+    // Only the header is read, never the file: a candidate may be gigabytes long.
+    let mut head = Vec::with_capacity(longest);
+    std::fs::File::open(&candidate)?
+        .take(longest as u64)
+        .read_to_end(&mut head)?;
+    for (combo, cryptor) in &cryptors {
         let header_cryptor = cryptor.file_header_cryptor();
-        let mut buf = vec![0u8; header_cryptor.header_size()];
-        let Ok(mut file) = std::fs::File::open(&candidate) else {
-            break;
-        };
         // A file shorter than the header of this scheme cannot have been written by it.
-        if file.read_exact(&mut buf).is_err() {
+        let Some(header) = head.get(..header_cryptor.header_size()) else {
             continue;
-        }
-        if header_cryptor.decrypt_header(&buf).is_ok() {
+        };
+        if header_cryptor.decrypt_header(header).is_ok() {
             log::debug!("detected cipher combo {combo} from {}", candidate.display());
-            return Ok(combo);
+            return Ok(*combo);
         }
     }
     Err(undetectable())
@@ -265,7 +337,7 @@ pub fn restore_masterkey(
     rng: &mut dyn Rng,
 ) -> Result<()> {
     let raw = decode_recovery_key(encoder, recovery_key)?;
-    let masterkey = Masterkey::from_raw(*raw);
+    let masterkey = Masterkey::from_zeroizing(raw);
     let dir = RecoveryDirectory::create(vault_path)?;
     let staged = dir.path().join(MASTERKEY_FILENAME);
     access.persist(
@@ -368,7 +440,7 @@ pub fn restore_all(
     rng: &mut dyn Rng,
 ) -> Result<VaultConfig> {
     let raw = decode_recovery_key(encoder, recovery_key)?;
-    let masterkey = Masterkey::from_raw(*raw);
+    let masterkey = Masterkey::from_zeroizing(raw);
     // The detection needs the key but no written file, so it happens here -- before anything
     // touches the vault.
     let combo = options.combo(vault_path, &masterkey)?;
@@ -487,6 +559,132 @@ mod tests {
         assert!(!dir.path().join(MASTERKEY_FILENAME).exists());
     }
 
+    /// A directory on a file system other than the one `path` sits on, or `None`.
+    ///
+    /// Linux has `/dev/shm` (tmpfs) next to a disk-backed repository; on macOS `$TMPDIR` and the
+    /// working copy share one APFS volume, so there is nothing to return and the cross-device half
+    /// of the test below is skipped. [`copy_then_rename`] is still exercised there -- it is called
+    /// directly, not reached through an `EXDEV` that never happens.
+    fn dir_on_another_filesystem(path: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let here = std::fs::metadata(path).ok()?.dev();
+        ["/dev/shm", "/run/shm"]
+            .into_iter()
+            .map(Path::new)
+            .find(|candidate| {
+                std::fs::metadata(candidate).is_ok_and(|m| m.is_dir() && m.dev() != here)
+            })
+            .map(Path::to_path_buf)
+    }
+
+    #[test]
+    fn the_cross_device_fallback_replaces_the_target_and_leaves_no_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("v");
+        std::fs::create_dir(&vault).unwrap();
+        let target = vault.join(MASTERKEY_FILENAME);
+
+        let mut sources = vec![tmp.path().join("same-fs")];
+        // The branch this helper exists for: a staged file that `rename` cannot move.
+        if let Some(other) = dir_on_another_filesystem(&vault) {
+            sources.push(other.join(format!("crypto-restore-test-{}", std::process::id())));
+        }
+        for source_dir in &sources {
+            std::fs::create_dir(source_dir).unwrap();
+            let from = source_dir.join(MASTERKEY_FILENAME);
+            std::fs::write(&from, b"new").unwrap();
+            std::fs::write(&target, b"old").unwrap();
+
+            copy_then_rename(&from, &target).unwrap();
+
+            assert_eq!(std::fs::read(&target).unwrap(), b"new");
+            assert!(!from.exists(), "the staged file was not removed");
+            assert!(
+                !vault
+                    .join(format!("{MASTERKEY_FILENAME}{RESTORE_TMP_SUFFIX}"))
+                    .exists(),
+                "the in-vault staging file was left behind"
+            );
+            std::fs::remove_dir_all(source_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_rename_failure_that_is_not_cross_device_is_reported_rather_than_copied_around() {
+        // The vault directory does not exist, so the rename fails with `NotFound` -- which must
+        // reach the caller instead of being retried as a copy into the same missing directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = RecoveryDirectory::create(&tmp.path().join("gone")).unwrap();
+        std::fs::write(dir.path().join(MASTERKEY_FILENAME), b"new").unwrap();
+        match dir.move_recovered_file(MASTERKEY_FILENAME) {
+            Err(CoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected a NotFound I/O error, got {other:?}"),
+        }
+        assert!(
+            dir.path().join(MASTERKEY_FILENAME).is_file(),
+            "a failed move must leave the staged file where it was"
+        );
+    }
+
+    #[test]
+    fn an_explicit_cipher_combo_is_checked_against_the_vault() {
+        let (_tmp, vault, masterkey) = vault_with(CipherCombo::SivGcm);
+        let options = |combo| ConfigOptions {
+            cipher_combo: Some(combo),
+            ..ConfigOptions::default()
+        };
+        // The one the vault agrees with passes through …
+        assert_eq!(
+            options(CipherCombo::SivGcm)
+                .combo(&vault, &masterkey)
+                .unwrap(),
+            CipherCombo::SivGcm
+        );
+        // … and the other one is refused, naming what the vault actually holds.
+        match options(CipherCombo::SivCtrMac).combo(&vault, &masterkey) {
+            Err(CoreError::CipherComboMismatch { given, detected }) => {
+                assert_eq!(given, CipherCombo::SivCtrMac);
+                assert_eq!(detected, CipherCombo::SivGcm);
+            }
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_given_cipher_combo_stands_when_the_vault_says_nothing() {
+        let (_tmp, vault, masterkey) = vault_with(CipherCombo::SivGcm);
+        remove_regular_files(&vault, &masterkey, CipherCombo::SivGcm);
+        // Nothing to check against, so the flag is the only source -- and is taken, even for the
+        // combo the (now unreadable) vault was written with the other way round.
+        for combo in CipherCombo::ALL {
+            assert_eq!(
+                ConfigOptions {
+                    cipher_combo: Some(combo),
+                    ..ConfigOptions::default()
+                }
+                .combo(&vault, &masterkey)
+                .unwrap(),
+                combo
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_read_is_an_io_error_not_an_undetectable_combo() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, vault, masterkey) = vault_with(CipherCombo::SivGcm);
+        let candidate = first_encrypted_file(&vault.join(DATA_DIR_NAME)).expect("a candidate file");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&candidate).is_ok() {
+            return; // running as root: the mode says nothing there.
+        }
+        assert!(matches!(
+            detect_cipher_combo(&vault, &masterkey),
+            Err(CoreError::Io(_))
+        ));
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
     fn both_schemes_are_detected_from_a_vault_written_with_them() {
         for combo in CipherCombo::ALL {
@@ -499,20 +697,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_vault_without_regular_files_has_no_detectable_combo() {
-        let (_tmp, vault, masterkey) = vault_with(CipherCombo::SivGcm);
-        // Leave the root directory and its `dirid.c9r` in place and remove only the WELCOME.rtf:
-        // the detection deliberately does not read the backup file.
-        let root = crate::vault::open::root_content_dir(
-            &vault,
-            &Cryptor::new(CipherCombo::SivGcm, &masterkey),
-        );
+    /// Leaves the root directory and its `dirid.c9r` in place and removes every file the user put
+    /// into the vault -- the WELCOME.rtf, here -- so the detection has nothing to read: it
+    /// deliberately does not look at the backup file.
+    fn remove_regular_files(vault: &Path, masterkey: &Masterkey, combo: CipherCombo) {
+        let root = crate::vault::open::root_content_dir(vault, &Cryptor::new(combo, masterkey));
         for entry in std::fs::read_dir(&root).unwrap().flatten() {
             if entry.file_name() != DIR_ID_BACKUP_FILE_NAME {
                 std::fs::remove_file(entry.path()).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn a_vault_without_regular_files_has_no_detectable_combo() {
+        let (_tmp, vault, masterkey) = vault_with(CipherCombo::SivGcm);
+        remove_regular_files(&vault, &masterkey, CipherCombo::SivGcm);
         assert!(matches!(
             detect_cipher_combo(&vault, &masterkey),
             Err(CoreError::CipherComboUndetectable(path)) if path == vault
