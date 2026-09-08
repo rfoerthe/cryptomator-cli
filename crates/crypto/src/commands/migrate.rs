@@ -15,7 +15,7 @@
 //! object on stdout.
 use crate::cli::MigrateArgs;
 use crate::commands::password::update_keychain_entry_or_warn;
-use crate::commands::{keychain_source, migratable_vault, Ctx};
+use crate::commands::{backup_files, keychain_source, migratable_vault, Ctx};
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::{decompose_passphrase, read_passphrase_with_keychain, AppError, SystemIo};
@@ -24,7 +24,6 @@ use cryptomator_core::migration::{
 };
 use cryptomator_core::CoreError;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -232,17 +231,6 @@ fn stopped_at(err: anyhow::Error, path: &Path, reference: &str) -> anyhow::Error
 
 /// The `*.bkup` files directly in the vault directory. Unreadable directory: an empty set, because
 /// this only ever feeds a message -- the migration itself has long since said whether it worked.
-fn backup_files(vault_path: &Path) -> BTreeSet<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(vault_path) else {
-        return BTreeSet::new();
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "bkup"))
-        .collect()
-}
-
 /// The steps from `from` up to [`VaultVersion::LATEST`]; empty when there is nothing to do.
 ///
 /// Computed here rather than through [`migration::plan`] on purpose: naming the chain needs no

@@ -24,7 +24,7 @@ use cryptomator_app::{
     VaultInfo, VaultRegistry,
 };
 use cryptomator_core::{determine_vault_state, VaultState};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -297,10 +297,29 @@ pub fn install_interrupt() -> Result<Arc<AtomicBool>> {
     Ok(flag)
 }
 
-/// Resolves a vault reference to its settings entry and path, requiring the vault to be LOCKED --
-/// both on disk (config + masterkey present, no partial state) and at runtime (no daemon serving
-/// it, no volume a crashed daemon left behind).
-pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
+/// Resolves a vault reference to its settings entry and path and requires the vault to be in one
+/// of `allowed` on disk **and** locked at runtime.
+///
+/// The runtime half is the same for every caller and is the reason none of them is simply a state
+/// check: a vault a daemon is serving looks LOCKED on disk (its key files are untouched), but its
+/// key is live in another process and its files are open. Rewriting the masterkey underneath that
+/// daemon -- which is what `password change`, `recovery-key reset-password` and
+/// `recovery-key restore` do -- or renaming every file below it, as `migrate` does, would leave
+/// the running mount serving a vault that no longer opens. `crypto lock --force` is the way out of
+/// a stale mount.
+///
+/// The three public wrappers below differ only in `allowed`; keep them as the documented entry
+/// points, because which states a command accepts is part of what that command *is*.
+///
+/// # Errors
+/// [`AppError::VaultNotFound`] / [`AppError::AmbiguousVault`] (exit code 3) for a reference that
+/// names no vault, [`AppError::WrongState`] (5) for a state outside `allowed` and for a vault a
+/// daemon is serving.
+fn vault_in_state(
+    ctx: &Ctx,
+    reference: &str,
+    allowed: &[VaultState],
+) -> Result<(VaultSettingsJson, PathBuf)> {
     let settings = ctx.store.load()?;
     let index = resolve_vault_index(&settings, reference)?;
     let vault = settings.directories[index].clone();
@@ -309,9 +328,13 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
         message: format!("vault {} has no path", vault.id),
     })?;
     let state = determine_vault_state(&path)?;
-    if state != VaultState::Locked {
+    if !allowed.contains(&state) {
         return Err(AppError::WrongState {
-            expected: VaultState::Locked.as_str().to_string(),
+            expected: allowed
+                .iter()
+                .map(|state| state.as_str())
+                .collect::<Vec<_>>()
+                .join(" or "),
             // A vault of format 5, 6 or 7 is not broken, it is old: every command that resolves it
             // this way works once it has been migrated, so the state names the way out. The
             // reference is the one the user typed, so the hint can be pasted back into the shell.
@@ -323,46 +346,62 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
         }
         .into());
     }
-    // The state on disk is only half the answer: a vault a daemon is serving looks LOCKED there
-    // (its masterkey file is untouched), but its key is live in another process and its files are
-    // open. Rewriting the masterkey underneath that daemon -- which is what `password change` and
-    // `recovery-key reset-password` do -- would leave the running mount serving a vault whose key
-    // no longer opens it. So every command that resolves a vault this way requires it to be
-    // locked in the runtime sense too; `crypto lock --force` is the way out of a stale mount.
     ctx.registry().require_locked(&vault)?;
     Ok((vault, path))
+}
+
+/// The vault must be LOCKED -- both on disk (config + masterkey present, no partial state) and at
+/// runtime. For every command that rewrites a key file of an otherwise intact vault.
+pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
+    vault_in_state(ctx, reference, &[VaultState::Locked])
 }
 
 /// [`locked_vault`] for `crypto migrate`: `NEEDS_MIGRATION` is allowed as well, because it is the
 /// very state the command exists to end.
 ///
-/// The runtime half of [`locked_vault`] is unchanged and is the reason this is not simply a
-/// version check: a daemon serving the vault holds its files open, and the migration renames every
-/// one of them. (A daemon cannot be serving a *legacy* vault -- it could not open it -- but it can
-/// be serving a format 8 one, and that is exactly the vault this command must refuse before it
-/// reports "already at format 8".)
+/// A daemon cannot be serving a *legacy* vault -- it could not open it -- but it can be serving a
+/// format 8 one, and that is exactly the vault this command must refuse before it reports "already
+/// at format 8"; [`vault_in_state`]'s runtime check does that.
 pub fn migratable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
-    let settings = ctx.store.load()?;
-    let index = resolve_vault_index(&settings, reference)?;
-    let vault = settings.directories[index].clone();
-    let path = vault.path_buf().ok_or_else(|| AppError::InvalidValue {
-        key: "path".to_string(),
-        message: format!("vault {} has no path", vault.id),
-    })?;
-    let state = determine_vault_state(&path)?;
-    if !matches!(state, VaultState::Locked | VaultState::NeedsMigration) {
-        return Err(AppError::WrongState {
-            expected: format!(
-                "{} or {}",
-                VaultState::Locked.as_str(),
-                VaultState::NeedsMigration.as_str()
-            ),
-            actual: state.as_str().to_string(),
-        }
-        .into());
-    }
-    ctx.registry().require_locked(&vault)?;
-    Ok((vault, path))
+    vault_in_state(
+        ctx,
+        reference,
+        &[VaultState::Locked, VaultState::NeedsMigration],
+    )
+}
+
+/// [`locked_vault`] for `crypto recovery-key restore`: a vault whose `vault.cryptomator` or whose
+/// key files are gone is `VAULT_CONFIG_MISSING` or `ALL_MISSING`, and those are the states this
+/// command exists to end. (A vault that has only lost its *masterkey* file still reports LOCKED:
+/// `determine_vault_state` stops at the readable config.)
+///
+/// `MISSING` -- the directory is not there, or holds no `d/` at all -- and `NEEDS_MIGRATION` stay
+/// refused: neither has key files this command could rebuild.
+pub fn restorable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
+    vault_in_state(
+        ctx,
+        reference,
+        &[
+            VaultState::Locked,
+            VaultState::VaultConfigMissing,
+            VaultState::AllMissing,
+        ],
+    )
+}
+
+/// The `*.bkup` files sitting directly in `vault_path`, as a set that can be diffed around an
+/// operation to report the backups *this run* created. Shared by `crypto migrate` and
+/// `crypto recovery-key restore`, both of which let the core write backups without being told
+/// where they went.
+pub fn backup_files(vault_path: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(vault_path) else {
+        return std::collections::BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "bkup"))
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Recovery key handling (desktop app `ui/recoverykey/{WordEncoder,RecoveryKeyFactory}.java`).
 pub mod key;
+pub mod restore;
 pub mod words;
 
 pub use key::{

@@ -1,18 +1,23 @@
-//! `crypto recovery-key show|reset-password`
-use crate::cli::{ResetPasswordArgs, ShowArgs};
+//! `crypto recovery-key show|reset-password|restore`
+use crate::cli::{ResetPasswordArgs, RestoreArgs, ShowArgs};
 use crate::commands::password::update_keychain_entry_or_warn;
-use crate::commands::{keychain_source, locked_vault, Ctx};
+use crate::commands::{backup_files, keychain_source, locked_vault, restorable_vault, Ctx};
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::{
     min_password_length, read_new_passphrase, read_passphrase_with_keychain, read_secret_file,
     AppError, PasswordArgs, PasswordIo, SystemIo,
 };
+use cryptomator_core::constants::{MASTERKEY_FILENAME, VAULTCONFIG_FILENAME};
 use cryptomator_core::recovery::{
-    create_recovery_key, decode_recovery_key, reset_password, WordEncoder,
+    create_recovery_key, decode_recovery_key, reset_password, restore, WordEncoder,
 };
-use cryptomator_core::{open_vault, read_vault_config, MasterkeyFileAccess, OsRng, VAULT_VERSION};
+use cryptomator_core::{
+    open_vault, read_vault_config, CipherCombo, CoreError, MasterkeyFileAccess, OsRng, VaultConfig,
+    VAULT_VERSION,
+};
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
@@ -43,13 +48,24 @@ pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
     Ok(exit::OK)
 }
 
+/// The recovery key from a file or from the next line of stdin, with its whitespace normalised to
+/// single blanks (the user may have wrapped the 44 words over several lines).
+///
+/// Takes the two sources rather than a `ResetPasswordArgs`, so `recovery-key restore` -- whose
+/// argument type is a different one and whose `--config` mode has no recovery key at all -- shares
+/// the body instead of copying it. The caller decides what "neither was given" means.
 fn read_recovery_key(
-    args: &ResetPasswordArgs,
+    recovery_key_file: Option<&Path>,
+    recovery_key_stdin: bool,
     io: &mut dyn PasswordIo,
 ) -> Result<Zeroizing<String>> {
-    let raw = if let Some(file) = &args.recovery_key_file {
+    let raw = if let Some(file) = recovery_key_file {
         read_secret_file(file, "--recovery-key-file")?
     } else {
+        debug_assert!(
+            recovery_key_stdin,
+            "callers check that one of the two sources was given"
+        );
         io.read_stdin_line()?
             .map(Zeroizing::new)
             // Not a password source: name the flag that was given but delivered nothing.
@@ -68,7 +84,11 @@ pub fn reset_password_cmd(ctx: &Ctx, args: ResetPasswordArgs) -> Result<u8> {
     let unverified = read_vault_config(&path)?;
     unverified.key_id()?.require_masterkey_file()?;
     let mut io = SystemIo;
-    let recovery_key = read_recovery_key(&args, &mut io)?;
+    let recovery_key = read_recovery_key(
+        args.recovery_key_file.as_deref(),
+        args.recovery_key_stdin,
+        &mut io,
+    )?;
     let encoder = WordEncoder::new();
     // Prove the key belongs to this vault before touching the masterkey file.
     let raw = decode_recovery_key(&encoder, &recovery_key)?;
@@ -104,4 +124,313 @@ pub fn reset_password_cmd(ctx: &Ctx, args: ResetPasswordArgs) -> Result<u8> {
         },
     )?;
     Ok(exit::OK)
+}
+
+/// `crypto recovery-key restore <VAULT> (--masterkey|--config|--all)`: rebuild the key files a
+/// vault lost.
+///
+/// The three modes are the desktop app's `RecoveryActionType.RESTORE_MASTERKEY`,
+/// `RESTORE_VAULT_CONFIG` and `RESTORE_ALL`, and they differ in what they need:
+///
+/// * `--masterkey` / `--all`: the **recovery key** plus a **new** password. The recovery key *is*
+///   the masterkey, so a new masterkey file can be wrapped around it; the old password is gone
+///   with the old file.
+/// * `--config`: the **vault password**. The masterkey file is still there and unlocks the key
+///   that has to sign the new `vault.cryptomator`; no recovery key is involved.
+///
+/// Everything is validated before the vault is touched (see
+/// [`cryptomator_core::recovery::restore`]), and a file that is replaced is copied to a `.bkup`
+/// first.
+///
+/// # Errors
+/// Exit code 2 for a mode/flag combination that cannot work and for a cipher combo that can
+/// neither be given nor detected, 3 for an unknown vault, 4 for a wrong recovery key or password,
+/// 5 for a vault that is not in a restorable state (or that a daemon is serving), 1 for I/O.
+pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
+    // Not `locked_vault`: a vault that lost its config is VAULT_CONFIG_MISSING or ALL_MISSING --
+    // exactly the states this command exists to end.
+    let (vault, path) = restorable_vault(ctx, &args.vault)?;
+    // `--masterkey` writes no config, so the two settings that only describe one would be quietly
+    // ignored. Saying so beats letting somebody believe they changed the vault's cipher combo.
+    if args.masterkey {
+        for (flag, given) in [
+            ("--cipher-combo", args.cipher_combo.is_some()),
+            (
+                "--shortening-threshold",
+                args.shortening_threshold.is_some(),
+            ),
+        ] {
+            if given {
+                return Err(AppError::InvalidValue {
+                    key: flag.to_string(),
+                    message: "--masterkey rebuilds only masterkey.cryptomator, which holds \
+                              neither; use --all or --config to write a vault config"
+                        .to_string(),
+                }
+                .into());
+            }
+        }
+    }
+    let config_options = restore::ConfigOptions {
+        cipher_combo: match args.cipher_combo.as_deref() {
+            None | Some("auto") => None,
+            // clap's value_parser already limits this to the two names.
+            Some(other) => Some(other.parse::<CipherCombo>()?),
+        },
+        shortening_threshold: args
+            .shortening_threshold
+            .unwrap_or(cryptomator_core::DEFAULT_SHORTENING_THRESHOLD),
+    };
+    let mut io = SystemIo;
+    let access = MasterkeyFileAccess::new(Vec::new());
+    let backups_before = backup_files(&path);
+
+    let outcome = if args.config {
+        if args.recovery_key_stdin || args.recovery_key_file.is_some() {
+            return Err(AppError::InvalidValue {
+                key: "--config".to_string(),
+                message: "restoring only the vault config uses the vault password, not the \
+                          recovery key; drop --recovery-key-* or use --all"
+                    .to_string(),
+            }
+            .into());
+        }
+        // Lazy keychain, like every other passphrase read in this crate: a scripted
+        // `--password-stdin` run never pays for the provider probe.
+        let passphrase = read_passphrase_with_keychain(
+            &args.password,
+            "Password: ",
+            || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
+            &mut io,
+        )?;
+        let config =
+            restore::restore_config(&access, &path, &passphrase, config_options, &mut OsRng)
+                .map_err(|err| name_the_combo(err, false))?;
+        Restored {
+            files: vec![VAULTCONFIG_FILENAME],
+            config: Some(config),
+            keychain_updated: false,
+        }
+    } else {
+        if !args.recovery_key_stdin && args.recovery_key_file.is_none() {
+            return Err(AppError::InvalidValue {
+                key: "--recovery-key-stdin".to_string(),
+                message: format!(
+                    "restoring the {} needs the recovery key; pass --recovery-key-stdin or \
+                     --recovery-key-file",
+                    if args.masterkey {
+                        "masterkey file"
+                    } else {
+                        "key files"
+                    }
+                ),
+            }
+            .into());
+        }
+        let recovery_key = read_recovery_key(
+            args.recovery_key_file.as_deref(),
+            args.recovery_key_stdin,
+            &mut io,
+        )?;
+        let encoder = WordEncoder::new();
+        // Prove the key is well-formed -- and, when the vault config survived, that it belongs to
+        // *this* vault -- before a new password is even asked for.
+        let raw = decode_recovery_key(&encoder, &recovery_key)?;
+        if let Ok(unverified) = read_vault_config(&path) {
+            unverified.verify(&raw, VAULT_VERSION)?;
+        }
+        drop(raw);
+        let new = read_new_passphrase(
+            &PasswordArgs::from(&args.new_password),
+            "New password: ",
+            min_password_length(),
+            &mut io,
+        )?;
+        let (files, config) = if args.masterkey {
+            restore::restore_masterkey(&encoder, &access, &path, &recovery_key, &new, &mut OsRng)?;
+            (vec![MASTERKEY_FILENAME], None)
+        } else {
+            let config = restore::restore_all(
+                &encoder,
+                &access,
+                &path,
+                &recovery_key,
+                &new,
+                config_options,
+                &mut OsRng,
+            )
+            .map_err(|err| name_the_combo(err, true))?;
+            (vec![MASTERKEY_FILENAME, VAULTCONFIG_FILENAME], Some(config))
+        };
+        // Same reasoning as `password change` and `reset-password`: a stored passphrase follows the
+        // new one, because a stale entry would make every later unlock fail. The masterkey file is
+        // already written, so a keychain that refuses is a warning, not an exit code.
+        let keychain_updated =
+            update_keychain_entry_or_warn(ctx, &vault, &new, &args.vault, "restored");
+        Restored {
+            files,
+            config,
+            keychain_updated,
+        }
+    };
+
+    // The core writes the `.bkup` copies without reporting where they went, so the ones this run
+    // created are the difference between the two listings -- a vault that already carried a
+    // matching backup gets none, because `attempt_backup` never overwrites.
+    let backups: Vec<PathBuf> = backup_files(&path)
+        .difference(&backups_before)
+        .cloned()
+        .collect();
+    ctx.out.emit(
+        json!({
+            "vault": vault.id,
+            "path": path,
+            "restored": outcome.restored_names(),
+            "cipherCombo": outcome.config.as_ref().map(|c| c.cipher_combo.as_str()),
+            "shorteningThreshold": outcome.config.as_ref().map(|c| c.shortening_threshold),
+            "backups": backups,
+            "keychainUpdated": outcome.keychain_updated,
+        }),
+        || outcome.human(&path, &backups),
+    )?;
+    Ok(exit::OK)
+}
+
+/// What a restore did, for the two renderings below.
+struct Restored {
+    /// The file names that were written, in the order they were written in.
+    files: Vec<&'static str>,
+    /// The config that was written, if one was.
+    config: Option<VaultConfig>,
+    keychain_updated: bool,
+}
+
+impl Restored {
+    /// The short names of the JSON `restored` array: `masterkey`, `config`.
+    fn restored_names(&self) -> Vec<&'static str> {
+        self.files
+            .iter()
+            .map(|file| {
+                if *file == MASTERKEY_FILENAME {
+                    "masterkey"
+                } else {
+                    "config"
+                }
+            })
+            .collect()
+    }
+
+    fn human(&self, path: &Path, backups: &[PathBuf]) -> String {
+        let files = match self.files.as_slice() {
+            [one] => (*one).to_string(),
+            other => other.join(" and "),
+        };
+        let mut lines = vec![match &self.config {
+            Some(config) => format!(
+                "Restored {files} in {} ({}, shortening threshold {})",
+                path.display(),
+                config.cipher_combo,
+                config.shortening_threshold
+            ),
+            None => format!("Restored {files} in {}", path.display()),
+        }];
+        if !backups.is_empty() {
+            lines.push("The previous files were kept as:".to_string());
+            lines.extend(backups.iter().map(|b| format!("  {}", b.display())));
+        }
+        if self.keychain_updated {
+            lines.push("The stored password in the keychain was updated.".to_string());
+        }
+        lines.join("\n")
+    }
+}
+
+/// Turns [`CoreError::CipherComboUndetectable`] into a usage error naming `--cipher-combo`.
+///
+/// The vault is not broken and the command is not wrong: there is simply nothing in it the combo
+/// could be read from, and only the user knows which one the vault was created with. `from_key`
+/// says whether the masterkey came from a recovery key, in which case a key belonging to a
+/// *different* vault looks exactly the same from here and is worth naming.
+fn name_the_combo(err: CoreError, from_key: bool) -> anyhow::Error {
+    let CoreError::CipherComboUndetectable(_) = &err else {
+        return err.into();
+    };
+    let mut message =
+        "the vault holds no encrypted file the cipher combo could be read from; pass \
+         --cipher-combo SIV_GCM or --cipher-combo SIV_CTRMAC (vaults created since 2021 use \
+         SIV_GCM)"
+            .to_string();
+    if from_key {
+        message.push_str(" -- or the recovery key does not belong to this vault");
+    }
+    AppError::InvalidValue {
+        key: "--cipher-combo".to_string(),
+        message,
+    }
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(combo: CipherCombo) -> VaultConfig {
+        VaultConfig::create_new(combo, 220)
+    }
+
+    #[test]
+    fn the_human_line_names_the_files_the_combo_and_the_backups() {
+        let restored = Restored {
+            files: vec![MASTERKEY_FILENAME, VAULTCONFIG_FILENAME],
+            config: Some(config(CipherCombo::SivGcm)),
+            keychain_updated: true,
+        };
+        let text = restored.human(
+            Path::new("/vaults/v"),
+            &[PathBuf::from("/vaults/v/vault.cryptomator.ABCD1234.bkup")],
+        );
+        assert_eq!(
+            text,
+            "Restored masterkey.cryptomator and vault.cryptomator in /vaults/v (SIV_GCM, \
+             shortening threshold 220)\nThe previous files were kept as:\n  \
+             /vaults/v/vault.cryptomator.ABCD1234.bkup\nThe stored password in the keychain was \
+             updated."
+        );
+        assert_eq!(restored.restored_names(), ["masterkey", "config"]);
+    }
+
+    #[test]
+    fn a_masterkey_only_restore_names_no_combo() {
+        let restored = Restored {
+            files: vec![MASTERKEY_FILENAME],
+            config: None,
+            keychain_updated: false,
+        };
+        assert_eq!(
+            restored.human(Path::new("/vaults/v"), &[]),
+            "Restored masterkey.cryptomator in /vaults/v"
+        );
+        assert_eq!(restored.restored_names(), ["masterkey"]);
+    }
+
+    #[test]
+    fn an_undetectable_combo_becomes_a_usage_error_naming_the_flag() {
+        let err = name_the_combo(
+            CoreError::CipherComboUndetectable(PathBuf::from("/vaults/v")),
+            true,
+        );
+        let app = err.downcast_ref::<AppError>().expect("an AppError");
+        assert!(matches!(app, AppError::InvalidValue { key, .. } if key == "--cipher-combo"));
+        assert_eq!(crate::exit::code_for(&err), crate::exit::USAGE);
+        assert!(err.to_string().contains("does not belong to this vault"));
+        // Without a recovery key that half of the message is left out …
+        let err = name_the_combo(
+            CoreError::CipherComboUndetectable(PathBuf::from("/vaults/v")),
+            false,
+        );
+        assert!(!err.to_string().contains("does not belong"));
+        // … and every other error passes through untouched, keeping its own exit code.
+        let err = name_the_combo(CoreError::InvalidPassphrase, true);
+        assert_eq!(crate::exit::code_for(&err), crate::exit::INVALID_PASSPHRASE);
+    }
 }

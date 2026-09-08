@@ -219,6 +219,87 @@ fn java_reads_a_legacy_vault_migrated_by_crypto() {
     );
 }
 
+/// A vault whose `masterkey.cryptomator` **and** `vault.cryptomator` were rebuilt by
+/// `crypto recovery-key restore --all` must still be a vault cryptofs 2.10.0 opens: the restored
+/// config is a freshly signed JWT (new `jti`) and the restored masterkey file a freshly wrapped
+/// key, so a mistake in either -- a wrong cipher combo detected, a wrong `kid`, a threshold the
+/// files do not match -- shows up here and nowhere else. The fixture is read-only, so the restore
+/// runs on a copy.
+#[test]
+#[ignore = "needs Java + Maven; run with --ignored"]
+fn java_reads_a_vault_restored_by_crypto() {
+    const OLD_PW: &str = "test-password-123";
+    const NEW_PW: &str = "restored-by-crypto-1";
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("siv_gcm_basic");
+    let fixture = repo_root().join("tests/fixtures/siv_gcm_basic");
+    copy_dir(&fixture, &vault);
+    let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("expected.json")).unwrap()).unwrap();
+    let settings = dir.path().join("settings.json");
+    let crypto = || {
+        let mut cmd = Command::cargo_bin("crypto").unwrap();
+        cmd.env_remove("CRYPTO_PASSWORD")
+            .env_remove("CRYPTO_MIN_PW_LENGTH")
+            .env_remove("CRYPTO_SETTINGS_PATH");
+        cmd.arg("--settings").arg(&settings);
+        cmd
+    };
+    crypto()
+        .args(["vault", "add", "--name", "siv_gcm_basic"])
+        .arg(&vault)
+        .assert()
+        .success();
+    let key = crypto()
+        .env("PW", OLD_PW)
+        .args([
+            "recovery-key",
+            "show",
+            "siv_gcm_basic",
+            "--password-env",
+            "PW",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let key = String::from_utf8(key).unwrap();
+
+    // Both key files (and every backup that would resurrect them) go away first, so the restore
+    // has to rebuild them from the recovery key alone -- including the cipher combo, which is read
+    // out of the ciphertext.
+    for name in ["masterkey.cryptomator", "vault.cryptomator"] {
+        std::fs::remove_file(vault.join(name)).unwrap();
+    }
+    for entry in std::fs::read_dir(&vault).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".bkup") {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    crypto()
+        .env("NP", NEW_PW)
+        .args([
+            "recovery-key",
+            "restore",
+            "siv_gcm_basic",
+            "--all",
+            "--recovery-key-stdin",
+            "--new-password-env",
+            "NP",
+        ])
+        .write_stdin(key)
+        .assert()
+        .success();
+
+    let manifest = verify_with_java(&vault, NEW_PW);
+    assert_eq!(
+        manifest, expected,
+        "cryptofs sees a different tree than expected.json after the restore"
+    );
+    assert_java_rejects(&vault, OLD_PW);
+}
+
 /// A tree written by `CryptoFs` (long names, unicode, sizes at chunk boundaries, symlinks, nesting)
 /// is read by the real cryptofs; the Java manifest equals `crypto fs tree --json --hash`.
 #[test]

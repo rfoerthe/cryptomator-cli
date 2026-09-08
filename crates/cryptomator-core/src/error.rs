@@ -52,6 +52,11 @@ pub enum CoreError {
         needed: usize,
         allowed: usize,
     },
+    /// `MasterkeyService.detect` found nothing to read the cipher combo from: the vault holds no
+    /// encrypted file whose header decrypts with either scheme (or no candidate file at all).
+    /// The caller has to be told which combo to use instead of guessing one.
+    #[error("cannot detect the cipher combo of {0}: no encrypted file it could be read from")]
+    CipherComboUndetectable(std::path::PathBuf),
     /// A vault format outside 5..=8: either older than any migrator this tool has
     /// (`NoApplicableMigratorException`) or newer than it knows.
     #[error("vault format {version} cannot be migrated by this version of the tool")]

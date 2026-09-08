@@ -106,6 +106,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             RecoveryKeyCommand::ResetPassword(args) => {
                 commands::recovery::reset_password_cmd(&ctx, args)
             }
+            RecoveryKeyCommand::Restore(args) => commands::recovery::restore(&ctx, args),
             RecoveryKeyCommand::Validate(args) => {
                 debug_assert!(args.recovery_key_stdin);
                 // The recovery key is key material: keep it in a buffer that is wiped on drop and

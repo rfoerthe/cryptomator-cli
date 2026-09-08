@@ -452,6 +452,8 @@ pub enum RecoveryKeyCommand {
     ResetPassword(ResetPasswordArgs),
     /// Check whether a recovery key is well-formed (dictionary words, length, checksum)
     Validate(ValidateArgs),
+    /// Rebuild a lost masterkey.cryptomator, vault.cryptomator or both
+    Restore(RestoreArgs),
 }
 
 #[derive(Args, Debug)]
@@ -479,6 +481,48 @@ pub struct ResetPasswordArgs {
     /// Read the recovery key from a file
     #[arg(long, value_name = "FILE", group = "recovery-key-source")]
     pub recovery_key_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub new_password: NewPasswordArgs,
+}
+
+// Two groups: exactly one of --masterkey/--config/--all (required), and at most one recovery key
+// source (optional here, because --config takes the vault password instead; the command itself
+// reports the missing or the surplus one with a message that says why).
+#[derive(Args, Debug)]
+#[command(group = clap::ArgGroup::new("restore-what").required(true))]
+pub struct RestoreArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Recreate masterkey.cryptomator from the recovery key and a new password
+    #[arg(long, group = "restore-what")]
+    pub masterkey: bool,
+    /// Recreate vault.cryptomator from the existing masterkey file and the vault password
+    #[arg(long, group = "restore-what")]
+    pub config: bool,
+    /// Recreate both files from the recovery key and a new password
+    #[arg(long, group = "restore-what")]
+    pub all: bool,
+    // The two config settings are `Option`s without a clap default, so the command can tell "not
+    // given" from "given the default" and refuse them for `--masterkey`, which writes no config
+    // and would otherwise ignore them without a word. The defaults are applied in the command.
+    /// Cipher combo of the new vault config; default: read it from the first encrypted file
+    /// (--config and --all only)
+    #[arg(long, value_name = "COMBO", value_parser = ["auto", "SIV_GCM", "SIV_CTRMAC"])]
+    pub cipher_combo: Option<String>,
+    /// Shortening threshold to write into the new vault config, 36-220 (--config and --all only)
+    /// [default: 220]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(36..=220))]
+    pub shortening_threshold: Option<u32>,
+    /// Read the recovery key from the next line of standard input
+    #[arg(long, group = "restore-recovery-key-source")]
+    pub recovery_key_stdin: bool,
+    /// Read the recovery key from a file
+    #[arg(long, value_name = "FILE", group = "restore-recovery-key-source")]
+    pub recovery_key_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub password: PasswordArgs,
     #[command(flatten)]
     pub new_password: NewPasswordArgs,
 }

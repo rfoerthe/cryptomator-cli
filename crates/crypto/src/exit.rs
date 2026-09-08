@@ -36,7 +36,10 @@ fn core_code(err: &CoreError) -> u8 {
         // The vault is the way it is and cannot be migrated: a state error, not a usage error.
         | CoreError::MigrationBlocked(_)
         | CoreError::UnsupportedVaultVersion { .. } => WRONG_STATE,
-        CoreError::InvalidArgument(_) => USAGE,
+        // Not a broken vault: the tool simply cannot work the cipher combo out from what is
+        // there, and the user has to name it with `--cipher-combo`. The restore command turns
+        // this into an `InvalidValue` naming that flag; this arm is the fallback.
+        CoreError::InvalidArgument(_) | CoreError::CipherComboUndetectable(_) => USAGE,
         CoreError::InvalidMasterkeyFile(_)
         | CoreError::VaultConfigLoad(_)
         | CoreError::UnsupportedKeyId(_)
