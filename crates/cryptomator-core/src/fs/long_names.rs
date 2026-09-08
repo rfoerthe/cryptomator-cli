@@ -30,16 +30,25 @@ pub fn is_deflated(name: &str) -> bool {
     name.ends_with(DEFLATED_FILE_SUFFIX)
 }
 
+/// The deflated *name* of a long file name: `BASE64URL(SHA1(longName)).c9s`.
+///
+/// The arithmetic of [`deflate`] on a bare name, so that the `shortened` health check
+/// ([`crate::health::shortened::deflate_name`]) can compute the expected `.c9s` directory name of a
+/// `name.c9s` content without building a path first — and without a second BASE64/SHA-1 site.
+pub(crate) fn deflate_str(long_name: &str) -> String {
+    format!(
+        "{}{DEFLATED_FILE_SUFFIX}",
+        BASE64URL.encode(&Sha1::digest(long_name.as_bytes()))
+    )
+}
+
 /// `LongFileNameProvider.deflate`: `<parent>/<BASE64URL(SHA1(longName))>.c9s`.
 pub fn deflate(c9r_path: &Path) -> DeflatedFileName {
     let long_name = c9r_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let short_name = format!(
-        "{}{DEFLATED_FILE_SUFFIX}",
-        BASE64URL.encode(&Sha1::digest(long_name.as_bytes()))
-    );
+    let short_name = deflate_str(&long_name);
     DeflatedFileName {
         c9s_path: c9r_path.with_file_name(short_name),
         long_name,

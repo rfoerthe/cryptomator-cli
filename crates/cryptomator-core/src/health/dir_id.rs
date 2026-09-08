@@ -15,7 +15,7 @@
 //!   `HealthyDir`/`MissingContentDir`); we print `-`, which reads better than Rust's `None`.
 //!
 //! The traversal itself is `std::fs` only and never writes; only a [`Fix`] touches the vault.
-use super::{CheckContext, DiagnosticResult, Fix, HealthCheck, Severity};
+use super::{at, CheckContext, DiagnosticResult, Fix, HealthCheck, Severity, VisitError};
 use crate::constants::{
     CRYPTOMATOR_FILE_SUFFIX, DATA_DIR_NAME, DEFLATED_FILE_SUFFIX, DIR_FILE_NAME,
     DIR_ID_BACKUP_FILE_NAME, MAX_DIR_ID_LENGTH,
@@ -56,7 +56,11 @@ impl HealthCheck for DirIdCheck {
         // Java lets any IOException escape `walkFileTree` and turns it into a single `CheckFailed`;
         // a half-traversed vault would produce phantom `MissingContentDir`s, so we abort as well.
         if let Err(e) = visitor.walk(ctx, &data_dir, &data_dir, 0, sink) {
-            sink(check_failed(&ctx.relativize(&e.path), &e.error));
+            sink(super::check_failed(
+                DIR_ID_CHECK_ID,
+                &ctx.relativize(&e.path),
+                &e.error,
+            ));
             return;
         }
         let DirVisitor {
@@ -97,27 +101,6 @@ fn content_dir_name(cryptor: &Cryptor, dir_id: &str) -> PathBuf {
     let hash = cryptor.file_name_cryptor().hash_directory_id(dir_id);
     let (prefix, rest) = hash.split_at(2);
     Path::new(prefix).join(rest)
-}
-
-/// An I/O error paired with the node that was being visited when it happened.
-///
-/// Java's `newDirectoryStream` throws a `FileSystemException` that names the file and `DirIdCheck`
-/// logs it; we have no log, so the path travels with the error up to the single `CheckFailed` the
-/// aborted traversal produces. Without it one unreadable node anywhere below `d/` would yield
-/// nothing but "Permission denied" -- nothing a repair could act on.
-#[derive(Debug)]
-struct VisitError {
-    /// Absolute; the reporting side relativizes it.
-    path: PathBuf,
-    error: io::Error,
-}
-
-/// `Err(error)` at `path`, for `map_err`.
-fn at(path: &Path) -> impl FnOnce(io::Error) -> VisitError + '_ {
-    move |error| VisitError {
-        path: path.to_path_buf(),
-        error,
-    }
 }
 
 /// What the sibling loop does after a `dir.c9r` was visited (Java's `FileVisitResult`).
@@ -381,20 +364,6 @@ fn orphan_content_dir(content_dir: &Path) -> DiagnosticResult {
     .with_fix(Box::new(crate::health::orphan::AdoptOrphan {
         content_dir: content_dir.to_path_buf(),
     }))
-}
-
-/// `CheckFailed`: the traversal itself broke. Java logs the cause and prints only a hint at the
-/// log; a CLI has no log to point at, so the error text goes into the message.
-fn check_failed(data_dir: &Path, error: &io::Error) -> DiagnosticResult {
-    result(
-        "CheckFailed",
-        Severity::Critical,
-        format!(
-            "Check failed: Traversal of data dir failed: {} ({error})",
-            data_dir.display()
-        ),
-        vec![data_dir.to_path_buf()],
-    )
 }
 
 /// `LooseDirFile.fix`: `Files.deleteIfExists`.

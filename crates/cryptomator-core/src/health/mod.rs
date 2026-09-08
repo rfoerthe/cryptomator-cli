@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod dir_id;
+pub mod file_type;
 pub mod orphan;
+pub mod shortened;
 
 /// The ids of all checks, in the order they run and are reported.
 pub const CHECK_IDS: [&str; 3] = ["dirid", "type", "shortened"];
@@ -199,16 +201,8 @@ impl CheckContext {
 pub fn all_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         Box::new(dir_id::DirIdCheck),
-        // Task 6 replaces this with the real `CiphertextFileTypeCheck`.
-        Box::new(Placeholder {
-            id: "type",
-            name: "Resource Type Check",
-        }),
-        // Task 6 replaces this with the real `ShortenedNamesCheck`.
-        Box::new(Placeholder {
-            id: "shortened",
-            name: "Shortened Names Check",
-        }),
+        Box::new(file_type::CiphertextFileTypeCheck),
+        Box::new(shortened::ShortenedNamesCheck),
     ]
 }
 
@@ -270,24 +264,93 @@ fn unknown_check(id: &str) -> CoreError {
     ))
 }
 
-/// Only until Task 6 lands: a check that reports nothing, so the catalogue, `run_checks`,
-/// `--check` and the report can be built and tested before the real traversals exist.
+// ------------------------------------------------------------------------------------------------
+// Traversal bits shared by all three checks.
+// ------------------------------------------------------------------------------------------------
+
+/// An I/O error paired with the node that was being visited when it happened.
+///
+/// Java's `walkFileTree` throws a `FileSystemException` that names the file and the checks log it;
+/// we have no log, so the path travels with the error up to the single [`check_failed`] result the
+/// aborted traversal produces. Without it one unreadable node anywhere below `d/` would yield
+/// nothing but "Permission denied" — nothing a repair could act on.
 #[derive(Debug)]
-struct Placeholder {
-    id: &'static str,
-    name: &'static str,
+pub(crate) struct VisitError {
+    /// Absolute; the reporting side relativizes it.
+    pub path: PathBuf,
+    pub error: io::Error,
 }
 
-impl HealthCheck for Placeholder {
-    fn id(&self) -> &'static str {
-        self.id
-    }
+/// The result of one visited node. Spelled out because this module's `Result` is
+/// [`crate::error::Result`].
+pub(crate) type VisitResult = std::result::Result<(), VisitError>;
 
-    fn name(&self) -> &'static str {
-        self.name
+/// `Err(error)` at `path`, for `map_err`.
+pub(crate) fn at(path: &Path) -> impl FnOnce(io::Error) -> VisitError + '_ {
+    move |error| VisitError {
+        path: path.to_path_buf(),
+        error,
     }
+}
 
-    fn run(&self, _ctx: &CheckContext, _sink: &mut dyn FnMut(DiagnosticResult)) {}
+/// `CheckFailed`: the traversal itself broke. Java logs the cause and prints only a hint at the
+/// log; a CLI has no log to point at, so the error text goes into the message.
+pub(crate) fn check_failed(
+    check: &'static str,
+    path: &Path,
+    error: &io::Error,
+) -> DiagnosticResult {
+    DiagnosticResult::new(
+        check,
+        "CheckFailed",
+        Severity::Critical,
+        format!(
+            "Check failed: Traversal of data dir failed: {} ({error})",
+            path.display()
+        ),
+        vec![path.to_path_buf()],
+    )
+}
+
+/// `Files.walkFileTree(dataDir, Set.of(), max_depth, visitor)`, reduced to what the `type` and the
+/// `shortened` check need: `visit` is called for every entry at exactly `max_depth` that is a
+/// directory.
+///
+/// That is not a shortcut but the same set of nodes Java sees: a directory *below* the maximum depth
+/// reaches `preVisitDirectory` (which neither visitor overrides) and only one at the maximum depth
+/// reaches `visitFile`; regular files reach `visitFile` at every depth but are dropped by both
+/// visitors' `attrs.isDirectory()` guard.
+///
+/// Entries are sorted by name so that the same vault always produces the same report; Java takes the
+/// order of the directory stream. Symlinks are never followed (`walkFileTree` without
+/// `FOLLOW_LINKS`), so a symlinked directory is a "file" and is skipped.
+pub(crate) fn walk_leaf_dirs(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    visit: &mut dyn FnMut(&Path) -> VisitResult,
+) -> VisitResult {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(at(dir))? {
+        let entry = entry.map_err(at(dir))?;
+        let file_type = entry
+            .file_type()
+            .map_err(at(&dir.join(entry.file_name())))?;
+        entries.push((entry.file_name(), file_type));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, file_type) in entries {
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = dir.join(&name);
+        if depth + 1 < max_depth {
+            walk_leaf_dirs(&path, depth + 1, max_depth, visit)?;
+        } else {
+            visit(&path)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -381,11 +444,23 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholders_report_nothing() {
+    fn every_check_turns_an_unreadable_vault_into_one_check_failed() {
+        // `/vault` does not exist, so all three traversals fail at their first `read_dir`. Each
+        // check reports that once and stops, instead of returning an error or panicking.
         let mut seen = 0;
-        let results = run_checks(&["type", "shortened"], &ctx(), &mut |_| seen += 1).unwrap();
-        assert!(results.is_empty());
-        assert_eq!(seen, 0);
+        let results = run_checks(&CHECK_IDS, &ctx(), &mut |_| seen += 1).unwrap();
+        assert_eq!(seen, CHECK_IDS.len());
+        assert_eq!(results.len(), CHECK_IDS.len(), "{results:#?}");
+        let checks: Vec<&str> = results.iter().map(|r| r.check).collect();
+        for id in CHECK_IDS {
+            assert!(checks.contains(&id), "{results:#?}");
+        }
+        assert!(
+            results
+                .iter()
+                .all(|r| r.kind == "CheckFailed" && r.severity == Severity::Critical),
+            "{results:#?}"
+        );
     }
 
     #[test]

@@ -123,11 +123,11 @@ fn a_check_context_is_built_from_the_unlocked_broken_fixture() {
     let root = cryptomator_core::root_content_dir(&ctx.vault_path, &ctx.cryptor);
     assert!(root.is_dir(), "{} is missing", root.display());
 
-    // `type` and `shortened` are still placeholders and report nothing (Task 6); `dirid` is real
-    // and has its own tests below.
-    let findings = cryptomator_core::run_checks(&["type", "shortened"], &ctx, &mut |_| {})
+    // Every check of the catalogue runs against this context; the findings are asserted one by one
+    // further down.
+    let findings = cryptomator_core::run_checks(&cryptomator_core::CHECK_IDS, &ctx, &mut |_| {})
         .expect("the catalogue ids are known");
-    assert!(findings.is_empty(), "{findings:#?}");
+    assert!(!findings.is_empty(), "{findings:#?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -183,13 +183,11 @@ fn slashed(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// The manifest's `dirid` entries, folded to `kind -> (count, severity)`.
-fn expected_dirid() -> BTreeMap<String, (usize, String)> {
+/// The manifest's entries for one check, folded to `kind -> (count, severity)`. The manifest is the
+/// authority for every count in here — never a literal `1` in a test.
+fn expected_for(check: &str) -> BTreeMap<String, (usize, String)> {
     let mut expected: BTreeMap<String, (usize, String)> = BTreeMap::new();
-    for finding in expected_findings()
-        .into_iter()
-        .filter(|f| f.check == "dirid")
-    {
+    for finding in expected_findings().into_iter().filter(|f| f.check == check) {
         let entry = expected
             .entry(finding.result.clone())
             .or_insert((0, finding.severity.clone()));
@@ -239,7 +237,7 @@ fn the_dirid_check_finds_exactly_the_manifest_findings() {
     let results = dirid(&ctx);
     assert!(results.iter().all(|r| r.check == "dirid"), "{results:#?}");
 
-    let expected = expected_dirid();
+    let expected = expected_for("dirid");
     assert_eq!(expected.len(), 5, "{expected:#?}");
     let found = by_kind(&results);
     for (kind, (count, severity)) in &expected {
@@ -464,7 +462,7 @@ fn the_orphan_adoption_builds_lost_and_found_the_way_java_does() {
     let generated = names
         .iter()
         .find(|n| n.starts_with("file"))
-        .expect("the undecryptable node was renamed: {adopted:#?}");
+        .unwrap_or_else(|| panic!("the undecryptable node was renamed: {adopted:#?}"));
     assert!(generated.contains("_withVeryLongName"), "{generated}");
 
     // Its ciphertext is a `.c9s` directory again, with a `name.c9s` holding the full name. The
@@ -508,4 +506,286 @@ fn the_orphan_adoption_builds_lost_and_found_the_way_java_does() {
         long_name.len()
     );
     assert!(shortened[0].join("contents.c9r").is_file(), "content moved");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 6: the `type` and `shortened` checks against the damaged fixture.
+// ---------------------------------------------------------------------------------------------
+
+use cryptomator_core::health::shortened::deflate_name;
+
+fn run(ctx: &CheckContext, id: &str) -> Vec<DiagnosticResult> {
+    cryptomator_core::run_checks(&[id], ctx, &mut |_| {}).expect("a known check")
+}
+
+/// Asserts that `results` carries exactly the manifest's findings for `check` — every listed kind
+/// with its count and its severity, and nothing beyond them that is not `GOOD`.
+fn assert_matches_manifest(check: &str, results: &[DiagnosticResult]) {
+    assert!(results.iter().all(|r| r.check == check), "{results:#?}");
+    let expected = expected_for(check);
+    assert!(
+        !expected.is_empty(),
+        "the manifest lists nothing for {check}"
+    );
+    let found = by_kind(results);
+    for (kind, (count, severity)) in &expected {
+        assert_eq!(
+            found.get(kind.as_str()).copied().unwrap_or(0),
+            *count,
+            "{kind}: {results:#?}"
+        );
+        for result in results.iter().filter(|r| r.kind == kind.as_str()) {
+            assert_eq!(result.severity.as_str(), severity, "{kind}");
+        }
+    }
+    for result in results {
+        assert!(
+            expected.contains_key(result.kind) || result.severity == Severity::Good,
+            "unexpected finding: {result:#?}"
+        );
+    }
+    assert!(
+        results
+            .iter()
+            .flat_map(|r| &r.paths)
+            .all(|p| p.is_relative() && p.starts_with("d")),
+        "{results:#?}"
+    );
+}
+
+/// Applies every fix and reports which ones refused. `UnknownType` on a non-empty node is expected
+/// to refuse, so the fix-all test cannot simply `expect` its way through the report.
+fn apply_fixes_reporting_failures(
+    ctx: &CheckContext,
+    results: &[DiagnosticResult],
+) -> Vec<(&'static str, String)> {
+    let mut failures = Vec::new();
+    for result in results {
+        if let Some(fix) = &result.fix {
+            if let Err(e) = fix.apply(ctx) {
+                failures.push((result.kind, e.to_string()));
+            }
+        }
+    }
+    failures
+}
+
+#[test]
+fn the_type_check_finds_exactly_the_manifest_findings() {
+    let (_tmp, _vault, ctx) = context("broken_health");
+    let results = run(&ctx, "type");
+    assert_matches_manifest("type", &results);
+
+    // The intact nodes of the fixture are all of a determined type.
+    let known = count_kind(&results, "KnownType");
+    assert!(known >= 5, "{results:#?}");
+    assert_eq!(known + count_kind(&results, "UnknownType"), results.len());
+    for result in results.iter().filter(|r| r.kind == "KnownType") {
+        assert!(
+            ["DIRECTORY.", "SYMLINK.", "FILE."]
+                .iter()
+                .any(|suffix| result.message.ends_with(suffix)),
+            "{}",
+            result.message
+        );
+        assert!(!result.fixable(), "a good node has nothing to repair");
+    }
+    // The one damaged node is named verbatim, and only it is fixable.
+    let unknown = results
+        .iter()
+        .find(|r| r.kind == "UnknownType")
+        .expect("the manifest lists an UnknownType");
+    assert_eq!(
+        slashed(&unknown.paths[0]),
+        expected_findings()
+            .into_iter()
+            .find(|f| f.result == "UnknownType")
+            .expect("in the manifest")
+            .path
+    );
+    assert!(unknown.fixable());
+}
+
+#[test]
+fn the_shortened_check_finds_exactly_the_manifest_findings() {
+    let (_tmp, _vault, ctx) = context("broken_health");
+    let results = run(&ctx, "shortened");
+    assert_matches_manifest("shortened", &results);
+
+    // The fixture carries one intact `.c9s` node for contrast.
+    assert_eq!(
+        count_kind(&results, "ValidShortenedFile"),
+        1,
+        "{results:#?}"
+    );
+    // Only the two WARN findings can be repaired; `MissingLongName` has no fix in Java either.
+    for result in &results {
+        assert_eq!(
+            result.fixable(),
+            matches!(
+                result.kind,
+                "TrailingBytesInNameFile" | "LongShortNamesMismatch"
+            ),
+            "{result:#?}"
+        );
+    }
+    // Each of the three damaged nodes is named verbatim.
+    for finding in expected_findings()
+        .into_iter()
+        .filter(|f| f.check == "shortened")
+    {
+        assert!(
+            results
+                .iter()
+                .filter(|r| r.kind == finding.result)
+                .any(|r| r.paths.iter().any(|p| slashed(p) == finding.path)),
+            "{} does not name {}: {results:#?}",
+            finding.result,
+            finding.path
+        );
+    }
+}
+
+#[test]
+fn the_type_and_shortened_fixes_repair_what_they_can() {
+    let (_tmp, vault, ctx) = context("broken_health");
+    let root = cryptomator_core::root_content_dir(&vault, &ctx.cryptor);
+
+    // The name the mismatched `.c9s` directory should have, straight from its own `name.c9s`.
+    let mismatch = run(&ctx, "shortened")
+        .into_iter()
+        .find(|r| r.kind == "LongShortNamesMismatch")
+        .expect("the fixture carries a mismatch");
+    let mismatch_dir = ctx.resolve(&mismatch.paths[0]);
+    let long_name = std::fs::read_to_string(mismatch_dir.join("name.c9s")).expect("a name file");
+    let expected_short_name = deflate_name(&long_name);
+    assert!(
+        !root.join(&expected_short_name).exists(),
+        "the expected name is free, so the fix is a real rename"
+    );
+
+    let before: Vec<DiagnosticResult> = ["type", "shortened"]
+        .iter()
+        .flat_map(|id| run(&ctx, id))
+        .collect();
+    let failures = apply_fixes_reporting_failures(&ctx, &before);
+    // `UnknownType.fix` is Java's `Files.delete`, which refuses a non-empty directory — and the
+    // fixture's unknown node holds a file (an empty directory does not survive git).
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert_eq!(failures[0].0, "UnknownType");
+
+    let after: Vec<DiagnosticResult> = ["type", "shortened"]
+        .iter()
+        .flat_map(|id| run(&ctx, id))
+        .collect();
+    assert_eq!(
+        count_kind(&after, "TrailingBytesInNameFile"),
+        0,
+        "the trailing bytes were cut: {after:#?}"
+    );
+    assert_eq!(
+        count_kind(&after, "LongShortNamesMismatch"),
+        0,
+        "the c9s dir was renamed: {after:#?}"
+    );
+    // Both repaired nodes are valid shortened resources now — one more than before.
+    assert_eq!(count_kind(&after, "ValidShortenedFile"), 3, "{after:#?}");
+    assert_eq!(
+        count_kind(&after, "MissingLongName"),
+        1,
+        "MissingLongName has no fix: {after:#?}"
+    );
+    assert_eq!(
+        count_kind(&after, "UnknownType"),
+        1,
+        "a non-empty node of unknown type is never deleted: {after:#?}"
+    );
+
+    // The rename really happened, and it is the name the long name deflates to.
+    assert!(!mismatch_dir.exists(), "the old name is gone");
+    let renamed = root.join(&expected_short_name);
+    assert!(
+        renamed.join("contents.c9r").is_file(),
+        "content moved along"
+    );
+    assert_eq!(
+        std::fs::read_to_string(renamed.join("name.c9s")).unwrap(),
+        long_name
+    );
+
+    // A second round changes nothing: the fixes are idempotent and the report has settled.
+    let failures = apply_fixes_reporting_failures(&ctx, &after);
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    let settled: Vec<DiagnosticResult> = ["type", "shortened"]
+        .iter()
+        .flat_map(|id| run(&ctx, id))
+        .collect();
+    assert_eq!(by_kind(&settled), by_kind(&after));
+
+    // The repaired vault opens and lists both repaired files under their real cleartext names.
+    let fs = CryptoFs::open(unlock(&vault), CryptoFsOptions::default());
+    let entries = fs.read_dir(&CleartextPath::root()).expect("the root lists");
+    let names = names_of(&entries);
+    // Damage 7 pointed the `name.c9s` at a synthetic name, so the renamed node lists as that name.
+    let renamed_cleartext = format!("{}.txt", "S".repeat(200));
+    assert!(names.contains(&renamed_cleartext.as_str()), "{names:#?}");
+    // Damage 8's node only becomes listable once the trailing bytes are gone.
+    let truncated_cleartext = format!("{}.txt", "T".repeat(200));
+    assert!(names.contains(&truncated_cleartext.as_str()), "{names:#?}");
+}
+
+#[test]
+fn an_empty_unknown_node_is_deleted_by_the_type_fix() {
+    let (_tmp, vault, ctx) = context("broken_health");
+    // The same damage the fixture carries, only empty — the way the desktop app leaves it behind.
+    // Git cannot track an empty directory, so the fixture's node holds a file instead.
+    let root = cryptomator_core::root_content_dir(&vault, &ctx.cryptor);
+    let name = format!(
+        "{}.c9r",
+        ctx.cryptor
+            .file_name_cryptor()
+            .encrypt_filename("empty", &[b""])
+    );
+    std::fs::create_dir(root.join(&name)).unwrap();
+
+    let found = run(&ctx, "type")
+        .into_iter()
+        .find(|r| r.paths.iter().any(|p| p.ends_with(&name)))
+        .expect("the empty node is reported");
+    assert_eq!(found.kind, "UnknownType");
+    let fix = found.fix.as_ref().expect("an unknown node is deletable");
+    fix.apply(&ctx).expect("the empty node is deleted");
+    assert!(!root.join(&name).exists());
+    // Applying it again is a no-op, not a `NotFound`.
+    fix.apply(&ctx).expect("idempotent");
+}
+
+#[test]
+fn a_healthy_vault_passes_all_three_checks() {
+    let mut seen_per_check: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in common::FIXTURE_NAMES {
+        let (_tmp, _vault, ctx) = context(name);
+        let results = cryptomator_core::run_checks(&cryptomator_core::CHECK_IDS, &ctx, &mut |_| {})
+            .expect("the catalogue ids are known");
+        assert!(!results.is_empty(), "{name}");
+        let bad: Vec<_> = results
+            .iter()
+            .filter(|r| r.severity > Severity::Good)
+            .collect();
+        assert!(bad.is_empty(), "{name}: {bad:#?}");
+        assert!(results.iter().all(|r| !r.fixable()), "{name}: {results:#?}");
+        // `dirid` always has something to say, so "no findings" is never the reason for the green
+        // result. `type` needs a node *directory* (`sizes` holds nothing but plain files) and
+        // `shortened` a `.c9s` node, so those two are counted over the whole set instead.
+        assert!(results.iter().any(|r| r.check == "dirid"), "{name}");
+        for result in &results {
+            *seen_per_check.entry(result.check).or_insert(0) += 1;
+        }
+    }
+    for id in cryptomator_core::CHECK_IDS {
+        assert!(
+            seen_per_check.get(id).copied().unwrap_or(0) > 0,
+            "no fixture exercised {id}: {seen_per_check:#?}"
+        );
+    }
 }

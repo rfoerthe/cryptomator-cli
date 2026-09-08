@@ -24,13 +24,12 @@
 use super::{CheckContext, Fix};
 use crate::constants::{
     CRYPTOMATOR_FILE_SUFFIX, DEFLATED_FILE_SUFFIX, DIR_FILE_NAME, DIR_ID_BACKUP_FILE_NAME,
-    INFLATED_FILE_NAME, INUSE_FILE_SUFFIX, RECOVERY_DIR_ID, RECOVERY_DIR_NAME, ROOT_DIR_ID,
-    SYMLINK_FILE_NAME,
+    INUSE_FILE_SUFFIX, RECOVERY_DIR_ID, RECOVERY_DIR_NAME, ROOT_DIR_ID, SYMLINK_FILE_NAME,
 };
 use crate::crypto::rng::{OsRng, Rng};
 use crate::fs::dir_id::{read_dir_id_backup, write_dir_id_backup};
 use crate::fs::dir_stream::matches_encrypted_content_pattern;
-use crate::fs::long_names::deflate;
+use crate::fs::long_names::{deflate, inflate};
 use crate::fs::{CiphertextDirectory, CiphertextFileType};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -87,6 +86,9 @@ impl Fix for AdoptOrphan {
         let long_suffix = clear_name_to_be_shortened(ctx.shortening_threshold);
         // `retrieveDirId`: with the orphan's own `dirid.c9r` the original names can be decrypted;
         // without it every child is renamed after its type and a counter.
+        // `read_dir_id_backup` yields a `String` and refuses a dir id that is not UTF-8, where
+        // Java's `DirectoryIdBackup.read` keeps the raw bytes. Such an orphan simply falls back to
+        // the counter names below -- unreachable for a real vault, whose dir ids are UUIDs.
         let dir_id = read_dir_id_backup(&ctx.cryptor, &orphan).ok();
         let (mut files, mut dirs, mut links) = (1u32, 1u32, 1u32);
 
@@ -240,6 +242,12 @@ pub(crate) fn run_id(rng: &mut dyn Rng) -> String {
 
 /// `OrphanContentDir.decryptFileName`, with Java's `catch`: any failure means "no name", and the
 /// caller falls back to `<prefix><counter>_<run id>`.
+///
+/// The `name.c9s` of a shortened node is read through [`inflate`], which refuses anything larger
+/// than [`MAX_FILENAME_BUFFER_SIZE`](crate::fs::long_names::MAX_FILENAME_BUFFER_SIZE). Java reads it
+/// unbounded, but a `--fix` is aimed at damaged vaults by definition: a corrupt name file of
+/// arbitrary size must not be pulled into memory whole, and "too large to be a name" is exactly the
+/// case the counter-name fallback exists for.
 fn decrypt_orphan_name(
     ctx: &CheckContext,
     resource: &Path,
@@ -247,7 +255,7 @@ fn decrypt_orphan_name(
     dir_id: &str,
 ) -> Option<String> {
     let with_extension = if shortened {
-        std::fs::read_to_string(resource.join(INFLATED_FILE_NAME)).ok()?
+        inflate(resource).ok()?
     } else {
         resource.file_name()?.to_str()?.to_owned()
     };
@@ -309,7 +317,19 @@ fn sorted_entries(dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// `Files.move`, with a copy-and-delete fallback for the (practically impossible) case that the
 /// orphan and `/LOST+FOUND` sit on different devices -- both live under `d/`, but a vault can be
 /// assembled across mount points.
+///
+/// An existing target is refused instead of replaced. `std::fs::rename` silently overwrites a
+/// regular file, Java's `Files.move` without `REPLACE_EXISTING` throws -- and this is the one place
+/// in the adoption where data could be lost: two children of one orphan that decrypt to the same
+/// cleartext name (a half-finished rename in a damaged vault) would otherwise leave one of them
+/// gone without a word.
 fn move_path(from: &Path, to: &Path) -> io::Result<()> {
+    if exists_no_follow(to)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", to.display()),
+        ));
+    }
     match std::fs::rename(from, to) {
         Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
             copy_recursively(from, to)?;
@@ -354,7 +374,7 @@ fn content_dir_of(ctx: &CheckContext, hash: &str) -> PathBuf {
 
 /// `Files.exists(path, NOFOLLOW_LINKS)`; anything but "not found" is reported instead of being
 /// silently treated as "absent", which would send the caller into a `create_new` that fails anyway.
-fn exists_no_follow(path: &Path) -> io::Result<bool> {
+pub(crate) fn exists_no_follow(path: &Path) -> io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -381,8 +401,9 @@ fn file_name_of(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{CONTENTS_FILE_NAME, DATA_DIR_NAME};
+    use crate::constants::{CONTENTS_FILE_NAME, DATA_DIR_NAME, INFLATED_FILE_NAME};
     use crate::crypto::rng::DetRng;
+    use crate::fs::long_names::MAX_FILENAME_BUFFER_SIZE;
     use crate::fs::testutil::new_vault;
     use crate::health::{DiagnosticResult, HealthCheck};
 
@@ -704,6 +725,48 @@ mod tests {
             0,
             "the recovery dir is referenced by the root now: {after:#?}"
         );
+    }
+
+    #[test]
+    fn an_oversized_name_file_falls_back_to_a_counter_name() {
+        let (_dir, ctx) = vault();
+        let orphan_dir = orphan(&ctx, "oversized-name-orphan", true);
+        let c9s = orphan_dir.join("D".repeat(32) + DEFLATED_FILE_SUFFIX);
+        std::fs::create_dir_all(&c9s).unwrap();
+        std::fs::write(c9s.join(CONTENTS_FILE_NAME), b"payload").unwrap();
+        // Larger than `MAX_FILENAME_BUFFER_SIZE`: `inflate` refuses to read it at all, so the
+        // adoption never sees a name to decrypt and numbers the node instead.
+        std::fs::write(
+            c9s.join(INFLATED_FILE_NAME),
+            vec![b'A'; MAX_FILENAME_BUFFER_SIZE as usize + 1],
+        )
+        .unwrap();
+
+        adopt(&ctx, &orphan_dir).unwrap();
+
+        let step_parent = step_parent_of(&ctx, &orphan_dir);
+        let names = cleartext_names(&ctx, &step_parent);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with(FILE_PREFIX), "{names:?}");
+        assert!(names[0].contains(LONG_NAME_SUFFIX_BASE), "{names:?}");
+    }
+
+    #[test]
+    fn a_move_never_replaces_an_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+
+        let error = move_path(&from, &to).expect_err("an existing target is never overwritten");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        assert!(from.is_file(), "the source is still there");
+
+        std::fs::remove_file(&to).unwrap();
+        move_path(&from, &to).expect("a free target is moved onto");
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
     }
 
     #[test]
