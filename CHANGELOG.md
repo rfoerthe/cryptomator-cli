@@ -839,6 +839,20 @@
   parse. The defaults every Cryptomator release writes (`N = 2^15`, `r = 8`, 32 MiB) are a factor
   of 64 below the memory limit; no real vault is affected. A deliberate deviation from Java —
   see *Limits on the masterkey file* in the README.
+- **Every write is `fsync`ed, and so is the directory it lands in.** `tmp + fsync(tmp) + rename` is
+  atomic for readers but not durable: the entry that names the file lives in the directory, and the
+  directory has its own dirty pages, so a crash in the gap could leave a vault with correct
+  masterkey bytes on the platter and no `masterkey.cryptomator` naming them. The new
+  `cryptomator_core::durability` (`sync_dir`, `sync_file`, `sync_parent_dir`, `rename_durably`)
+  closes that gap for `masterkey.cryptomator` (creation, `password change`, restore) and its
+  `.bkup` copy — which was not synced at all before — as well as `vault.cryptomator`, the health
+  report, `settings.json`, `cli.json` and the state files. `fs put` now syncs the ciphertext it
+  wrote before renaming it into place (`close()` flushes, it does not sync) and syncs the
+  ciphertext directory afterwards; `fs get` syncs the local temporary file it streams into. A
+  directory `fsync` that the file system refuses as unsupported (`EINVAL`/`ENOTSUP`, seen on SMB
+  and some FUSE file systems) is not an error; every other failure is. Nothing changed for writes
+  *through* a mount: those still sync when the kernel or the WebDAV client asks (`fsync`, `close`).
+  See *Durability of writes* in the README.
 - Side effect of the same check: `MasterkeyFile::is_valid` is now `validate().is_ok()` and
   therefore stricter — a `scryptCostParam` that is not a power of two (`1000`, say) was accepted by
   the old `> 1` test and failed later inside the derivation with a usage error (exit `2`); it is

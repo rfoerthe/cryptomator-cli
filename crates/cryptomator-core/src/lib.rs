@@ -5,6 +5,7 @@
 pub mod backup;
 pub mod constants;
 pub mod crypto;
+pub mod durability;
 pub mod error;
 pub mod fs;
 pub mod health;

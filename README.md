@@ -157,6 +157,21 @@ A file outside these limits is an invalid masterkey file (exit `1`); rejecting i
 the JSON parse. No vault written by a Cryptomator release comes near them — the defaults are a
 factor of 64 below the memory limit — and the file's own values are named in the error message.
 
+## Durability of writes
+
+Every file `crypto` writes on its own behalf — `masterkey.cryptomator` (created, or rewritten by
+`password change`), its `.bkup` copy, `vault.cryptomator`, a health report, a restored file, the
+temporary file `fs put` streams into and `fs get` writes, plus `settings.json`, `cli.json` and the
+state files — is written to a temporary name, `fsync`ed, and only then renamed over its target;
+after the rename the *directory* is `fsync`ed as well. The second sync is the one that is easy to
+forget and the one that matters here: a rename lives in the directory's own dirty pages, so without
+it a power cut can leave a vault whose masterkey file has correct contents on the platter and no
+directory entry naming them — a vault with no key file at all. On the few file systems that answer
+`fsync` on a directory with "not supported" (some SMB shares, some FUSE file systems) the sync is
+skipped rather than turned into an error; every other failure is reported. Data written *through* a
+mount is a different matter: there `crypto` syncs when the kernel or the WebDAV client asks it to
+(`fsync(2)`, `close(2)`), exactly like any other file system.
+
 ## Exit codes
 
 | Code | Meaning |

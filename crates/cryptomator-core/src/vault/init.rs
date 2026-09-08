@@ -73,6 +73,12 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    drop(file);
+    // `sync_all` put the bytes on the platter; the entry that names them lives in the directory
+    // and has its own dirty page. Without this a crash right after `crypto vault create` can
+    // leave a vault directory with no `vault.cryptomator` -- which is exactly the state
+    // `open_vault` refuses to open.
+    crate::durability::sync_parent_dir(path)?;
     Ok(())
 }
 

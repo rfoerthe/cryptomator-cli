@@ -52,7 +52,15 @@ pub fn attempt_backup(path: &Path) -> Result<BackupOutcome> {
         .create_new(true)
         .open(&backup_path)
     {
-        Ok(mut file) => match file.write_all(&file_bytes) {
+        // A backup is the copy that has to be there when the original is gone, so it is only
+        // called `Created` once its bytes *and* the directory entry naming them are on the
+        // platter. Without the two syncs a crash right after a passphrase change could take the
+        // backup and the file it was made from at once.
+        Ok(mut file) => match file
+            .write_all(&file_bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| crate::durability::sync_parent_dir(&backup_path))
+        {
             Ok(()) => BackupStatus::Created,
             Err(e) => BackupStatus::Failed(e.to_string()),
         },

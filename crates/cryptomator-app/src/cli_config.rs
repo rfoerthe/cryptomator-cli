@@ -121,7 +121,9 @@ impl CliConfig {
             let _ = std::fs::remove_file(&tmp);
             return Err(AppError::Io(e));
         }
-        if let Err(e) = std::fs::rename(&tmp, path) {
+        // The same durable rename the settings file gets: the contents are synced above, the
+        // entry that names them is synced by the rename.
+        if let Err(e) = cryptomator_core::durability::rename_durably(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(AppError::Io(e));
         }

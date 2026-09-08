@@ -455,7 +455,9 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     // A tmp file created before this process changed its umask may still be too permissive.
     let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(FILE_MODE));
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    // The rename is what publishes the state file; syncing the directory is what makes the
+    // published name survive a power cut, now that its contents already do.
+    if let Err(e) = cryptomator_core::durability::rename_durably(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(AppError::Io(e));
     }

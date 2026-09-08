@@ -12,7 +12,7 @@ use cryptomator_core::fs::{
     CleartextPath, CryptoFs, CryptoFsOptions, EventSink, FileAttributes,
     DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
 };
-use cryptomator_core::{open_vault, read_vault_config, MasterkeyFileAccess};
+use cryptomator_core::{durability, open_vault, read_vault_config, MasterkeyFileAccess};
 use data_encoding::HEXLOWER;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -297,11 +297,22 @@ fn stream_to_local(fs: &CryptoFs, path: &CleartextPath, local: &Path) -> Result<
     let copied = fs
         .copy_to_writer(path, &mut file)
         .map_err(io_detail)
-        .with_context(|| format!("cannot read {path}"));
+        .with_context(|| format!("cannot read {path}"))
+        .and_then(|bytes| {
+            // Synced while the file is still open: the rename below gives it the destination's
+            // name, and a name whose contents are still only in the page cache is what a power
+            // cut turns into an empty or truncated file that looks complete.
+            file.sync_all()
+                .map_err(io_detail)
+                .with_context(|| format!("cannot write {}", temp.display()))?;
+            Ok(bytes)
+        });
     // Closed before the rename: Windows is unhappy about renaming a file that is still open.
     drop(file);
     let result = copied.and_then(|bytes| {
-        std::fs::rename(&temp, local)
+        // `rename_durably`: the rename itself lives in the destination's directory, whose dirty
+        // pages nothing else here syncs.
+        durability::rename_durably(&temp, local)
             .map_err(io_detail)
             .with_context(|| format!("cannot create {}", local.display()))?;
         Ok(bytes)
@@ -352,6 +363,35 @@ fn get(ctx: &Ctx, args: FsGetArgs) -> Result<u8> {
         || format!("{path} -> {} ({bytes} bytes)", args.local.display()),
     )?;
     Ok(exit::OK)
+}
+
+/// `fsync` on the ciphertext directories that hold the entry `put`'s rename just created.
+///
+/// The rename inside the vault is a `rename(2)` between two names in a ciphertext directory, and
+/// that entry lives in the directory's own dirty pages -- so without this a power cut can leave
+/// the freshly written file under its temporary name, or under no name at all, while its contents
+/// (synced by `write_from_reader`) are safely on the platter.
+///
+/// Two directories can be involved: a name too long for the vault's shortening threshold is stored
+/// as `<hash>.c9s/contents.c9r`, where the `.c9s` directory holds the entry for the contents and
+/// the content directory holds the entry for the `.c9s` directory itself.
+fn sync_ciphertext_dirs(fs: &CryptoFs, path: &CleartextPath) -> io::Result<()> {
+    let ciphertext = fs.ciphertext_path(path)?;
+    let mut dirs: Vec<PathBuf> = ciphertext
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Some(parent) = path.parent() {
+        let content_dir = fs.ciphertext_path(&parent)?;
+        if !dirs.contains(&content_dir) {
+            dirs.push(content_dir);
+        }
+    }
+    for dir in &dirs {
+        durability::sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 fn put(ctx: &Ctx, args: FsPutArgs) -> Result<u8> {
@@ -408,6 +448,7 @@ fn put(ctx: &Ctx, args: FsPutArgs) -> Result<u8> {
     let bytes = match fs
         .write_from_reader(&tmp, input, false)
         .and_then(|bytes| fs.rename(&tmp, &path, args.force).map(|()| bytes))
+        .and_then(|bytes| sync_ciphertext_dirs(&fs, &path).map(|()| bytes))
     {
         Ok(bytes) => bytes,
         Err(e) => {

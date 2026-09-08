@@ -213,7 +213,10 @@ impl MasterkeyFileAccess {
             tmp.write_all(&bytes)?;
             tmp.sync_all()?;
         }
-        std::fs::rename(&tmp_path, path)?;
+        // Not `std::fs::rename`: the contents are on the platter (`sync_all` above), but the
+        // directory entry that names them is not until the directory itself is synced. A crash in
+        // between would leave the vault with no masterkey file at all.
+        crate::durability::rename_durably(&tmp_path, path)?;
         Ok(())
     }
 
