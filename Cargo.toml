@@ -45,6 +45,9 @@ anyhow = "1"
 clap = { version = "4.6", features = ["derive", "env", "wrap_help", "string"] }
 clap_complete = "4.6"
 clap_mangen = "0.2"
+# Only `xtask`'s tests use it: they read `[package.metadata.deb]` back the way cargo-deb does,
+# instead of grepping the manifest text.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 fuser = { version = "0.18", default-features = false, features = ["macos-no-mount"] }
 libloading = "0.9"
 tempfile = "3"

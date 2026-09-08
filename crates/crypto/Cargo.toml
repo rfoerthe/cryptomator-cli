@@ -37,3 +37,45 @@ assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+
+# `cargo deb` builds the Debian package from this section; `cargo xtask deb` is the wrapper that
+# generates the manpages and the completion scripts first (neither is committed, Ruling 3) and then
+# calls it with `--no-build`, so the package ships exactly the binary `cargo xtask dist` built.
+#
+# Asset source paths are resolved relative to *this* manifest's directory (`crates/crypto/`), which
+# is why everything outside the crate starts with `../../`. The one exception is the literal prefix
+# `target/release/`: cargo-deb treats it as a placeholder for the real build-products directory and
+# rewrites it to `target/<triple>/release/` when `--target` is given, so the same entry covers
+# every architecture. Spelling it `../../target/release/crypto` would defeat that and point at the
+# host build instead.
+[package.metadata.deb]
+# Deliberately the project's noreply address and not a person's: a private mailbox in a package
+# that gets distributed is the maintainer's own decision to make.
+maintainer = "cryptomator-cli maintainers <cryptomator-cli@users.noreply.github.com>"
+copyright = "2026, cryptomator-cli contributors. AGPL-3.0-only."
+# Relative to this manifest, like every other asset path; `0` is the number of leading lines to
+# skip when copying it into `usr/share/doc/crypto/copyright`.
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+extended-description = """
+crypto is a command line client for Cryptomator vaults (vault format 8). It creates, unlocks, \
+mounts, repairs and migrates vaults, reads and writes their contents without mounting, and shares \
+settings.json and the keychain entries with the Cryptomator desktop app."""
+# `$auto` keeps the libc and libgcc dependencies cargo-deb works out from the binary itself.
+# `fuse3` provides `fusermount3`, which the Linux mount backend calls at run time; it is not linked
+# against, so it cannot be discovered automatically.
+depends = "$auto, fuse3"
+# The keychain is optional: without a Secret Service daemon `crypto` simply asks for the
+# passphrase. `libsecret-tools` is not required either -- it is what makes `secret-tool` available
+# for inspecting the entries by hand.
+recommends = "gnome-keyring, libsecret-tools"
+assets = [
+    ["target/release/crypto", "usr/bin/crypto", "755"],
+    ["../../target/man/*.1", "usr/share/man/man1/", "644"],
+    ["../../target/completions/crypto.bash", "usr/share/bash-completion/completions/crypto", "644"],
+    ["../../target/completions/_crypto", "usr/share/zsh/site-functions/_crypto", "644"],
+    ["../../target/completions/crypto.fish", "usr/share/fish/vendor_completions.d/crypto.fish", "644"],
+    ["../../README.md", "usr/share/doc/crypto/README.md", "644"],
+    ["../../CHANGELOG.md", "usr/share/doc/crypto/CHANGELOG.md", "644"],
+]
