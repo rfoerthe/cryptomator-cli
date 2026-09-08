@@ -76,6 +76,10 @@ pub enum Command {
     Events(EventsArgs),
     /// The mount services this build knows
     Mounters(MountersArgs),
+    /// Check a vault for structural damage and optionally repair it
+    Health(HealthArgs),
+    /// Bring a vault of format 5, 6 or 7 up to format 8
+    Migrate(MigrateArgs),
     /// Inspect and self-test the keychain
     Keychain {
         #[command(subcommand)]
@@ -165,6 +169,53 @@ pub struct LockArgs {
     /// Unmount even while the volume is in use
     #[arg(long)]
     pub force: bool,
+}
+
+/// Only `--report` and `--no-report` exclude each other; `--fix-severity` without `--fix` is
+/// harmless and stays a no-op, the way `--interval` without `--follow` does.
+#[derive(Args, Debug)]
+pub struct HealthArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Which checks to run, comma separated: dirid, type, shortened (default: all)
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub check: Vec<String>,
+    /// Apply the fixes of the findings that have one
+    #[arg(long)]
+    pub fix: bool,
+    /// Lowest severity that --fix repairs (INFO is accepted here, unlike --fail-on)
+    #[arg(long, value_name = "INFO|WARN|CRITICAL", default_value = "WARN")]
+    pub fix_severity: String,
+    /// Where to write the text report; it replaces an existing file of that name
+    /// (default: ./healthReport_<vault>_<stamp>.log, which never replaces one)
+    #[arg(long, value_name = "FILE", conflicts_with = "no_report")]
+    pub report: Option<PathBuf>,
+    /// Write no report file
+    #[arg(long)]
+    pub no_report: bool,
+    /// Lowest severity that makes the command exit 11
+    #[arg(long, value_name = "WARN|CRITICAL", default_value = "CRITICAL")]
+    pub fail_on: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Migrate without asking for confirmation; required when there is no terminal to ask at
+    #[arg(long)]
+    pub yes: bool,
+    /// List the steps and the renames and exit without touching the vault
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
 }
 
 #[derive(Args, Debug)]
@@ -401,6 +452,8 @@ pub enum RecoveryKeyCommand {
     ResetPassword(ResetPasswordArgs),
     /// Check whether a recovery key is well-formed (dictionary words, length, checksum)
     Validate(ValidateArgs),
+    /// Rebuild a lost masterkey.cryptomator, vault.cryptomator or both
+    Restore(RestoreArgs),
 }
 
 #[derive(Args, Debug)]
@@ -428,6 +481,55 @@ pub struct ResetPasswordArgs {
     /// Read the recovery key from a file
     #[arg(long, value_name = "FILE", group = "recovery-key-source")]
     pub recovery_key_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub new_password: NewPasswordArgs,
+}
+
+// Two groups: exactly one of --masterkey/--config/--all (required), and at most one recovery key
+// source (optional here, because --config takes the vault password instead; the command itself
+// reports the missing or the surplus one with a message that says why).
+#[derive(Args, Debug)]
+#[command(group = clap::ArgGroup::new("restore-what").required(true))]
+pub struct RestoreArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Recreate masterkey.cryptomator from the recovery key and a new password
+    #[arg(long, group = "restore-what")]
+    pub masterkey: bool,
+    /// Recreate vault.cryptomator from the existing masterkey file and the vault password
+    #[arg(long, group = "restore-what")]
+    pub config: bool,
+    /// Recreate both files from the recovery key and a new password
+    #[arg(long, group = "restore-what")]
+    pub all: bool,
+    // The two config settings are `Option`s without a clap default, so the command can tell "not
+    // given" from "given the default" and refuse them for `--masterkey`, which writes no config
+    // and would otherwise ignore them without a word. The defaults are applied in the command.
+    /// Cipher combo of the new vault config; default: read it from the first encrypted file
+    /// (--config and --all only)
+    #[arg(long, value_name = "COMBO", value_parser = ["auto", "SIV_GCM", "SIV_CTRMAC"])]
+    pub cipher_combo: Option<String>,
+    /// Shortening threshold to write into the new vault config, 36-220 (--config and --all only)
+    /// [default: 220]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(36..=220))]
+    pub shortening_threshold: Option<u32>,
+    /// Read the recovery key from the next line of standard input
+    #[arg(long, group = "restore-recovery-key-source")]
+    pub recovery_key_stdin: bool,
+    /// Read the recovery key from a file
+    #[arg(long, value_name = "FILE", group = "restore-recovery-key-source")]
+    pub recovery_key_file: Option<PathBuf>,
+    // The vault's *old* password, read only by `--config` -- which signs the new config with the
+    // key already in the masterkey file. `--masterkey` and `--all` take the recovery key and a
+    // **new** password instead, and the command refuses a `--password-*` flag there (exit 2),
+    // exactly as it refuses `--cipher-combo` under `--masterkey`: ignoring it would let somebody
+    // believe the old password was used, and `--password-stdin` next to `--recovery-key-stdin`
+    // would put two readers on the same stdin. clap cannot express "only with --config", so the
+    // rule lives in `commands::recovery::restore`.
+    #[command(flatten)]
+    pub password: PasswordArgs,
     #[command(flatten)]
     pub new_password: NewPasswordArgs,
 }

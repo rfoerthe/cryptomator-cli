@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <!-- Standalone on purpose: no parent, no reactor. The three legacy generators pull mutually
+       incompatible cryptofs 1.x versions, and tools/fixture-gen/pom.xml has to stay a single-module
+       build because crates/crypto/tests/java_interop.rs points at exactly that POM.
+       gson and slf4j are NOT declared here: cryptofs 1.9.15 brings the gson version it was built
+       against, and forcing a newer one onto cryptolib 1.x is a needless risk. -->
+  <groupId>org.cryptomator.cli</groupId>
+  <artifactId>gen-legacy-v7</artifactId>
+  <version>0.1.0</version>
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <exec.mainClass>org.cryptomator.cli.fixtures.GenV7</exec.mainClass>
+    <!-- Absolute: exec:exec resolves relative paths against the module directory, not the repo root. -->
+    <fixture.arg1>${project.basedir}/../../../tests/fixtures</fixture.arg1>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.cryptomator</groupId>
+      <artifactId>cryptofs</artifactId>
+      <version>1.9.15</version>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <!-- exec:exec (forked JVM) instead of exec:java, like the format-8 generator:
+               java.nio.file.spi.FileSystemProvider finds the cryptofs provider only through the
+               system class loader. -->
+          <executable>java</executable>
+          <arguments>
+            <argument>-classpath</argument>
+            <classpath/>
+            <argument>${exec.mainClass}</argument>
+            <argument>${fixture.arg1}</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

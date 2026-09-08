@@ -163,6 +163,23 @@ fn unlock_mounts_the_vault_and_lock_takes_it_down() {
     // Locked again: `fs` works, and there is nothing left to lock.
     fx.crypto_daemon(&["fs", "ls", "v"]).assert().success();
     fx.crypto_daemon(&["lock", "v"]).assert().code(5);
+
+    // The detached daemon -- the normal case, unlike `--foreground` -- writes the same log file,
+    // and it stays behind after the lock so a mount that failed can still be read up on.
+    let log = std::fs::read_to_string(fx.state_file(".log")).expect("the detached daemon log");
+    assert!(
+        log.contains("INFO"),
+        "the daemon installed its logger: {log:?}"
+    );
+    assert!(
+        log.contains("mounted at"),
+        "the mount is in the log: {log:?}"
+    );
+    assert!(log.contains("stopped"), "and so is the shutdown: {log:?}");
+    assert!(
+        !log.contains(common::PW),
+        "no passphrase ever reaches the log"
+    );
 }
 
 /// Rewriting the masterkey of a vault a daemon is serving would leave that daemon holding a key
@@ -194,6 +211,12 @@ fn password_and_recovery_key_refuse_a_vault_a_daemon_is_serving() {
         .crypto_daemon(&["lock", fixture.name])
         .assert()
         .success();
+    // `lock` returns as soon as the daemon has unmounted, which is before that daemon has removed
+    // its state files -- and until they are gone the registry still calls the vault UNLOCKED, so
+    // the commands below would race it into the very exit code 5 they were just asserted to give.
+    wait_until("the daemon to clean up its state files", || {
+        !fixture.state_file(".sock").exists() && !fixture.state_file(".json").exists()
+    });
 
     // Once it is locked again, every one of them works. The new password is the one the sandbox
     // already uses, so each command leaves the vault openable for the next.
@@ -222,6 +245,36 @@ fn password_and_recovery_key_refuse_a_vault_a_daemon_is_serving() {
         .env("NEWPW", common::PW)
         .assert()
         .success();
+}
+
+/// `crypto health` opens the vault itself, so it needs the same exclusive access every other
+/// mount-less command needs: a vault a daemon is serving is exit code 5, never a health report of
+/// a vault that is being written underneath it.
+#[test]
+fn health_refuses_a_vault_a_daemon_is_serving() {
+    let fixture = Fixture::new("hv");
+    unlock(&fixture);
+    let assertion = fixture
+        .crypto_daemon(&["health", "hv", "--no-report"])
+        .assert()
+        .code(5);
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("UNLOCKED"),
+        "it says what is wrong: {stderr}"
+    );
+
+    fixture.crypto_daemon(&["lock", "hv"]).assert().success();
+    wait_until("the daemon to clean up its state files", || {
+        !fixture.state_file(".sock").exists() && !fixture.state_file(".json").exists()
+    });
+    // Locked again, the freshly created vault checks out clean -- and writes no report, because
+    // `--no-report` said so.
+    fixture
+        .crypto_daemon(&["health", "hv", "--no-report"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("0 critical"));
 }
 
 #[test]

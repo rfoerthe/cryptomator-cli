@@ -110,6 +110,19 @@ pub fn normalize_passphrase(raw: &str) -> Zeroizing<String> {
     Zeroizing::new(raw.nfc().collect())
 }
 
+/// The canonical **decomposition** (NFD) of `raw` -- the other half of the pair, and the form a
+/// vault of format 5 may have been created with.
+///
+/// Every passphrase this module hands out is NFC, because that is what the desktop app's
+/// `SecurePasswordField` produces and what every vault of format 6 and later is wrapped with.
+/// Format 5 predates that rule: Cryptomator 1.3 wrapped the masterkey with the characters the
+/// operating system put into the password field, which on macOS is NFD -- and format 6 is exactly
+/// the migration step that normalised it. `crypto migrate` therefore needs to be able to ask for
+/// the decomposed form of what the user typed; nothing else does.
+pub fn decompose_passphrase(raw: &str) -> Zeroizing<String> {
+    Zeroizing::new(raw.nfd().collect())
+}
+
 fn strip_line_ending(mut line: String) -> String {
     if line.ends_with('\n') {
         line.pop();

@@ -14,6 +14,10 @@ pub const UNMOUNT_FAILED: u8 = 7;
 pub const KEYCHAIN_UNAVAILABLE: u8 = 8;
 pub const HUB_VAULT: u8 = 9;
 pub const DAEMON_UNREACHABLE: u8 = 10;
+/// `crypto health` found something at or above its `--fail-on` threshold. Not an error -- the
+/// command did exactly what it was asked to do -- so it is returned by the command itself rather
+/// than mapped from an error type here.
+pub const HEALTH_FINDINGS: u8 = 11;
 pub const NOT_A_VAULT: u8 = 12;
 
 // Exhaustive on purpose (no `_` arm): a new `CoreError` variant must be given an exit code here
@@ -28,11 +32,24 @@ fn core_code(err: &CoreError) -> u8 {
         CoreError::NotAVaultDirectory { .. } => NOT_A_VAULT,
         CoreError::NeedsMigration(_)
         | CoreError::ContentRootMissing(_)
-        | CoreError::VaultVersionMismatch { .. } => WRONG_STATE,
-        CoreError::InvalidArgument(_) => USAGE,
+        | CoreError::VaultVersionMismatch { .. }
+        // The vault is the way it is and cannot be migrated: a state error, not a usage error.
+        | CoreError::MigrationBlocked(_)
+        | CoreError::UnsupportedVaultVersion { .. } => WRONG_STATE,
+        // Not a broken vault: the tool simply cannot work the cipher combo out from what is
+        // there, and the user has to name it with `--cipher-combo`. The restore command turns
+        // this into an `InvalidValue` naming that flag; this arm is the fallback.
+        // Same for a `--cipher-combo` the vault contradicts: the vault is fine, the flag is wrong.
+        CoreError::InvalidArgument(_)
+        | CoreError::CipherComboUndetectable(_)
+        | CoreError::CipherComboMismatch { .. } => USAGE,
         CoreError::InvalidMasterkeyFile(_)
         | CoreError::VaultConfigLoad(_)
         | CoreError::UnsupportedKeyId(_)
+        | CoreError::MissingCapability { .. }
+        // A limit of the storage, like a missing capability: nothing about the vault or the
+        // command is wrong, the file system simply cannot hold the migrated names.
+        | CoreError::FileNameTooLong { .. }
         | CoreError::Io(_) => GENERAL,
     }
 }
@@ -167,6 +184,31 @@ mod tests {
                 "busy".to_owned()
             ))),
             Some(UNMOUNT_FAILED)
+        );
+    }
+
+    /// The migration errors: what the storage cannot do is a general failure, what the vault is
+    /// keeps its state code.
+    #[test]
+    fn a_name_the_storage_cannot_hold_is_a_general_failure() {
+        let too_long = CoreError::FileNameTooLong {
+            path: std::path::PathBuf::from("/v/d/AB/CD/xxx.c9r"),
+            needed: 232,
+            allowed: 143,
+        };
+        assert_eq!(
+            too_long.to_string(),
+            "/v/d/AB/CD/xxx.c9r needs 232 characters, but the storage supports only 143"
+        );
+        assert_eq!(
+            failure_report(&anyhow::Error::from(too_long)),
+            Some(GENERAL)
+        );
+        assert_eq!(
+            failure_report(&anyhow::Error::from(CoreError::MigrationBlocked(
+                "a full scan is needed".to_owned()
+            ))),
+            Some(WRONG_STATE)
         );
     }
 }

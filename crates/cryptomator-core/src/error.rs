@@ -32,6 +32,43 @@ pub enum CoreError {
     ContentRootMissing(std::path::PathBuf),
     #[error("vault needs migration to format 8: {0}")]
     NeedsMigration(std::path::PathBuf),
+    /// `FileSystemCapabilityChecker.MissingCapabilityException`. `capability` is `"read access"`
+    /// or `"write access"`.
+    #[error("the storage does not support {capability}: {path}")]
+    MissingCapability {
+        path: std::path::PathBuf,
+        capability: &'static str,
+    },
+    /// The vault is, as it is, not migratable — e.g. a `vault.cryptomator` already sits next to a
+    /// format 7 masterkey file, or a step of the chain is not implemented yet.
+    #[error("migration cannot continue: {0}")]
+    MigrationBlocked(String),
+    /// `cryptofs/FileNameTooLongException`: the 6 → 7 migration would produce a name or a path
+    /// that the storage cannot hold. `allowed` is what the capability probe found — the name limit
+    /// for a name, that limit plus 48 for a path — and the vault is left unchanged.
+    #[error("{path} needs {needed} characters, but the storage supports only {allowed}")]
+    FileNameTooLong {
+        path: std::path::PathBuf,
+        needed: usize,
+        allowed: usize,
+    },
+    /// `MasterkeyService.detect` found nothing to read the cipher combo from: the vault holds no
+    /// encrypted file whose header decrypts with either scheme (or no candidate file at all).
+    /// The caller has to be told which combo to use instead of guessing one.
+    #[error("cannot detect the cipher combo of {0}: no encrypted file it could be read from")]
+    CipherComboUndetectable(std::path::PathBuf),
+    /// A cipher combo was given explicitly, but the vault's own files were written with another
+    /// one. Writing the given one would produce a config the vault cannot be opened with, so the
+    /// caller is told what the vault actually says instead.
+    #[error("the vault was written with {detected}, not {given}")]
+    CipherComboMismatch {
+        given: crate::crypto::cryptor::CipherCombo,
+        detected: crate::crypto::cryptor::CipherCombo,
+    },
+    /// A vault format outside 5..=8: either older than any migrator this tool has
+    /// (`NoApplicableMigratorException`) or newer than it knows.
+    #[error("vault format {version} cannot be migrated by this version of the tool")]
+    UnsupportedVaultVersion { version: u32 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

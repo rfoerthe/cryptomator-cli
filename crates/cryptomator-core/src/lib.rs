@@ -7,7 +7,9 @@ pub mod constants;
 pub mod crypto;
 pub mod error;
 pub mod fs;
+pub mod health;
 pub mod masterkey_file;
+pub mod migration;
 pub mod recovery;
 pub mod vault;
 pub mod vault_config;
@@ -32,7 +34,21 @@ pub use fs::{
     CryptoFsOptions, CryptoPathMapper, DirEntry, DirIdLoader, EventSink, FileAttributes,
     FileHandle, FilesystemEvent, FilesystemLoop, OpenOptions,
 };
+pub use health::report::{
+    civil_utc, render_report, report_file_name, write_report, write_report_to,
+};
+pub use health::{
+    all_checks, checks_by_ids, run_checks, CheckContext, DiagnosticResult, Fix, HealthCheck,
+    Severity, CHECK_FAILED_KIND, CHECK_IDS,
+};
 pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
+/// The migration entry points keep their module prefix (`migration::plan`, `migration::migrate`,
+/// `migration::detect_version`, `migration::needs_migration`); only the types are re-exported,
+/// because `needs_migration` already exists here with the plain numeric semantics of
+/// `vault::state`.
+pub use migration::{
+    MigrationEvent, MigrationOptions, MigrationPlan, MigrationStep, PlannedRename, VaultVersion,
+};
 pub use vault::init::{
     create_vault, initialize, write_root_file, CreateVaultOptions, DEFAULT_SHORTENING_THRESHOLD,
     MAX_SHORTENING_THRESHOLD, MIN_SHORTENING_THRESHOLD,

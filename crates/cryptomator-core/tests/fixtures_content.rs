@@ -13,6 +13,8 @@ use data_encoding::HEXLOWER;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// The clean format-8 fixtures. Deliberately damaged (`kind` = `broken`) and pre-format-8
+/// (`kind` = `legacy`) fixtures do not decrypt to a full cleartext tree and stay out of this list.
 const FIXTURE_NAMES: [&str; 8] = [
     "long_names",
     "nested",
@@ -29,6 +31,22 @@ const FIXTURE_NAMES: [&str; 8] = [
 struct FixtureMeta {
     cipher_combo: String,
     passphrase: String,
+}
+
+/// Only the `kind` of a manifest, so this filter also parses the manifests of `legacy` fixtures,
+/// which carry neither `cipherCombo` nor `masterkeyHex`.
+#[derive(serde::Deserialize)]
+struct FixtureKind {
+    /// `clean` (the default for manifests written before the field existed), `broken` or `legacy`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// A fixture is clean unless its manifest marks it as damaged or as an older vault format.
+fn is_clean(vault: &Path) -> bool {
+    let kind: FixtureKind =
+        serde_json::from_slice(&std::fs::read(vault.join("fixture.json")).unwrap()).unwrap();
+    !matches!(kind.kind.as_deref(), Some("broken") | Some("legacy"))
 }
 
 /// One cleartext node. `size`/`sha256` are set for files, `target` for symlinks, matching `expected.json`.
@@ -150,9 +168,10 @@ fn every_fixture_decrypts_to_its_expected_tree() {
         .expect("tests/fixtures exists (run tools/fixture-gen)")
         .map(|e| e.unwrap().file_name().to_str().unwrap().to_owned())
         .filter(|n| root.join(n).join("fixture.json").exists())
+        .filter(|n| is_clean(&root.join(n)))
         .collect();
     found.sort();
-    assert_eq!(found, FIXTURE_NAMES, "unexpected set of fixtures");
+    assert_eq!(found, FIXTURE_NAMES, "unexpected set of clean fixtures");
 
     for name in FIXTURE_NAMES {
         let vault = root.join(name);

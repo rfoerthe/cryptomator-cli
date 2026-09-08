@@ -31,6 +31,17 @@ pub fn copy_fixture(name: &str) -> TempDir {
     dir
 }
 
+/// Like [`copy_fixture`], but the copy keeps the fixture's own name inside the temp dir and the path
+/// is handed back. Tests that repair, migrate or restore a vault need a path that looks like a real
+/// vault directory (and a sibling-free parent) instead of the bare temp root.
+pub fn fixture_copy_at(name: &str) -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join(name);
+    std::fs::create_dir(&vault).unwrap();
+    copy_recursively(&fixtures_root().join(name), &vault);
+    (dir, vault)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FixtureMeta {
@@ -76,6 +87,8 @@ pub fn expected_entries(vault: &Path) -> Vec<ExpectedEntry> {
     entries
 }
 
+/// The clean format-8 fixtures. Fixtures whose `fixture.json` carries a `kind` of `broken` or
+/// `legacy` are deliberately damaged or of an older vault format and are not part of this list.
 pub const FIXTURE_NAMES: [&str; 8] = [
     "long_names",
     "nested",
