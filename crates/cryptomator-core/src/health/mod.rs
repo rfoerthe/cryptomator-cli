@@ -23,10 +23,16 @@ use std::sync::Arc;
 pub mod dir_id;
 pub mod file_type;
 pub mod orphan;
+pub mod report;
 pub mod shortened;
 
 /// The ids of all checks, in the order they run and are reported.
 pub const CHECK_IDS: [&str; 3] = ["dirid", "type", "shortened"];
+
+/// [`DiagnosticResult::kind`] of the result a check reports when it could not finish (Java's
+/// `CheckFailed`). It is the one kind the report renders differently -- as Java's `STATUS: FAILED`
+/// section -- so it is named here rather than spelled out at both ends.
+pub const CHECK_FAILED_KIND: &str = "CheckFailed";
 
 /// How bad a finding is (`DiagnosticResult.Severity`).
 ///
@@ -68,8 +74,10 @@ impl Severity {
 }
 
 impl fmt::Display for Severity {
+    /// Through [`fmt::Formatter::pad`], not `write_str`: the report's severity column is a `{:>8}`,
+    /// and a `Display` that writes straight to the formatter silently ignores width and alignment.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -302,7 +310,7 @@ pub(crate) fn check_failed(
 ) -> DiagnosticResult {
     DiagnosticResult::new(
         check,
-        "CheckFailed",
+        CHECK_FAILED_KIND,
         Severity::Critical,
         format!(
             "Check failed: Traversal of data dir failed: {} ({error})",
@@ -402,6 +410,9 @@ mod tests {
         assert!(Severity::Warn < Severity::Critical);
         assert_eq!(Severity::Critical.as_str(), "CRITICAL");
         assert_eq!(Severity::Good.to_string(), "GOOD");
+        // The report's severity column is a `{:>8}`; `Display` has to honour it.
+        assert_eq!(format!("{:>8}", Severity::Good), "    GOOD");
+        assert_eq!(format!("{:>8}", Severity::Critical), "CRITICAL");
     }
 
     #[test]

@@ -46,11 +46,9 @@ impl HealthCheck for CiphertextFileTypeCheck {
         // `DirVisitor.visitFile`: a directory named `*.c9r` is checked without `contents.c9r`, one
         // named `*.c9s` with it. Everything else is not a node and is ignored.
         let mut visit = |dir: &Path| -> VisitResult {
-            let name = dir
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            // Borrowed, not owned: this runs once per node of the vault, and the two suffix tests
+            // need no allocation of their own.
+            let name = dir.file_name().unwrap_or_default().to_string_lossy();
             if name.ends_with(CRYPTOMATOR_FILE_SUFFIX) {
                 sink(check_ciphertext_type(ctx, dir, false));
             } else if name.ends_with(DEFLATED_FILE_SUFFIX) {
@@ -184,9 +182,12 @@ struct DeleteUnknownNode {
 }
 
 impl Fix for DeleteUnknownNode {
+    /// Conditional on purpose: the fix hangs on *every* `UnknownType`, but `remove_dir` deletes only
+    /// an empty directory. A `--dry-run` listing must not promise a deletion that the repair will
+    /// then refuse.
     fn describe(&self) -> String {
         format!(
-            "delete the empty node {} of unknown type",
+            "delete the node {} of unknown type if it is empty",
             self.cipher_dir.display()
         )
     }
