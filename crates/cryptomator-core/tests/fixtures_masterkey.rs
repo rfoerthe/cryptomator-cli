@@ -16,12 +16,28 @@ struct FixtureMeta {
     masterkey_hex: String,
 }
 
+/// Only the `kind` of a manifest, so this filter also parses the manifests of `legacy` fixtures,
+/// which carry neither `masterkeyHex` nor a format-8 vault config.
+#[derive(serde::Deserialize)]
+struct FixtureKind {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// A fixture is clean unless its manifest marks it as damaged or as an older vault format.
+fn is_clean(vault: &std::path::Path) -> bool {
+    let kind: FixtureKind =
+        serde_json::from_slice(&std::fs::read(vault.join("fixture.json")).unwrap()).unwrap();
+    !matches!(kind.kind.as_deref(), Some("broken") | Some("legacy"))
+}
+
 fn fixture_dirs() -> Vec<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
         .expect("tests/fixtures exists (run tools/fixture-gen)")
         .map(|e| e.unwrap().path())
         .filter(|p| p.join("fixture.json").exists())
+        .filter(|p| is_clean(p))
         .collect();
     dirs.sort();
     assert!(

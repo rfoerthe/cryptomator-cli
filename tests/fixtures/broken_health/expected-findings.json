@@ -1,0 +1,56 @@
+[
+  {
+    "check": "dirid",
+    "severity": "WARN",
+    "result": "OrphanContentDir",
+    "path": "d/CU/JUVHHOHR37XSFJOOJJKFUPSLEJNPVQ"
+  },
+  {
+    "check": "dirid",
+    "severity": "INFO",
+    "result": "MissingDirIdBackup",
+    "path": "d/I3/K7JJ7BWFVFRMCDI3CWIH7TFXL3PW5B"
+  },
+  {
+    "check": "dirid",
+    "severity": "WARN",
+    "result": "MissingContentDir",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/cKRze-KyJX9d0sRPXXsMqA1GfPA677PTbA==.c9r/dir.c9r"
+  },
+  {
+    "check": "dirid",
+    "severity": "INFO",
+    "result": "LooseDirFile",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/dir.c9r"
+  },
+  {
+    "check": "dirid",
+    "severity": "CRITICAL",
+    "result": "DirIdCollision",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/tG34njxNR2nhvO6wuR2HJHiDPWD4EZQ=.c9r/dir.c9r"
+  },
+  {
+    "check": "type",
+    "severity": "CRITICAL",
+    "result": "UnknownType",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/UZ0NGPkQSJnrCOQjzCb51FwFhIczbrc=.c9r"
+  },
+  {
+    "check": "shortened",
+    "severity": "WARN",
+    "result": "LongShortNamesMismatch",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/-tkB9tDD2jeWB_iMlPT4ovqCllA=.c9s"
+  },
+  {
+    "check": "shortened",
+    "severity": "WARN",
+    "result": "TrailingBytesInNameFile",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/xZrv3JjcQ2vq_65f_YsaKbj6YeY=.c9s/name.c9s"
+  },
+  {
+    "check": "shortened",
+    "severity": "CRITICAL",
+    "result": "MissingLongName",
+    "path": "d/6U/4KW6ORGR5N4GV6MTOWAPDA7EHVOELW/2rg7ZlgdSQT4uS29_B5b37qYka8=.c9s"
+  }
+]

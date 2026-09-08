@@ -1,0 +1,8 @@
+{
+  "name": "broken_health",
+  "kind": "broken",
+  "cipherCombo": "SIV_GCM",
+  "shorteningThreshold": 220,
+  "passphrase": "test-password-123",
+  "masterkeyHex": "932336486ed9935c665780e6720b1e729bce5ec9486ffe0053a50bf58780b2a5eac1c76b0d9e353ba1d3c5294c2d51374ff62e5c81fefc9bf25a0d19d313b036"
+}
