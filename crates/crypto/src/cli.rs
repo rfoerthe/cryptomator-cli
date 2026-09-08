@@ -183,8 +183,8 @@ pub struct HealthArgs {
     /// Apply the fixes of the findings that have one
     #[arg(long)]
     pub fix: bool,
-    /// Lowest severity that --fix repairs
-    #[arg(long, value_name = "WARN|CRITICAL", default_value = "WARN")]
+    /// Lowest severity that --fix repairs (INFO is accepted here, unlike --fail-on)
+    #[arg(long, value_name = "INFO|WARN|CRITICAL", default_value = "WARN")]
     pub fix_severity: String,
     /// Where to write the text report; it replaces an existing file of that name
     /// (default: ./healthReport_<vault>_<stamp>.log, which never replaces one)

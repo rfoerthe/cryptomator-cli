@@ -60,14 +60,31 @@ impl Severity {
         }
     }
 
-    /// Parses a `--fail-on` / `--fix-severity` threshold. Only `WARN` and `CRITICAL` are thresholds:
-    /// failing on `GOOD` or `INFO` would make every report a failure.
+    /// Parses a `--fail-on` threshold. Only `WARN` and `CRITICAL` are thresholds: failing on `GOOD`
+    /// or `INFO` would make every report a failure.
     pub fn parse_threshold(input: &str) -> Result<Severity> {
         match input.to_ascii_uppercase().as_str() {
             "WARN" => Ok(Severity::Warn),
             "CRITICAL" => Ok(Severity::Critical),
             _ => Err(CoreError::InvalidArgument(format!(
                 "unknown severity {input:?}; expected WARN or CRITICAL"
+            ))),
+        }
+    }
+
+    /// Parses a `--fix-severity` threshold. Unlike `--fail-on`, `INFO` is a legitimate threshold
+    /// here: `--fix` repairs a finding, it does not fail the report, so asking it to also repair
+    /// every `INFO` finding -- e.g. the desktop app's `LooseDirFile` and `MissingDirIdBackup` fixes
+    /// -- is a sensible request rather than a report that always fails. `GOOD` stays excluded: it
+    /// never carries a fix, so accepting it would only invite a `--fix-severity GOOD` that silently
+    /// fixes nothing.
+    pub fn parse_fix_severity(input: &str) -> Result<Severity> {
+        match input.to_ascii_uppercase().as_str() {
+            "INFO" => Ok(Severity::Info),
+            "WARN" => Ok(Severity::Warn),
+            "CRITICAL" => Ok(Severity::Critical),
+            _ => Err(CoreError::InvalidArgument(format!(
+                "unknown severity {input:?}; expected INFO, WARN or CRITICAL"
             ))),
         }
     }
@@ -424,6 +441,24 @@ mod tests {
         );
         assert!(Severity::parse_threshold("INFO").is_err());
         assert!(Severity::parse_threshold("").is_err());
+    }
+
+    #[test]
+    fn fix_severity_also_accepts_info_but_not_good() {
+        assert_eq!(
+            Severity::parse_fix_severity("info").unwrap(),
+            Severity::Info
+        );
+        assert_eq!(
+            Severity::parse_fix_severity("WARN").unwrap(),
+            Severity::Warn
+        );
+        assert_eq!(
+            Severity::parse_fix_severity("CRITICAL").unwrap(),
+            Severity::Critical
+        );
+        assert!(Severity::parse_fix_severity("GOOD").is_err());
+        assert!(Severity::parse_fix_severity("").is_err());
     }
 
     #[test]

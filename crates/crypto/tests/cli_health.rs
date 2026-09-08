@@ -203,6 +203,24 @@ fn fail_on_warn_catches_what_fail_on_critical_lets_pass() {
 }
 
 #[test]
+fn fail_on_stays_warn_or_critical_only() {
+    // Unlike `--fix-severity`, `--fail-on` never accepts `INFO`: failing on it would make every
+    // report a failure.
+    let fx = Sandbox::new();
+    vault(&fx, "broken_health");
+    fx.crypto(&[
+        "health",
+        "broken_health",
+        "--fail-on",
+        "INFO",
+        "--no-report",
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("WARN"));
+}
+
+#[test]
 fn check_selects_and_an_unknown_check_is_a_usage_error() {
     let fx = Sandbox::new();
     vault(&fx, "broken_health");
@@ -480,6 +498,47 @@ fn fix_severity_critical_leaves_the_warnings_alone() {
     .assert()
     .code(2)
     .stderr(predicate::str::contains("WARN"));
+}
+
+#[test]
+fn fix_severity_info_reaches_the_desktop_parity_fixes_over_a_second_round() {
+    let fx = Sandbox::new();
+    vault(&fx, "broken_health");
+    let value = fix_run(
+        &fx,
+        &[
+            "--json",
+            "health",
+            "broken_health",
+            "--fix",
+            "--fix-severity",
+            "INFO",
+            "--no-report",
+        ],
+        // The three unfixable CRITICALs (`DirIdCollision`, `UnknownType`, `MissingLongName`) still
+        // survive a full repair, whatever --fix-severity is.
+        11,
+    );
+    assert_eq!(value["fixSeverity"], "INFO");
+
+    let attempts = attempts(&value);
+    let fixed_kinds: Vec<&str> = attempts
+        .iter()
+        .filter(|(_, outcome)| outcome == "fixed")
+        .map(|(kind, _)| kind.as_str())
+        .collect();
+    assert!(
+        fixed_kinds
+            .iter()
+            .any(|kind| *kind == "MissingDirIdBackup" || *kind == "LooseDirFile"),
+        "an INFO-only fix was attempted and succeeded: {attempts:#?}"
+    );
+    // Round 1 adopts the orphan into /LOST+FOUND; that step-parent's missing dir id backup is
+    // itself an INFO finding the adoption leaves behind, so a second round is needed to reach it.
+    let rounds = value["rounds"].as_u64().expect("a round count");
+    assert!(rounds >= 2, "{attempts:#?} ran in {rounds} rounds");
+
+    assert_eq!(value["summary"]["critical"], 3, "{value:#?}");
 }
 
 #[test]

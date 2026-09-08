@@ -49,10 +49,10 @@ pub fn run(ctx: &Ctx, args: HealthArgs) -> Result<u8> {
     // typo should not cost the user a prompt (or a keychain dialog) first.
     let fail_on = Severity::parse_threshold(&args.fail_on)?;
     // `--fix-severity` is a documented no-op without `--fix`, so it is parsed -- and a bogus value
-    // rejected -- only when the repairs actually run.
+    // rejected -- only when the repairs actually run. Unlike `--fail-on`, `INFO` is accepted here.
     let fix_severity = args
         .fix
-        .then(|| Severity::parse_threshold(&args.fix_severity))
+        .then(|| Severity::parse_fix_severity(&args.fix_severity))
         .transpose()?;
     let ids: Vec<String> = if args.check.is_empty() {
         CHECK_IDS.iter().map(|id| (*id).to_string()).collect()
