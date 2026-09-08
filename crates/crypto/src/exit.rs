@@ -11,6 +11,7 @@ pub const INVALID_PASSPHRASE: u8 = 4;
 pub const WRONG_STATE: u8 = 5;
 pub const MOUNT_FAILED: u8 = 6;
 pub const UNMOUNT_FAILED: u8 = 7;
+pub const KEYCHAIN_UNAVAILABLE: u8 = 8;
 pub const HUB_VAULT: u8 = 9;
 pub const DAEMON_UNREACHABLE: u8 = 10;
 pub const NOT_A_VAULT: u8 = 12;
@@ -45,6 +46,7 @@ fn app_code(err: &AppError) -> u8 {
         AppError::NoPasswordSource { .. } | AppError::InvalidValue { .. } => USAGE,
         AppError::MountFailed(_) | AppError::MountPointInvalid(..) => MOUNT_FAILED,
         AppError::UnmountFailed(_) => UNMOUNT_FAILED,
+        AppError::Keychain(_) | AppError::KeychainNoEntry { .. } => KEYCHAIN_UNAVAILABLE,
         AppError::DaemonUnreachable(_) => DAEMON_UNREACHABLE,
         // The daemon reports what went wrong on its side; its code decides ours.
         AppError::DaemonError { code, .. } => match code.as_str() {
@@ -124,6 +126,27 @@ mod tests {
             .context("cannot write the vault list")
             .unwrap_err();
         assert_eq!(failure_report(&contextual), None);
+    }
+
+    #[test]
+    fn every_keychain_failure_is_exit_code_eight() {
+        use cryptomator_app::KeychainError;
+        let timed_out = AppError::Keychain(KeychainError::TimedOut {
+            provider: "macOS Keychain".to_string(),
+            after: cryptomator_app::KEYCHAIN_TIMEOUT,
+        });
+        assert_eq!(
+            failure_report(&anyhow::Error::from(timed_out)),
+            Some(KEYCHAIN_UNAVAILABLE)
+        );
+        let missing = AppError::KeychainNoEntry {
+            vault: "Secret".to_string(),
+            provider: "macOS Keychain".to_string(),
+        };
+        assert_eq!(
+            failure_report(&anyhow::Error::from(missing)),
+            Some(KEYCHAIN_UNAVAILABLE)
+        );
     }
 
     #[test]

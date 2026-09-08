@@ -347,8 +347,7 @@
 - The branch that puts a mount back into the daemon's state when a forced unmount is asked of a
   service that has none is not covered by a test — no mount service in this build lacks a forced
   unmount.
-- `--store-password` (keychain) does not exist yet; it arrives with M6. `crypto unlock --port`
-  arrived with M5 (below).
+- `crypto unlock --port` arrived with M5 and `--store-password` with M6 (both below).
 - The unlock timeouts are compiled in: 60 seconds for the daemon to receive an `unlock`, 70 for the
   whole call. A mount slower than that needs a rebuild, not a setting.
 
@@ -446,8 +445,9 @@
   silently), and **`--reveal` opens nothing for a URL** — a browser is not the vault, and
   `$CRYPTO_REVEAL_CMD` does not change that.
 - **No keychain entry before the AppleScript mount.** Java stores an anonymous internet password
-  first so macOS does not ask about the unencrypted connection; writing to the keychain is M6's
-  decision, so macOS asks.
+  first so macOS does not ask about the unencrypted connection. M6 brought the vault keychain but
+  deliberately not this: it is an *internet* password for the WebDAV server, unrelated to vault
+  passphrases, and it is deferred to M8. macOS therefore still asks.
 - **The OS mounts unmount themselves when dropped**, blocking and logging failures like their FUSE
   siblings, so a dropped mount cannot strand a Finder volume.
 
@@ -487,5 +487,145 @@
   `cryptomator_app::mounters`, kept in step by a parity test rather than by one owner.
 - The timeouts are still compiled in: 60 seconds for the daemon to receive an `unlock`, 70 for the
   whole call, and 10 for the mount table to show the volume.
-- `--store-password` and the keychain (`password store`/`forget`) remain M6, and with them the
-  keychain item that would stop macOS asking about the unencrypted connection.
+- `--store-password` and the keychain (`password store`/`forget`) were carried into M6 and are
+  delivered there (below). The keychain item that would stop macOS asking about the unencrypted
+  connection is a separate *internet* password and moved on to M8.
+
+### M6 – Keychain
+
+- **`cryptomator_app::keychain`**: the Rust twin of
+  `org.cryptomator.integrations.keychain.KeychainAccessProvider` (integrations-api 1.9.0) —
+  `store`, `load`, `delete`, `change`, `is_supported`, `is_locked`, `java_class_name`,
+  `display_name`, `priority`. `load` answers `None` where Java answers `null`; `delete`/`change`
+  answer "was there an entry?" as a `bool`, like `MacKeychain.deletePassword`.
+- **macOS**: the login keychain through `security-framework` 3.7 — generic password, service
+  `Cryptomator` (override `$CRYPTO_KEYCHAIN_SERVICE`, the desktop app's
+  `cryptomator.integrationsMac.keychainServiceName`), account = the vault id. `errSecItemNotFound`
+  (-25300) is "nothing stored", not a failure. `kSecAttrLabel` is set explicitly, because
+  `SecItemAdd` leaves it empty and a nameless row in Keychain Access is what the label is there to
+  avoid.
+- **macOS legacy items are migrated on read.** Cryptomator once wrote items under the service name
+  `"Cryptomator\0"` (a trailing NUL, `MacKeychain.tryMigratePassword`). When nothing is found under
+  the current service, `crypto` looks under `<service>\0` through the legacy `SecKeychain…` API —
+  the only one that can express a NUL in a service name — and moves a hit across.
+- **Linux**: the FreeDesktop Secret Service through `secret-service` 5.2 (blocking API, `zbus`,
+  pure-Rust crypto) — the default collection with a `login` fallback, item label `Cryptomator`,
+  attributes `{Vault, Name}`, and a lookup by `Vault` alone so a renamed vault keeps its password.
+  `GnomeKeyringKeychainAccess` is the same backend without `Name`, and it is the default on Linux
+  because `Settings.DEFAULT_KEYCHAIN_PROVIDER` picks it. `KDEWalletKeychainAccess` exists only to
+  report itself unusable and point at `secret-service`, which KWallet's own bridge serves.
+- **Provider selection follows `KeychainModule.provideKeychainAccessProvider`**: nothing when
+  `useKeychain` is off, otherwise the supported provider whose class name matches
+  `keychainProvider`, otherwise the highest-priority supported one. Every `is_supported()` probe
+  runs under a 5-second budget, so choosing a provider cannot cost 30 seconds per candidate.
+- **Password sources gained two steps**: `--password-keychain` (the keychain and nothing else,
+  checked ahead of every other source; a missing entry is exit `8`) and an implicit keychain lookup
+  between `$CRYPTO_PASSWORD` and the prompt. `--no-keychain` removes the implicit step for one run
+  and makes `--password-keychain` exit `8`.
+- **New commands and flags**: `crypto password store|forget <VAULT>`, `crypto keychain test`,
+  `crypto unlock --store-password|--no-store-password`, `crypto vault create --store-password`,
+  `crypto vault remove --forget-password`, and `crypto config set keychainProvider` with the
+  aliases `macos`, `touchid`, `secret-service`, `gnome-keyring`, `kde` and `kwallet` (an alias is
+  stored as the Java class name, so the desktop app keeps reading its own setting).
+- `password store` **verifies the passphrase against the masterkey file before saving it**; an
+  unverified password in the keychain would break every later unlock silently.
+- `password change` and `recovery-key reset-password` **carry a stored password along**, like
+  `KeychainManager.changePassphrase`: only when one is stored, and a keychain that refuses is a
+  warning rather than a failed password change.
+- **Exit code `8` is live**: no usable provider, `--no-keychain`/`useKeychain false` on a keychain
+  command, a locked keyring, a 30-second timeout, or `--password-keychain` with nothing stored.
+- **The CLI installs a logger**, so what the library reports through `log::warn!` reaches standard
+  error as `warning: …`: a provider whose probe did not answer, a Secret Service item that could
+  not be cleaned up, a `keychain test` entry that may have been left behind. It is a *delegating*
+  logger — `crypto unlock --foreground` runs a daemon in the same process, and `log` accepts one
+  logger per process, so the daemon's log file is swapped in behind the same handle instead of
+  losing the race (`daemon::logging`).
+- **`$CRYPTO_KEYCHAIN_FAKE` announces itself** once per run, naming the file the passphrases sit in
+  in the clear. It stays enabled in release builds — the CLI tests run the shipped binary — so
+  saying so is what keeps it a test switch.
+- **Every keychain call runs on a worker thread with a 30-second `recv_timeout`**, so a macOS ACL
+  dialog nobody answers ends the command instead of hanging it (spike B). The worker is detached
+  rather than cancelled — a thread blocked in `securityd` cannot be interrupted — and it holds its
+  own end of a one-shot channel, so a late answer can never reach a later call.
+- **Tests**: a file-backed fake keychain behind `$CRYPTO_KEYCHAIN_FAKE` covers every CLI flow on
+  every OS, and while it is set it is the *only* provider, so no test can reach a developer's real
+  keychain. The real keychain is touched only by `crates/cryptomator-app/tests/keychain_e2e.rs`,
+  which is `#[ignore]`d *and* gated on `CRYPTO_E2E_KEYCHAIN=1`, isolates itself under the service
+  name `crypto-e2e-<pid>`, and skips rather than hangs when a dialog appears. New CI jobs
+  `keychain-e2e-linux` (gnome-keyring under `dbus-run-session`, plus a `secret-tool` check of the
+  raw attribute names) and `keychain-e2e-macos`, both `continue-on-error`.
+- **Follow-ups from M5**: `host_header_allowed` is re-exported from `webdav`, a `Host` header with
+  an empty port (`localhost:`) is refused, and `DavFile::seek` has a test for seeking before the
+  start of the file.
+
+#### Decisions taken along the way
+
+- **`$CRYPTO_PASSWORD` outranks the implicit keychain step.** It is a source a script sets on
+  purpose and it can never make the operating system open a dialog; a keychain lookup can.
+  `--password-keychain`, being explicit, outranks everything including `$CRYPTO_PASSWORD`.
+- **`TouchIdKeychainAccess` is not a provider of its own.** It and `MacSystemKeychainAccess`
+  address the same generic-password items — only `requireOsAuthentication` differs, and the CLI
+  cannot set it — so a `settings.json` naming the Touch-ID provider is served by the macOS backend.
+- **`change()` updates the item in place instead of Java's delete-and-store.** Deleting an entry
+  and writing a new one would drop the macOS ACL with it, and the user would be asked to approve
+  `crypto` all over again. `SecItemUpdate` with a label-less query keeps the ACL and also updates
+  an item that lives under the desktop app's label rather than ours.
+- **The macOS label is the vault's display name** (its id when it has none), where the desktop app
+  labels every item `Cryptomator`. The label is the column Keychain Access shows; the item is
+  addressed by service and account, so the two programs still find each other's entries.
+- **`store` on Linux removes superseded items.** `replace = true` only replaces an item whose
+  attribute set is *identical*, and `Name` is part of that set, so a renamed vault would otherwise
+  end up with two items carrying the same `Vault` and `load` would pick one at random.
+- **A missing keychain entry is never an error in the implicit step** — the prompt takes over —
+  but a locked keyring, a refused prompt, a timeout or a backend failure are, because silently
+  asking for a password the machine already has stored would hide a real problem.
+- **A keychain failure after the fact is a warning, not an exit code**: `--store-password` after a
+  successful mount, and the entry update after `password change`/`recovery-key reset-password`.
+  The mount stands and the new passphrase is already on disk; `crypto password store` repairs the
+  entry.
+- **`crypto keychain test` reports on an unsupported provider instead of hiding it.** It picks from
+  the unfiltered provider list, so the machine whose keychain does not work still gets a
+  `supported: false` line rather than one bare error — and it prints its document *before* it
+  fails.
+- **The self-test key is random** (`crypto-selftest-<16 hex>`) and the command fails outright when
+  the machine has no randomness, rather than falling back to a fixed key two concurrent runs would
+  fight over.
+- **The 30-second call budget and the 5-second probe budget are compiled in**, like the unlock
+  timeouts: a machine that needs them longer needs a rebuild, not a setting.
+
+#### Known limitations and follow-ups
+
+- **Reading an entry the desktop app wrote has not been verified end to end.** It needs a person at
+  the machine to answer the macOS ACL dialog and a desktop vault with a stored passphrase; spike B
+  could not do it and this milestone did not either. What is verified is our own round trip and,
+  in the E2E test, an entry seeded with `security add-generic-password -A`. Signing release
+  binaries with a stable Developer-ID identity (M8) is what makes "Always Allow" stick.
+- **The Linux backend has never run on real hardware here.** The development machine is a Mac;
+  the code compiles and lints for Linux and its pure parts are unit-tested, but no `store`, `load`,
+  `delete` or `change` has executed against a Secret Service. The `keychain-e2e-linux` CI job is
+  the first place any of it runs, and the `secret-tool` check there is the first thing that
+  compares the raw attribute names against something outside our own code — it still cannot compare
+  them against the desktop app.
+- **Touch-ID entries are best effort.** `TouchIdKeychainAccess` is served by the plain macOS
+  backend, so passwords `crypto` writes carry no Touch-ID access control; `security-framework`'s
+  password API cannot request one without unsafe code.
+- **KWallet is unsupported.** The provider exists only to say so and to point at `secret-service`.
+- **`change()` keeps the ACL by updating in place** — a deliberate deviation from Java's
+  delete-and-store. The consequence is that a stale label (the desktop app's, or an earlier display
+  name) survives a password change.
+- **`crypto unlock --json` has no `stored` field.** `vault create --json` reports `stored`, and
+  `password store --json` reports `{id, stored}`, but an unlock that saved a password says so only
+  on stderr.
+- **`--password-keychain` shows up in `crypto password store --help`.** It comes with the shared
+  `PasswordArgs` group; using it there would mean verifying a stored password against the vault and
+  storing it again, which is harmless but pointless.
+- **Keychain calls must not run concurrently in one process.** A pending macOS prompt serialises
+  keychain access, so a second call made next to a waiting one blocks too and burns its own 30
+  seconds. Every command makes its keychain calls one at a time; nothing enforces it structurally.
+- **The keychain item for the WebDAV mount is not written.** Java stores an anonymous *internet*
+  password before the AppleScript mount so macOS does not ask about the unencrypted connection.
+  It is unrelated to vault passphrases and would need its own code (protocol, host, port, path);
+  it is deferred to M8.
+- Still open from earlier milestones: macFUSE is unverified (M4), `LinuxGioMounter` has never run
+  on a real GNOME desktop (M5), and coexistence with a running desktop app is still a manual step
+  nobody has taken.

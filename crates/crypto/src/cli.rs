@@ -24,6 +24,9 @@ pub struct Cli {
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
+    /// Never touch the keychain, whatever settings.json says
+    #[arg(long, global = true)]
+    pub no_keychain: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -73,9 +76,20 @@ pub enum Command {
     Events(EventsArgs),
     /// The mount services this build knows
     Mounters(MountersArgs),
+    /// Inspect and self-test the keychain
+    Keychain {
+        #[command(subcommand)]
+        command: KeychainCommand,
+    },
     /// The vault daemon itself; started by `crypto unlock`, never by hand.
     #[command(name = "__daemon", hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KeychainCommand {
+    /// Report the provider and do a store/load/delete round trip with a throwaway key
+    Test,
 }
 
 #[derive(Args, Debug)]
@@ -115,6 +129,21 @@ pub struct UnlockArgs {
     /// Open the mount point in the file manager afterwards
     #[arg(long)]
     pub reveal: bool,
+    /// Save the password in the keychain once the vault is mounted
+    // `--password-keychain` took the password *from* the keychain, so there would be nothing to
+    // store that is not stored already: clap refuses that combination as a usage error (exit 2).
+    #[arg(
+        long,
+        group = "store-password-choice",
+        conflicts_with = "password_keychain"
+    )]
+    pub store_password: bool,
+    /// Do not save the password (the default; spell it out to be explicit in a script)
+    // A no-op today, on purpose: without `--store-password` nothing is ever stored implicitly. It
+    // is in the same group so a script can write the default down and keep its meaning if the
+    // default ever changes.
+    #[arg(long, group = "store-password-choice")]
+    pub no_store_password: bool,
     #[command(flatten)]
     pub password: PasswordArgs,
 }
@@ -204,6 +233,9 @@ pub enum VaultCommand {
         // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
         #[arg(allow_hyphen_values = true)]
         vault: String,
+        /// Also remove the vault's password from the keychain
+        #[arg(long)]
+        forget_password: bool,
     },
     /// List registered vaults with their state
     List,
@@ -274,12 +306,13 @@ pub struct SetArgs {
 pub enum ConfigCommand {
     /// Print one or all settings
     Get {
-        /// settings.json: mountService | port | useKeychain | keychainProvider | debugMode;
-        /// cli.json: mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs |
-        /// webdavBind
+        /// settings.json: mountService | port | useKeychain | keychainProvider (alias: macos,
+        /// touchid, secret-service, gnome-keyring, kde, kwallet) | debugMode; cli.json:
+        /// mountPointsDir | defaultMounter | logLevel | forceUnmountOnSignalAfterSecs | webdavBind
         key: Option<String>,
     },
-    /// Change a setting
+    /// Change a setting (keychainProvider takes the aliases macos, touchid, secret-service,
+    /// gnome-keyring, kde, kwallet or a Java class name)
     // Values may start with a dash (a negative number is refused later, with a reason).
     Set {
         key: String,
@@ -306,6 +339,9 @@ pub struct CreateArgs {
     /// Do not add the vault to settings.json
     #[arg(long)]
     pub no_register: bool,
+    /// Save the new password in the keychain
+    #[arg(long)]
+    pub store_password: bool,
     #[command(flatten)]
     pub password: PasswordArgs,
 }
@@ -323,6 +359,25 @@ pub struct AddArgs {
 pub enum PasswordCommand {
     /// Change the password of a vault (writes a .bkup of the old masterkey file)
     Change(ChangePasswordArgs),
+    /// Verify a password and save it in the keychain
+    Store(StorePasswordArgs),
+    /// Remove a vault's password from the keychain
+    Forget {
+        /// Vault id, display name or path
+        // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+        #[arg(allow_hyphen_values = true)]
+        vault: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct StorePasswordArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
 }
 
 #[derive(Args, Debug)]

@@ -1220,6 +1220,51 @@ mod tests {
         });
     }
 
+    /// `SeekFrom::Current(-N)` past position zero must error, not wrap: `target` is computed in
+    /// `i128` precisely so that `position + offset` going negative is representable, but the
+    /// final `u64::try_from` still has to reject it instead of silently truncating.
+    #[test]
+    fn seeking_before_the_start_of_the_file_is_an_error_not_a_wrap() {
+        let (_dir, fs) = test_fs();
+        fs.write_file(&CleartextPath::parse("/hello.txt"), b"0123456789", false)
+            .expect("write");
+        let dav = CryptoDavFs::new(Arc::clone(&fs));
+        runtime().block_on(async {
+            let options = OpenOptions {
+                read: true,
+                ..Default::default()
+            };
+            let mut file = dav
+                .open(&dav_path("/hello.txt"), options)
+                .await
+                .expect("open");
+            // Forward first, so the position is a small non-zero number ...
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), file.seek(io::SeekFrom::Current(2)))
+                    .await
+                    .expect("no timeout")
+                    .expect("seek forward"),
+                2
+            );
+            // ... and then far enough back that `position + offset` is negative. `u64::try_from`
+            // has to reject that instead of wrapping into a huge offset.
+            let err =
+                tokio::time::timeout(Duration::from_secs(5), file.seek(io::SeekFrom::Current(-3)))
+                    .await
+                    .expect("no timeout")
+                    .expect_err("seeking before the start is an error");
+            assert_eq!(err, FsError::GeneralFailure, "{err:?}");
+            // The position is unchanged, so the next seek still reports where we actually are.
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), file.seek(io::SeekFrom::Current(0)))
+                    .await
+                    .expect("no timeout")
+                    .expect("seek to where we are"),
+                2
+            );
+        });
+    }
+
     #[test]
     fn create_new_refuses_an_existing_name() {
         let (_dir, fs) = test_fs();

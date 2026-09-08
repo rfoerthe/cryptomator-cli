@@ -8,7 +8,9 @@ use crate::commands::Ctx;
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::settings::SettingsJson;
-use cryptomator_app::{resolve_mounter, AppError, CliConfig};
+use cryptomator_app::{
+    alias_for_keychain, resolve_keychain_provider, resolve_mounter, AppError, CliConfig,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -121,10 +123,22 @@ pub fn get(ctx: &Ctx, key: Option<&str>) -> Result<u8> {
                 return Err(unknown_key(key).into());
             }
             let value = all[key].clone();
-            ctx.out.emit(json!({ key: value }), || render(&value))?;
+            ctx.out
+                .emit(json!({ key: value }), || render_setting(key, &value))?;
         }
     }
     Ok(exit::OK)
+}
+
+/// One setting for a human reader. `keychainProvider` gets its short alias appended when the
+/// stored class has one, because that is the spelling `config set` takes back; the JSON stays the
+/// class name alone, which is what the desktop app reads and what a script wants.
+fn render_setting(key: &str, value: &Value) -> String {
+    let rendered = render(value);
+    match (key, alias_for_keychain(&rendered)) {
+        ("keychainProvider", Some(alias)) => format!("{rendered} (alias: {alias})"),
+        _ => rendered,
+    }
 }
 
 fn render(value: &Value) -> String {
@@ -172,8 +186,16 @@ pub fn set(ctx: &Ctx, key: &str, value: &str) -> Result<u8> {
             }
             "useKeychain" => settings.use_keychain = parse_bool(key, value)?,
             "keychainProvider" => {
-                reject_empty(key, value, "pass the keychain provider's Java class name")?;
-                settings.keychain_provider = value.to_string()
+                reject_empty(
+                    key,
+                    value,
+                    "pass a keychain alias or the provider's Java class name",
+                )?;
+                // Aliases like `macos` / `gnome-keyring` are a convenience of this CLI; what lands
+                // in settings.json is always the Java class name, so the desktop app keeps reading
+                // its own setting. Anything that is neither an alias nor a class name (no dot) is
+                // an `InvalidValue` that lists the aliases -- exit code 2, nothing written.
+                settings.keychain_provider = resolve_keychain_provider(value)?
             }
             "debugMode" => settings.debug_mode = parse_bool(key, value)?,
             // Unreachable: the key was checked against `KEYS` above, before `settings.json` was
@@ -275,6 +297,27 @@ mod tests {
         for key in KEYS.iter().chain(CLI_KEYS.iter()) {
             assert!(message.contains(key), "{key} missing in {message}");
         }
+    }
+
+    /// The alias is a human convenience; the value itself stays the class name.
+    #[test]
+    fn the_keychain_provider_is_rendered_with_its_alias() {
+        let class = json!("org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess");
+        assert_eq!(
+            render_setting("keychainProvider", &class),
+            "org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess (alias: gnome-keyring)"
+        );
+        // A class nobody has an alias for is printed as it is ...
+        let other = json!("org.example.Keychain");
+        assert_eq!(
+            render_setting("keychainProvider", &other),
+            "org.example.Keychain"
+        );
+        // ... and no other setting ever grows an alias.
+        assert_eq!(
+            render_setting("mountService", &class),
+            class.as_str().expect("a string")
+        );
     }
 
     #[test]

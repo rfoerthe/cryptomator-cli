@@ -1,11 +1,12 @@
 //! `crypto recovery-key show|reset-password`
 use crate::cli::{ResetPasswordArgs, ShowArgs};
-use crate::commands::{locked_vault_path, Ctx};
+use crate::commands::password::update_keychain_entry_or_warn;
+use crate::commands::{keychain_source, locked_vault, Ctx};
 use crate::exit;
 use anyhow::Result;
 use cryptomator_app::{
-    min_password_length, read_new_passphrase, read_passphrase, read_secret_file, AppError,
-    PasswordArgs, PasswordIo, SystemIo,
+    min_password_length, read_new_passphrase, read_passphrase_with_keychain, read_secret_file,
+    AppError, PasswordArgs, PasswordIo, SystemIo,
 };
 use cryptomator_core::recovery::{
     create_recovery_key, decode_recovery_key, reset_password, WordEncoder,
@@ -15,12 +16,19 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
-    let path = locked_vault_path(ctx, &args.vault)?;
+    let (vault, path) = locked_vault(ctx, &args.vault)?;
     // Reject Hub and unsupported key ids before asking for any passphrase.
     read_vault_config(&path)?
         .key_id()?
         .require_masterkey_file()?;
-    let passphrase = read_passphrase(&args.password, "Password: ", &mut SystemIo)?;
+    // Lazy: the provider is only probed once the source order actually reaches the keychain
+    // steps, so a scripted `--password-stdin` run never pays for it.
+    let passphrase = read_passphrase_with_keychain(
+        &args.password,
+        "Password: ",
+        || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
+        &mut SystemIo,
+    )?;
     let opened = open_vault(&path, &MasterkeyFileAccess::new(Vec::new()), &passphrase)?;
     let key = create_recovery_key(&WordEncoder::new(), opened.masterkey.raw());
     if ctx.out.json {
@@ -56,7 +64,7 @@ fn read_recovery_key(
 }
 
 pub fn reset_password_cmd(ctx: &Ctx, args: ResetPasswordArgs) -> Result<u8> {
-    let path = locked_vault_path(ctx, &args.vault)?;
+    let (vault, path) = locked_vault(ctx, &args.vault)?;
     let unverified = read_vault_config(&path)?;
     unverified.key_id()?.require_masterkey_file()?;
     let mut io = SystemIo;
@@ -79,8 +87,21 @@ pub fn reset_password_cmd(ctx: &Ctx, args: ResetPasswordArgs) -> Result<u8> {
         &new,
         &mut OsRng,
     )?;
-    ctx.out.emit(json!({ "path": path }), || {
-        "Password reset. A backup of the previous masterkey file was kept next to it.".to_string()
-    })?;
+    // Same reasoning as `password change`: a stored passphrase follows the reset, because a stale
+    // entry would make every later unlock fail silently. The masterkey file is already rewritten,
+    // so a keychain that refuses is a warning, not an exit code.
+    let keychain_updated = update_keychain_entry_or_warn(ctx, &vault, &new, &args.vault, "reset");
+    ctx.out.emit(
+        json!({ "path": path, "keychainUpdated": keychain_updated }),
+        || {
+            let base =
+                "Password reset. A backup of the previous masterkey file was kept next to it.";
+            if keychain_updated {
+                format!("{base}\nThe stored password in the keychain was updated.")
+            } else {
+                base.to_string()
+            }
+        },
+    )?;
     Ok(exit::OK)
 }

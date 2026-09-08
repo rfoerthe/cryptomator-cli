@@ -73,7 +73,8 @@ jobs:
   # The WebDAV end-to-end tests that mount a real volume. `webdav-applescript` asks Finder, through
   # `osascript -e 'mount volume …'`, so it needs a GUI (window server) session that a hosted runner
   # may not have -- and macOS may put a "connect to an unencrypted server?" dialog in the way, since
-  # there is no keychain item to suppress it (writing one is M6). Both tests print "skipped: …" and
+  # there is no keychain item to suppress it (Java writes an anonymous *internet* password for the
+  # server; M6 brought the vault keychain, that item is M8). Both tests print "skipped: …" and
   # pass when the mounter is not supported here, so a green job is only meaningful together with the
   # "mounted at …" line in its log; `continue-on-error` keeps it advisory either way. The
   # HTTP-level tests (crates/cryptomator-mount/tests/webdav_http.rs) need none of this and run in
@@ -126,3 +127,120 @@ jobs:
           "$CRYPTO" lock v
           # The bytes went through the server into the vault, not past it.
           "$CRYPTO" fs cat v /ci.txt --password-file "$PW" | grep -qx hello
+
+  # The keychain end-to-end tests. Like the mount jobs they are `#[ignore]`d twice over: `cargo
+  # test` skips them, and even `--ignored` only touches a keyring when CRYPTO_E2E_KEYCHAIN=1 says
+  # so. Everything else about the keychain -- every CLI flow -- runs against the file-backed fake
+  # in the ordinary `test` job above.
+  #
+  # `continue-on-error`: gnome-keyring under a headless session is fragile (no display, no
+  # ssh-agent, an empty-password keyring created on the fly), so a red job here must not block a
+  # pull request. A green one is only meaningful together with the "round trip: ok" line and the
+  # attribute assertions in its log -- both tests print "skipped: ..." and pass when no secret
+  # service answered. This is also the *first* place the Linux backend runs at all: it was written
+  # on a Mac and has no other hardware to run on.
+  keychain-e2e-linux:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `libsecret-tools` is what provides `secret-tool`; `dbus-x11` provides `dbus-run-session`.
+      - run: sudo apt-get update && sudo apt-get install -y gnome-keyring libsecret-tools dbus-x11
+      - run: cargo build --locked -p crypto
+      # The script is written to a file rather than inlined into `bash -c '...'`: it contains both
+      # quote characters, and one wrong nesting level would silently change what is asserted.
+      - name: write the keychain script
+        run: |
+          # Deliberately no `set -x` anywhere below: a trace would put the vault password into a
+          # public log. `secret-tool search` prints the secret itself, so its output is filtered
+          # down to the label and the attributes before anything is echoed.
+          cat > "$RUNNER_TEMP/keychain-e2e.sh" <<'SCRIPT'
+          set -euo pipefail
+
+          echo "::group::the end-to-end test against gnome-keyring"
+          CRYPTO_E2E_KEYCHAIN=1 cargo test -p cryptomator-app --test keychain_e2e --locked \
+            -- --ignored --nocapture
+          echo "::endgroup::"
+
+          CRYPTO="$PWD/target/debug/crypto"
+          export CRYPTO_SETTINGS_PATH="$RUNNER_TEMP/kc-settings.json"
+          export CRYPTO_STATE_DIR="$RUNNER_TEMP/kc-state"
+          mkdir -p "$CRYPTO_STATE_DIR"
+          PW="$RUNNER_TEMP/kc-pw"
+          (umask 077; printf 'ci-password-123' > "$PW")
+          trap 'rm -f "$PW"' EXIT
+
+          "$CRYPTO" vault create "$RUNNER_TEMP/kcv" --name kcv --password-file "$PW"
+          ID=$("$CRYPTO" --json vault list \
+               | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+          echo "vault id: $ID"
+
+          # `secret-tool search` prints `secret = ...` too, so only the label and the attributes
+          # ever reach the log. These are the raw names the desktop app has to agree with.
+          attributes() {
+            secret-tool search Vault "$ID" 2>/dev/null | grep -E '^(label|attribute\.)' || true
+          }
+
+          # The default provider on Linux is GnomeKeyringKeychainAccess: `Vault`, no `Name`.
+          "$CRYPTO" config get keychainProvider
+          "$CRYPTO" password store kcv --password-file "$PW"
+          GK=$(attributes)
+          echo "gnome-keyring item:"; echo "$GK"
+          echo "$GK" | grep -qxF "label = Cryptomator"
+          echo "$GK" | grep -qxF "attribute.Vault = $ID"
+          if echo "$GK" | grep -q '^attribute\.Name'; then
+            echo "GnomeKeyringKeychainAccess must not write a Name attribute"; exit 1
+          fi
+          "$CRYPTO" password forget kcv
+          test -z "$(attributes)"
+
+          # The SecretService variant writes `Name` as well, and is found by `Vault` alone.
+          "$CRYPTO" config set keychainProvider secret-service
+          "$CRYPTO" password store kcv --password-file "$PW"
+          SS=$(attributes)
+          echo "secret-service item:"; echo "$SS"
+          echo "$SS" | grep -qxF "label = Cryptomator"
+          echo "$SS" | grep -qxF "attribute.Vault = $ID"
+          echo "$SS" | grep -qxF "attribute.Name = kcv"
+          # A stored password is a password source of its own: nothing else is passed here.
+          "$CRYPTO" fs ls kcv / >/dev/null
+          "$CRYPTO" password forget kcv
+          test -z "$(attributes)"
+          echo "keychain CLI smoke: ok"
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/keychain-e2e.sh"
+      - name: round-trip a passphrase through gnome-keyring
+        # `dbus-run-session` gives the daemon a private session bus; `--unlock` with an empty
+        # password on stdin creates and unlocks the default keyring, so nothing prompts. The
+        # daemon prints the environment it wants exported, hence the `eval`.
+        run: |
+          set -euo pipefail
+          dbus-run-session -- bash -c '
+            eval "$(echo -n "" | gnome-keyring-daemon --unlock --components=secrets)"
+            export GNOME_KEYRING_CONTROL
+            bash "$RUNNER_TEMP/keychain-e2e.sh"
+          '
+
+  # macOS runners have an unlocked login keychain, so no `security create-keychain` is needed. The
+  # test points $CRYPTO_KEYCHAIN_SERVICE at `crypto-e2e-<pid>`, so it can only ever see its own
+  # items and never the real "Cryptomator" ones, and it deletes everything it wrote through a
+  # guard that also runs on panic.
+  #
+  # The one thing this job cannot cover is the ACL prompt: nothing on a hosted runner can put a
+  # dialog on screen, and the phase that reads a foreign entry seeds it with
+  # `security add-generic-password -A` ("any application may read it") precisely to avoid one.
+  # Reading an entry the Cryptomator desktop app wrote needs a human at a real Mac to answer
+  # "Always Allow" -- see the keychain section of the README. Every call is under a 10-second
+  # timeout that turns a dialog into a "skipped:" line rather than a hang, so `continue-on-error`
+  # keeps the job advisory and a green job is only meaningful together with the "round trip: ok"
+  # line in its log.
+  keychain-e2e-macos:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: CRYPTO_E2E_KEYCHAIN=1 cargo test -p cryptomator-app --test keychain_e2e --locked -- --ignored --nocapture

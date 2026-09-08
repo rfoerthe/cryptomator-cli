@@ -6,7 +6,9 @@ mod output;
 
 use anyhow::Context;
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand};
+use cli::{
+    Cli, Command, ConfigCommand, KeychainCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand,
+};
 use commands::Ctx;
 use cryptomator_app::settings::SettingsStore;
 use cryptomator_app::StateDir;
@@ -46,6 +48,13 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
+    // Before anything can log: the library warns through `log` (a keychain provider that had to
+    // be skipped, a self-test entry that could not be removed), and without a logger installed
+    // every one of those lines is dropped. `warn` is the CLI's level -- the console is for what
+    // the user has to know, not for a trace. `unlock --foreground` later swaps the daemon's log
+    // file in behind this same logger (`daemon::logging`), which is why it is installed here
+    // rather than fought over there.
+    cryptomator_app::daemon::init_stderr_logger(log::LevelFilter::Warn);
     // Absolutized once, here, rather than wherever each value is later used: a detached daemon
     // runs with its cwd at `/` (see `commands::unlock::spawn_daemon`), so a relative `--settings`
     // or `--state-dir` would resolve to the wrong place in the child even though it was correct
@@ -59,12 +68,13 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Some(path) => StateDir::at(path),
         None => StateDir::from_env_or_default()?,
     };
-    let ctx = Ctx {
+    let ctx = Ctx::new(
         store,
-        out: Output { json: cli.json },
+        Output { json: cli.json },
         state_dir,
         settings_arg,
-    };
+        cli.no_keychain,
+    );
     // Before the command runs, not after it wrote: the `flock` only serialises `crypto` against
     // `crypto`, and the user should know about the remaining gap while there is still time to
     // quit the app. stderr, so `--json` output stays machine-readable.
@@ -78,14 +88,19 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Vault { command } => match command {
             VaultCommand::Create(args) => commands::vault::create(&ctx, args),
             VaultCommand::Add(args) => commands::vault::add(&ctx, args),
-            VaultCommand::Remove { vault } => commands::vault::remove(&ctx, &vault),
+            VaultCommand::Remove {
+                vault,
+                forget_password,
+            } => commands::vault::remove(&ctx, &vault, forget_password),
             VaultCommand::List => commands::vault::list(&ctx),
             VaultCommand::Info { vault } => commands::vault::info(&ctx, &vault),
             VaultCommand::Set(args) => commands::vault::set(&ctx, args),
         },
-        Command::Password {
-            command: PasswordCommand::Change(args),
-        } => commands::password::change(&ctx, args),
+        Command::Password { command } => match command {
+            PasswordCommand::Change(args) => commands::password::change(&ctx, args),
+            PasswordCommand::Store(args) => commands::password::store(&ctx, args),
+            PasswordCommand::Forget { vault } => commands::password::forget(&ctx, &vault),
+        },
         Command::RecoveryKey { command } => match command {
             RecoveryKeyCommand::Show(args) => commands::recovery::show(&ctx, args),
             RecoveryKeyCommand::ResetPassword(args) => {
@@ -121,6 +136,9 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Stats(args) => commands::stats::stats(&ctx, args),
         Command::Events(args) => commands::events::events(&ctx, args),
         Command::Mounters(args) => commands::mounters::mounters(&ctx, args),
+        Command::Keychain { command } => match command {
+            KeychainCommand::Test => commands::keychain::test(&ctx),
+        },
         Command::Daemon(args) => commands::daemon::run(&ctx, args),
     }
 }
@@ -152,6 +170,8 @@ fn writes_settings(command: &Command) -> bool {
         | Command::Stats(_)
         | Command::Events(_)
         | Command::Mounters(_)
+        // `keychain test` writes into the keychain, never into settings.json.
+        | Command::Keychain { .. }
         | Command::Daemon(_) => false,
     }
 }

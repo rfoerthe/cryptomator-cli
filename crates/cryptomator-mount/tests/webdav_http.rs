@@ -7,7 +7,7 @@ use cryptomator_core::constants::DEFAULT_KEY_ID;
 use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions};
 use cryptomator_core::{initialize, open_vault_with_key, CipherCombo, DetRng, Masterkey};
 use cryptomator_mount::webdav::fs::CryptoDavFs;
-use cryptomator_mount::webdav::server::{
+use cryptomator_mount::webdav::{
     host_header_allowed, probe_context_root, strip_prefix_for, WebDavServerConfig,
     WebDavServerError, WebDavServerHandle, HEALTH_TIMEOUT,
 };
@@ -596,6 +596,9 @@ fn only_a_literal_address_or_localhost_is_an_acceptable_host() {
         "[::1]x",
         "[::1]:notaport",
         "127.0.0.1:notaport",
+        "localhost:",
+        "127.0.0.1:",
+        "[::1]:",
         "",
     ] {
         assert!(!host_header_allowed(refused), "{refused} is not");

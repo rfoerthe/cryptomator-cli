@@ -76,6 +76,17 @@ tokio = { version = "1.53.1", default-features = false, features = [
 bytes = "1.12"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 
+# Keychain back ends. `security-framework` wraps Security.framework (macOS); only the generic
+# password API is used, so the default TLS features (`alpn`, `session-tickets`) stay off.
+security-framework = { version = "3.7.0", default-features = false }
+# `secret-service` speaks the FreeDesktop Secret Service D-Bus interface (Linux only). The
+# blocking API is what we use, so the runtime only ever matters for zbus's own `block_on`:
+# `rt-tokio` reuses the tokio the workspace already depends on instead of pulling async-io in
+# next to it, and `crypto-rust` is the pure-Rust DH session (no OpenSSL to link against).
+secret-service = { version = "5.2", default-features = false, features = [
+    "rt-tokio-crypto-rust",
+] }
+
 # fuser is vendored under vendor/fuser: FUSE-T on macOS speaks the Linux struct layouts while
 # upstream fuser hard-codes the macFUSE ones. See vendor/fuser/README-VENDORED.md.
 [patch.crates-io]

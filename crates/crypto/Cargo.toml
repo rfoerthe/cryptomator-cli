@@ -19,10 +19,12 @@ clap.workspace = true
 anyhow.workspace = true
 zeroize.workspace = true
 serde_json.workspace = true
+getrandom.workspace = true
 sha2.workspace = true
 data-encoding.workspace = true
 libc.workspace = true
 signal-hook.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

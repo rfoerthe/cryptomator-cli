@@ -5,6 +5,7 @@
 pub mod cli_config;
 pub mod daemon;
 pub mod error;
+pub mod keychain;
 pub mod mounters;
 pub mod mounting;
 pub mod password;
@@ -20,14 +21,18 @@ pub use daemon::{
     PROTOCOL_VERSION,
 };
 pub use error::{AppError, Result};
+pub use keychain::{
+    alias_for_keychain, resolve_keychain_provider, service_name, with_timeout, Keychain,
+    KeychainError, KeychainResult, DEFAULT_SERVICE, KEYCHAIN_TIMEOUT, SERVICE_ENV,
+};
 pub use mounters::{alias_for, resolve_mounter};
 pub use mounting::{
     choose_service, conflicts_with, mount, MountHandle, MountOverrides, MountRequest,
 };
 pub use password::{
     min_password_length, normalize_passphrase, read_new_passphrase,
-    read_new_passphrase_no_env_fallback, read_passphrase, read_secret_file, NewPasswordArgs,
-    PasswordArgs, PasswordIo, SystemIo,
+    read_new_passphrase_no_env_fallback, read_passphrase, read_passphrase_with_keychain,
+    read_secret_file, KeychainSource, NewPasswordArgs, PasswordArgs, PasswordIo, SystemIo,
 };
 pub use platform::Platform;
 pub use registry::{RuntimeState, VaultInfo, VaultRegistry};

@@ -26,7 +26,17 @@ rpassword.workspace = true
 unicode-normalization.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
+security-framework.workspace = true
+
+# The Secret Service back ends (`keychain::linux`). Linux only: on macOS the crate would only pull
+# zbus and a D-Bus session bus that is not there.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# The keychain E2E seeds an item under the *legacy* service name, which carries a NUL byte: only
+# `SecKeychainAddGenericPassword`, which takes a length-delimited byte range, can express it.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework.workspace = true
