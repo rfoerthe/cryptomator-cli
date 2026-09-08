@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod dir_id;
+pub mod orphan;
 
 /// The ids of all checks, in the order they run and are reported.
 pub const CHECK_IDS: [&str; 3] = ["dirid", "type", "shortened"];

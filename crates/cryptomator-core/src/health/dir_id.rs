@@ -56,7 +56,7 @@ impl HealthCheck for DirIdCheck {
         // Java lets any IOException escape `walkFileTree` and turns it into a single `CheckFailed`;
         // a half-traversed vault would produce phantom `MissingContentDir`s, so we abort as well.
         if let Err(e) = visitor.walk(ctx, &data_dir, &data_dir, 0, sink) {
-            sink(check_failed(&ctx.relativize(&data_dir), &e));
+            sink(check_failed(&ctx.relativize(&e.path), &e.error));
             return;
         }
         let DirVisitor {
@@ -97,6 +97,27 @@ fn content_dir_name(cryptor: &Cryptor, dir_id: &str) -> PathBuf {
     let hash = cryptor.file_name_cryptor().hash_directory_id(dir_id);
     let (prefix, rest) = hash.split_at(2);
     Path::new(prefix).join(rest)
+}
+
+/// An I/O error paired with the node that was being visited when it happened.
+///
+/// Java's `newDirectoryStream` throws a `FileSystemException` that names the file and `DirIdCheck`
+/// logs it; we have no log, so the path travels with the error up to the single `CheckFailed` the
+/// aborted traversal produces. Without it one unreadable node anywhere below `d/` would yield
+/// nothing but "Permission denied" -- nothing a repair could act on.
+#[derive(Debug)]
+struct VisitError {
+    /// Absolute; the reporting side relativizes it.
+    path: PathBuf,
+    error: io::Error,
+}
+
+/// `Err(error)` at `path`, for `map_err`.
+fn at(path: &Path) -> impl FnOnce(io::Error) -> VisitError + '_ {
+    move |error| VisitError {
+        path: path.to_path_buf(),
+        error,
+    }
 }
 
 /// What the sibling loop does after a `dir.c9r` was visited (Java's `FileVisitResult`).
@@ -141,18 +162,21 @@ impl DirVisitor {
         dir: &Path,
         depth: usize,
         sink: &mut dyn FnMut(DiagnosticResult),
-    ) -> io::Result<()> {
+    ) -> Result<(), VisitError> {
         if let Ok(rel) = dir.strip_prefix(data_dir) {
             if rel.components().count() == 2 {
                 self.second_level_dirs.insert(rel.to_path_buf());
             }
         }
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(dir).map_err(at(dir))? {
+            let entry = entry.map_err(at(dir))?;
             // `DirEntry::file_type` does not follow symlinks, just like a `walkFileTree` without
             // `FOLLOW_LINKS`: a symlinked directory is visited as a file, not descended into.
-            entries.push((entry.file_name(), entry.file_type()?));
+            let file_type = entry
+                .file_type()
+                .map_err(at(&dir.join(entry.file_name())))?;
+            entries.push((entry.file_name(), file_type));
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, file_type) in entries {
@@ -174,7 +198,7 @@ impl DirVisitor {
         ctx: &CheckContext,
         dir_file: &Path,
         sink: &mut dyn FnMut(DiagnosticResult),
-    ) -> io::Result<Flow> {
+    ) -> Result<Flow, VisitError> {
         let rel = ctx.relativize(dir_file);
         let parent_name = dir_file
             .parent()
@@ -189,7 +213,9 @@ impl DirVisitor {
             return Ok(Flow::Continue);
         }
 
-        let size = std::fs::symlink_metadata(dir_file)?.len();
+        let size = std::fs::symlink_metadata(dir_file)
+            .map_err(at(dir_file))?
+            .len();
         if size > MAX_DIR_ID_LENGTH as u64 {
             sink(obese_dir_file(&rel, size));
         } else if size == 0 {
@@ -197,7 +223,8 @@ impl DirVisitor {
         } else {
             // Java reads the bytes as UTF-8 without validating them; a lossy conversion keeps a
             // garbled dir id comparable instead of aborting the whole traversal.
-            let dir_id = String::from_utf8_lossy(&std::fs::read(dir_file)?).into_owned();
+            let bytes = std::fs::read(dir_file).map_err(at(dir_file))?;
+            let dir_id = String::from_utf8_lossy(&bytes).into_owned();
             match self.dir_ids.get(&dir_id) {
                 Some(other) => sink(dir_id_collision(&dir_id, &rel, other.as_deref())),
                 None => {
@@ -343,7 +370,7 @@ fn missing_content_dir(
 }
 
 /// `OrphanContentDir`: a content dir no `dir.c9r` points at. Its fix moves the contents into
-/// `LOST+FOUND` and arrives with Task 5.
+/// `LOST+FOUND`; see [`crate::health::orphan`].
 fn orphan_content_dir(content_dir: &Path) -> DiagnosticResult {
     result(
         "OrphanContentDir",
@@ -351,7 +378,9 @@ fn orphan_content_dir(content_dir: &Path) -> DiagnosticResult {
         format!("Orphan directory: {}", content_dir.display()),
         vec![content_dir.to_path_buf()],
     )
-    // Task 5 attaches the LOST+FOUND adoption fix here.
+    .with_fix(Box::new(crate::health::orphan::AdoptOrphan {
+        content_dir: content_dir.to_path_buf(),
+    }))
 }
 
 /// `CheckFailed`: the traversal itself broke. Java logs the cause and prints only a hint at the
@@ -425,15 +454,38 @@ impl Fix for CreateContentDir {
     }
 
     fn apply(&self, ctx: &CheckContext) -> io::Result<()> {
+        // Refuse before creating anything: a content dir without the backup it was created for
+        // would only be a fresh orphan.
+        bounded_dir_id(&self.dir_id, &self.content_dir)?;
         std::fs::create_dir_all(ctx.resolve(&self.content_dir))?;
         write_backup(ctx, &self.dir_id, &self.content_dir)
     }
+}
+
+/// The dir id of a backup must survive `read_dir_id_backup`, which refuses more than
+/// [`MAX_DIR_ID_LENGTH`] bytes.
+///
+/// It comes from a lossy UTF-8 decode of at most 36 raw bytes, so a garbled `dir.c9r` grows to up
+/// to 108 bytes (3 per replacement character). Java encodes US-ASCII (`?` per bad byte) and stays
+/// within the limit by construction; we refuse instead of writing a backup nobody can read back.
+fn bounded_dir_id(dir_id: &str, content_dir: &Path) -> io::Result<()> {
+    if dir_id.len() > MAX_DIR_ID_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Directory id of {} exceeds the maximum length of {MAX_DIR_ID_LENGTH} bytes",
+                content_dir.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Writes `dirid.c9r` and tolerates an existing one. `write_dir_id_backup` opens the file with
 /// `CREATE_NEW` like Java, which throws there; tolerating `AlreadyExists` is what makes `--fix`
 /// idempotent (Java does the same only in `prepareStepParent`).
 fn write_backup(ctx: &CheckContext, dir_id: &str, content_dir: &Path) -> io::Result<()> {
+    bounded_dir_id(dir_id, content_dir)?;
     let dir = CiphertextDirectory {
         dir_id: dir_id.to_owned(),
         path: ctx.resolve(content_dir),
@@ -643,8 +695,91 @@ mod tests {
             orphan.message,
             "Orphan directory: d/AA/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         );
-        // Task 5 adds the LOST+FOUND adoption.
-        assert!(!orphan.fixable());
+        // The LOST+FOUND adoption of `health::orphan`, which has its own tests.
+        assert!(orphan.fixable());
+    }
+
+    /// The root has no `dir.c9r`, so its `MissingContentDir` prints `-` and carries no path at all
+    /// -- and its fix is the one repair that revives a vault whose root content dir vanished.
+    #[test]
+    fn a_missing_root_content_dir_is_reported_and_repaired() {
+        let (_dir, ctx) = vault();
+        let root = root_content_dir(&ctx.vault_path, &ctx.cryptor);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let before = run(&ctx);
+        assert_eq!(kinds(&before), vec!["MissingContentDir"]);
+        assert_eq!(before[0].severity, Severity::Warn);
+        assert_eq!(
+            before[0].message,
+            "dir.c9r file (-) points to non-existing directory."
+        );
+        assert!(before[0].paths.is_empty(), "{:#?}", before[0]);
+
+        before[0].fix.as_ref().unwrap().apply(&ctx).unwrap();
+        assert!(root.is_dir());
+        assert_eq!(
+            crate::fs::dir_id::read_dir_id_backup(&ctx.cryptor, &root).unwrap(),
+            ROOT_DIR_ID
+        );
+        assert_eq!(kinds(&run(&ctx)), vec!["HealthyDir"]);
+    }
+
+    /// A `dir.c9r` full of invalid UTF-8 decodes lossily to three bytes per bad byte, which would
+    /// produce a `dirid.c9r` that `read_dir_id_backup` refuses. The fix refuses first, and creates
+    /// nothing.
+    #[test]
+    fn a_garbled_dir_id_is_never_written_as_a_backup() {
+        let (_dir, ctx) = vault();
+        let root = root_content_dir(&ctx.vault_path, &ctx.cryptor);
+        let node = root.join("HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH.c9r");
+        std::fs::create_dir_all(&node).unwrap();
+        let garbled = [0xffu8; MAX_DIR_ID_LENGTH];
+        std::fs::write(node.join(DIR_FILE_NAME), garbled).unwrap();
+
+        let results = run(&ctx);
+        let broken = results
+            .iter()
+            .find(|r| r.kind == "MissingContentDir")
+            .expect("the garbled id hashes to a content dir that does not exist");
+        // 36 bad bytes become 36 replacement characters, i.e. 108 bytes -- three times the limit.
+        let dir_id = String::from_utf8_lossy(&garbled).into_owned();
+        assert!(dir_id.len() > MAX_DIR_ID_LENGTH);
+        let content_dir = ctx.data_dir().join(content_dir_name(&ctx.cryptor, &dir_id));
+
+        let e = broken.fix.as_ref().unwrap().apply(&ctx).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(!content_dir.exists(), "nothing was created");
+    }
+
+    /// A `CheckFailed` must say *where* the traversal broke; `d` alone is not actionable.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_traversal_names_the_node_it_broke_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, ctx) = vault();
+        let content = add_dir(&ctx, "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII.c9r", "unreadable");
+        std::fs::set_permissions(&content, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores the mode bits; the test has nothing to observe then.
+        let running_as_root = std::fs::read_dir(&content).is_ok();
+        let results = run(&ctx);
+        // Restore before asserting, or the temp dir cannot be cleaned up.
+        std::fs::set_permissions(&content, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if running_as_root {
+            return;
+        }
+
+        assert_eq!(kinds(&results), vec!["CheckFailed"]);
+        let rel = ctx.relativize(&content);
+        assert_eq!(results[0].paths, vec![rel.clone()]);
+        assert!(
+            results[0].message.starts_with(&format!(
+                "Check failed: Traversal of data dir failed: {}",
+                rel.display()
+            )),
+            "{}",
+            results[0].message
+        );
     }
 
     #[test]

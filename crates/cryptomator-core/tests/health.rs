@@ -203,14 +203,34 @@ fn expected_dirid() -> BTreeMap<String, (usize, String)> {
     expected
 }
 
-/// Applies every fix except the orphan adoption, which only arrives with Task 5.
-fn apply_simple_fixes(ctx: &CheckContext, results: &[DiagnosticResult]) {
+/// Applies every fix the report offers, in report order.
+fn apply_fixes(ctx: &CheckContext, results: &[DiagnosticResult]) {
     for result in results {
         if let Some(fix) = &result.fix {
             fix.apply(ctx)
                 .unwrap_or_else(|e| panic!("{} fix failed: {e}", result.kind));
         }
     }
+}
+
+/// The cleartext name of the step parent the adoption creates for `content_dir`: the two path
+/// components of `d/XX/YYYY…`, concatenated (`OrphanContentDir.fix`).
+fn step_parent_name(content_dir: &Path) -> String {
+    let component = |p: Option<&Path>| {
+        p.and_then(Path::file_name)
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    format!(
+        "{}{}",
+        component(content_dir.parent()),
+        component(Some(content_dir))
+    )
+}
+
+fn names_of(entries: &[cryptomator_core::DirEntry]) -> Vec<&str> {
+    entries.iter().map(|e| e.cleartext_name.as_str()).collect()
 }
 
 #[test]
@@ -291,50 +311,201 @@ fn an_intact_vault_yields_only_good_dirid_results() {
 }
 
 #[test]
-fn the_simple_dirid_fixes_repair_the_vault_and_are_idempotent() {
+fn the_dirid_fixes_repair_the_vault_and_are_idempotent() {
     let (_tmp, vault, ctx) = context("broken_health");
     let before = dirid(&ctx);
-    // The adoption fix arrives with Task 5; until then the orphan is reported without one.
     assert!(
         before
             .iter()
-            .any(|r| r.kind == "OrphanContentDir" && !r.fixable()),
+            .any(|r| r.kind == "OrphanContentDir" && r.fixable()),
         "{before:#?}"
     );
     // Before the repair the directory whose content dir is missing is not even listable.
     let fs = CryptoFs::open(unlock(&vault), CryptoFsOptions::default());
     assert!(
-        !fs.read_dir(&CleartextPath::root())
-            .expect("the root lists")
-            .iter()
-            .any(|e| e.cleartext_name == "nocontent"),
+        !names_of(&fs.read_dir(&CleartextPath::root()).expect("the root lists"))
+            .contains(&"nocontent"),
         "the broken directory is filtered out while its content dir is missing"
     );
     drop(fs);
 
-    apply_simple_fixes(&ctx, &before);
+    apply_fixes(&ctx, &before);
     let after = dirid(&ctx);
-    for kind in ["LooseDirFile", "MissingDirIdBackup", "MissingContentDir"] {
-        assert_eq!(count_kind(&after, kind), 0, "{kind}: {after:#?}");
+    for kind in [
+        "LooseDirFile",
+        "MissingDirIdBackup",
+        "MissingContentDir",
+        "OrphanContentDir",
+    ] {
+        // `MissingDirIdBackup` reappears below for the freshly created recovery directory, but the
+        // one the fixture carries is repaired.
+        if kind != "MissingDirIdBackup" {
+            assert_eq!(count_kind(&after, kind), 0, "{kind}: {after:#?}");
+        }
     }
-    // Untouched: the orphan fix was not implemented yet, the collision is unfixable in Java too.
-    assert_eq!(count_kind(&after, "OrphanContentDir"), 1, "{after:#?}");
+    // Java's `prepareRecoveryDir` writes no `dirid.c9r` for /LOST+FOUND, so the adoption leaves
+    // exactly one new INFO finding for the next pass to repair.
+    assert_eq!(count_kind(&after, "MissingDirIdBackup"), 1, "{after:#?}");
+    // The collision is unfixable in Java too.
     assert_eq!(count_kind(&after, "DirIdCollision"), 1, "{after:#?}");
 
-    // Applying the same fixes a second time changes nothing.
-    apply_simple_fixes(&ctx, &after);
-    assert_eq!(by_kind(&dirid(&ctx)), by_kind(&after));
+    apply_fixes(&ctx, &after);
+    let settled = dirid(&ctx);
+    assert_eq!(
+        count_kind(&settled, "MissingDirIdBackup"),
+        0,
+        "{settled:#?}"
+    );
+    // A further round changes nothing at all.
+    apply_fixes(&ctx, &settled);
+    assert_eq!(by_kind(&dirid(&ctx)), by_kind(&settled));
 
-    // The repaired vault still opens and the repaired directory now lists (empty, its content was
-    // never there — the fix restores the structure, not the data).
+    // The repaired vault still opens, the repaired directory now lists (empty, its content was
+    // never there — the fix restores the structure, not the data) and the adopted files of the
+    // orphan are reachable below /LOST+FOUND.
     let fs = CryptoFs::open(unlock(&vault), CryptoFsOptions::default());
     let root = fs.read_dir(&CleartextPath::root()).expect("the root lists");
-    assert!(
-        root.iter().any(|e| e.cleartext_name == "nocontent"),
-        "{root:#?}"
-    );
+    assert!(names_of(&root).contains(&"nocontent"), "{root:#?}");
+    assert!(names_of(&root).contains(&"LOST+FOUND"), "{root:#?}");
     assert!(fs
         .read_dir(&CleartextPath::parse("/nocontent"))
         .expect("the repaired directory lists")
         .is_empty());
+
+    let lost_and_found = CleartextPath::parse("/LOST+FOUND");
+    let step_parents = fs
+        .read_dir(&lost_and_found)
+        .expect("/LOST+FOUND lists after the adoption");
+    let orphan_path = before
+        .iter()
+        .find(|r| r.kind == "OrphanContentDir")
+        .map(|r| r.paths[0].clone())
+        .expect("the orphan was reported");
+    assert_eq!(
+        names_of(&step_parents),
+        vec![step_parent_name(&orphan_path).as_str()],
+        "one step parent per adopted orphan"
+    );
+    let step_parent = lost_and_found
+        .join(&step_parents[0].cleartext_name)
+        .expect("a hash is a valid file name");
+    let adopted = fs.read_dir(&step_parent).expect("the step parent lists");
+    // The orphan still had its `dirid.c9r`, so the original names could be decrypted.
+    assert_eq!(
+        names_of(&adopted),
+        vec!["adopted.txt", "second.txt"],
+        "{adopted:#?}"
+    );
+
+    // …and the payload of an adopted file is readable through the cleartext layer.
+    let file = step_parent.join("adopted.txt").expect("a valid file name");
+    let handle = fs
+        .open_file(&file, cryptomator_core::OpenOptions::read_only())
+        .expect("the adopted file opens");
+    let size = handle.size();
+    assert!(size > 0, "the adopted file is not empty");
+    let mut buf = vec![0u8; size as usize];
+    assert_eq!(
+        handle.read_at(&mut buf, 0).expect("the file reads"),
+        buf.len()
+    );
+}
+
+/// The specifics of `OrphanContentDir.fix`: the `/LOST+FOUND` node in the vault root carries the
+/// dir id `recovery`, the step parent is named after the orphan's hash, and a shortened node stays
+/// shortened. The fixture's orphan holds no `.c9s`, so this test adds one to the copy.
+#[test]
+fn the_orphan_adoption_builds_lost_and_found_the_way_java_does() {
+    let (_tmp, vault, ctx) = context("broken_health");
+    let orphan_rel = dirid(&ctx)
+        .into_iter()
+        .find(|r| r.kind == "OrphanContentDir")
+        .expect("the fixture carries an orphan")
+        .paths[0]
+        .clone();
+    let orphan = ctx.resolve(&orphan_rel);
+
+    // A shortened node whose `name.c9s` does not decrypt: the adoption has to fall back to
+    // `file<n>_<runId>_withVeryLongName…` and shorten that name again.
+    let c9s = orphan.join(format!("{}.c9s", "D".repeat(32)));
+    std::fs::create_dir_all(&c9s).unwrap();
+    std::fs::write(c9s.join("contents.c9r"), b"unreadable").unwrap();
+    std::fs::write(c9s.join("name.c9s"), b"notACiphertextName.c9r").unwrap();
+
+    let orphan_result = dirid(&ctx)
+        .into_iter()
+        .find(|r| r.kind == "OrphanContentDir")
+        .expect("still an orphan");
+    let fix = orphan_result.fix.as_ref().expect("the orphan is fixable");
+    assert!(fix.describe().contains("LOST+FOUND"), "{}", fix.describe());
+    fix.apply(&ctx).expect("the adoption succeeds");
+    assert!(!orphan.exists(), "the orphaned content dir was removed");
+
+    // `/LOST+FOUND` sits in the vault root and its `dir.c9r` names the fixed recovery id.
+    let root = cryptomator_core::root_content_dir(&vault, &ctx.cryptor);
+    let cipher_name = format!(
+        "{}.c9r",
+        ctx.cryptor
+            .file_name_cryptor()
+            .encrypt_filename("LOST+FOUND", &[b""])
+    );
+    let dir_file = root.join(&cipher_name).join("dir.c9r");
+    assert_eq!(std::fs::read_to_string(&dir_file).unwrap(), "recovery");
+
+    // The step parent below it is named after the orphan and holds the three adopted nodes.
+    let fs = CryptoFs::open(unlock(&vault), CryptoFsOptions::default());
+    let step_parent = CleartextPath::parse("/LOST+FOUND")
+        .join(&step_parent_name(&orphan_rel))
+        .expect("a hash is a valid file name");
+    let adopted = fs.read_dir(&step_parent).expect("the step parent lists");
+    let names = names_of(&adopted);
+    assert!(names.contains(&"adopted.txt"), "{adopted:#?}");
+    assert!(names.contains(&"second.txt"), "{adopted:#?}");
+    let generated = names
+        .iter()
+        .find(|n| n.starts_with("file"))
+        .expect("the undecryptable node was renamed: {adopted:#?}");
+    assert!(generated.contains("_withVeryLongName"), "{generated}");
+
+    // Its ciphertext is a `.c9s` directory again, with a `name.c9s` holding the full name. The
+    // step parent's content dir is found the way the mapper would: recovery id -> hash -> the step
+    // parent's own `dir.c9r` -> hash.
+    let step_cipher = format!(
+        "{}.c9r",
+        ctx.cryptor
+            .file_name_cryptor()
+            .encrypt_filename(&step_parent_name(&orphan_rel), &[b"recovery"])
+    );
+    let recovery_hash = ctx
+        .cryptor
+        .file_name_cryptor()
+        .hash_directory_id("recovery");
+    let step_dir_id = std::fs::read_to_string(
+        ctx.data_dir()
+            .join(&recovery_hash[..2])
+            .join(&recovery_hash[2..])
+            .join(&step_cipher)
+            .join("dir.c9r"),
+    )
+    .expect("the step parent has a dir.c9r");
+    let step_hash = ctx
+        .cryptor
+        .file_name_cryptor()
+        .hash_directory_id(&step_dir_id);
+    let step_content_dir = ctx.data_dir().join(&step_hash[..2]).join(&step_hash[2..]);
+    let shortened: Vec<PathBuf> = std::fs::read_dir(&step_content_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "c9s"))
+        .collect();
+    assert_eq!(shortened.len(), 1, "{shortened:#?}");
+    let long_name = std::fs::read_to_string(shortened[0].join("name.c9s"))
+        .expect("the adopted .c9s carries a name.c9s");
+    assert!(long_name.ends_with(".c9r"), "{long_name}");
+    assert!(
+        long_name.len() > ctx.shortening_threshold,
+        "the generated name really needed shortening: {}",
+        long_name.len()
+    );
+    assert!(shortened[0].join("contents.c9r").is_file(), "content moved");
 }
