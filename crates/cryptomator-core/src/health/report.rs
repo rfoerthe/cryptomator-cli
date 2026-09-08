@@ -157,21 +157,69 @@ pub fn report_file_name(vault_name: &str, at: SystemTime) -> String {
 /// [`MAX_NAME_COLLISIONS`] candidate names are taken.
 pub fn write_report(dir: &Path, file_name: &str, contents: &str) -> io::Result<PathBuf> {
     let path = reserve_name(dir, file_name)?;
-    let temp = match write_temp_file(dir, file_name, contents) {
-        Ok(temp) => temp,
+    // The rename inside replaces the empty file the reservation created; that file is ours, so
+    // nobody else's report is lost by it.
+    match replace_with_temp(dir, file_name, contents, &path) {
+        Ok(()) => Ok(path),
         Err(e) => {
             let _ = std::fs::remove_file(&path);
-            return Err(e);
+            Err(e)
         }
-    };
-    // The rename replaces the empty file the reservation created; that file is ours, so nobody
-    // else's report is lost by it.
-    if let Err(e) = std::fs::rename(&temp, &path) {
+    }
+}
+
+/// [`write_report`] for a report file the caller names in full, with a say over the collision rule.
+///
+/// `crypto health` has two report targets and they answer "the file is already there" differently:
+///
+/// * the automatic report in the working directory keeps [`write_report`]'s rule -- `overwrite =
+///   false`, nothing is ever replaced, yesterday's evidence survives;
+/// * `--report FILE` passes `overwrite = true`, because the user named that path and expects the
+///   report *there*. A surprise `FILE-1.log` would break the obvious `crypto health v --report
+///   r.log && cat r.log`.
+///
+/// Both stay atomic: the text is written to a temporary file next to the target and moved onto it,
+/// so a crash never leaves half a report behind -- and with `overwrite = true` never destroys the
+/// previous one either, which a plain truncating write would do the moment it opened the file.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidInput`] if `path` does not end in a file name, or if that name is not
+/// UTF-8 (the temporary file is derived from it); otherwise whatever the file system reports.
+pub fn write_report_to(path: &Path, contents: &str, overwrite: bool) -> io::Result<PathBuf> {
+    let (dir, file_name) = split_target(path)?;
+    if !overwrite {
+        return write_report(dir, file_name, contents);
+    }
+    replace_with_temp(dir, file_name, contents, path)?;
+    Ok(path.to_path_buf())
+}
+
+/// The directory a report goes into and the name it takes there.
+///
+/// `Path::new("report.log").parent()` is `Some("")`, and joining onto an empty path yields the
+/// relative name again -- so a bare file name lands in the working directory, as typed.
+fn split_target(path: &Path) -> io::Result<(&Path, &str)> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} does not name a report file", path.display()),
+            )
+        })?;
+    Ok((path.parent().unwrap_or(Path::new("")), file_name))
+}
+
+/// Writes `contents` into a temporary file in `dir` and moves it onto `target`, leaving no
+/// temporary file behind on either failure.
+fn replace_with_temp(dir: &Path, file_name: &str, contents: &str, target: &Path) -> io::Result<()> {
+    let temp = write_temp_file(dir, file_name, contents)?;
+    if let Err(e) = std::fs::rename(&temp, target) {
         let _ = std::fs::remove_file(&temp);
-        let _ = std::fs::remove_file(&path);
         return Err(e);
     }
-    Ok(path)
+    Ok(())
 }
 
 /// Creates the first free candidate name exclusively and returns it, leaving the empty file behind
@@ -511,6 +559,32 @@ REASON:
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
         assert_eq!(std::fs::read_to_string(&third).unwrap(), "third");
+    }
+
+    /// The `--report FILE` rule: the report lands at the path the user named, every time.
+    #[test]
+    fn a_named_target_is_replaced_while_the_automatic_name_still_steps_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("r.log");
+        assert_eq!(write_report_to(&target, "first", true).unwrap(), target);
+        assert_eq!(write_report_to(&target, "second", true).unwrap(), target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no sibling and no leftover temporary file"
+        );
+        // The same call with `overwrite = false` is `write_report`, suffix and all.
+        let stepped_aside = write_report_to(&target, "third", false).unwrap();
+        assert_eq!(stepped_aside.file_name().unwrap(), "r-1.log");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(&stepped_aside).unwrap(), "third");
+    }
+
+    #[test]
+    fn a_target_without_a_file_name_is_rejected() {
+        let err = write_report_to(Path::new("/"), "x", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

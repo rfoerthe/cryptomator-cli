@@ -3,6 +3,7 @@ pub mod config;
 pub mod daemon;
 pub mod events;
 pub mod fs;
+pub mod health;
 pub mod keychain;
 pub mod lock;
 pub mod mounters;

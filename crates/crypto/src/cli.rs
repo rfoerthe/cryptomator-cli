@@ -76,6 +76,8 @@ pub enum Command {
     Events(EventsArgs),
     /// The mount services this build knows
     Mounters(MountersArgs),
+    /// Check a vault for structural damage and optionally repair it
+    Health(HealthArgs),
     /// Inspect and self-test the keychain
     Keychain {
         #[command(subcommand)]
@@ -165,6 +167,37 @@ pub struct LockArgs {
     /// Unmount even while the volume is in use
     #[arg(long)]
     pub force: bool,
+}
+
+/// Only `--report` and `--no-report` exclude each other; `--fix-severity` without `--fix` is
+/// harmless and stays a no-op, the way `--interval` without `--follow` does.
+#[derive(Args, Debug)]
+pub struct HealthArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Which checks to run, comma separated: dirid, type, shortened (default: all)
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub check: Vec<String>,
+    /// Apply the fixes of the findings that have one
+    #[arg(long)]
+    pub fix: bool,
+    /// Lowest severity that --fix repairs
+    #[arg(long, value_name = "WARN|CRITICAL", default_value = "WARN")]
+    pub fix_severity: String,
+    /// Where to write the text report; it replaces an existing file of that name
+    /// (default: ./healthReport_<vault>_<stamp>.log, which never replaces one)
+    #[arg(long, value_name = "FILE", conflicts_with = "no_report")]
+    pub report: Option<PathBuf>,
+    /// Write no report file
+    #[arg(long)]
+    pub no_report: bool,
+    /// Lowest severity that makes the command exit 11
+    #[arg(long, value_name = "WARN|CRITICAL", default_value = "CRITICAL")]
+    pub fail_on: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
 }
 
 #[derive(Args, Debug)]

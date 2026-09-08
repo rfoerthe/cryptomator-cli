@@ -33,7 +33,9 @@ pub use fs::{
     CryptoFsOptions, CryptoPathMapper, DirEntry, DirIdLoader, EventSink, FileAttributes,
     FileHandle, FilesystemEvent, FilesystemLoop, OpenOptions,
 };
-pub use health::report::{civil_utc, render_report, report_file_name, write_report};
+pub use health::report::{
+    civil_utc, render_report, report_file_name, write_report, write_report_to,
+};
 pub use health::{
     all_checks, checks_by_ids, run_checks, CheckContext, DiagnosticResult, Fix, HealthCheck,
     Severity, CHECK_FAILED_KIND, CHECK_IDS,

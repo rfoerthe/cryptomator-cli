@@ -136,6 +136,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Stats(args) => commands::stats::stats(&ctx, args),
         Command::Events(args) => commands::events::events(&ctx, args),
         Command::Mounters(args) => commands::mounters::mounters(&ctx, args),
+        Command::Health(args) => commands::health::run(&ctx, args),
         Command::Keychain { command } => match command {
             KeychainCommand::Test => commands::keychain::test(&ctx),
         },
@@ -170,6 +171,8 @@ fn writes_settings(command: &Command) -> bool {
         | Command::Stats(_)
         | Command::Events(_)
         | Command::Mounters(_)
+        // `health` reads the vault; even `--fix` (Task 9) never touches settings.json.
+        | Command::Health(_)
         // `keychain test` writes into the keychain, never into settings.json.
         | Command::Keychain { .. }
         | Command::Daemon(_) => false,

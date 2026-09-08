@@ -14,6 +14,10 @@ pub const UNMOUNT_FAILED: u8 = 7;
 pub const KEYCHAIN_UNAVAILABLE: u8 = 8;
 pub const HUB_VAULT: u8 = 9;
 pub const DAEMON_UNREACHABLE: u8 = 10;
+/// `crypto health` found something at or above its `--fail-on` threshold. Not an error -- the
+/// command did exactly what it was asked to do -- so it is returned by the command itself rather
+/// than mapped from an error type here.
+pub const HEALTH_FINDINGS: u8 = 11;
 pub const NOT_A_VAULT: u8 = 12;
 
 // Exhaustive on purpose (no `_` arm): a new `CoreError` variant must be given an exit code here
