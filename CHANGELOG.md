@@ -661,7 +661,8 @@
 - **`cryptomator_core::migration`**: `detect_version`, `needs_migration`, `plan` and `migrate` over
   `VaultVersion` `V5`…`V8`, with the three migrators — `v6` (NFC passphrase, masterkey rewritten),
   `v7` (`FilePathMigration`: BASE32 → base64url, `0`/`1S` prefixes to `.c9r` directories, `.lng`
-  from `m/xx/yy/` into `name.c9s`, up to three `_n` attempts on a collision, `m/` deleted) and `v8`
+  from `m/xx/yy/` into `name.c9s`, up to three `_n` attempts on a collision, `m/` deleted when
+  nothing was skipped) and `v8`
   (the `vault.cryptomator` JWT with `SIV_CTRMAC` and threshold 220, masterkey version 999). The
   capability probe in `c/`, `PreMigrationVisitor` and the `.bkup` rule are Java's.
 - **`crypto migrate <VAULT>`** with `--yes` and `--dry-run`, a confirmation on a terminal, one
@@ -679,7 +680,26 @@
 - **Everything is staged and validated before the vault is touched**: the recovery key is decoded
   and, when a config survived, checked against it; the staged masterkey is loaded back; the staged
   config's signature is verified; `--all` opens the whole pair as a vault. Only then are the files
-  backed up and moved into place.
+  backed up and moved into place — `vault.cryptomator` first, `masterkey.cryptomator` second, so a
+  failure between the two moves leaves the half-state `restore --masterkey` can finish.
+- **A restore into a format 5/6 vault is refused** (exit `5`, naming `crypto migrate`). Such a
+  vault that lost both key files is `ALL_MISSING`, which the command otherwise accepts; writing a
+  format 8 config over its BASE32 names would make `detect_version` answer 8, `crypto migrate`
+  refuse it and no Cryptomator open it again. The tell is `<vault>/m`, so format 7 — which shares
+  its layout with format 8 — is unaffected.
+- **The nodes the 6 → 7 step cannot migrate are reported instead of being swallowed.** A `.lng`
+  whose `m/` entry is missing, unreadable or oversized, a name that does not base32-decode and a
+  node that lost all three `_n` attempts keep their old names; `crypto migrate` names them on
+  stderr, counts them in its summary line and lists them under `skipped` in `--json`, and
+  `--dry-run` lists them before anything is written.
+- **`m/` is kept when at least one node was skipped** — a deliberate deviation from Java, which
+  deletes the metadata directory unconditionally and with it the only copy of those nodes' long
+  names. A leftover `m/` is ignored by formats 7 and 8, and the next migration run removes it.
+- **`crypto health --fix`, `crypto migrate` and `crypto recovery-key restore` warn when the
+  Cryptomator desktop app is running.** The automatic "is anybody serving this vault?" check only
+  asks `crypto`'s own daemon, and a vault the desktop app has unlocked looks `LOCKED` on disk — so
+  the three commands that rewrite vault content say so on stderr before they start. `health`
+  without `--fix` and `migrate --dry-run` stay silent.
 - **New fixtures**: `broken_health` (nine deliberate damages plus `expected-findings.json`, the
   findings the *real* cryptofs health checks report for it) and `legacy_v7` / `legacy_v6` /
   `legacy_v5`, each written by the cryptofs release that produced that format (1.9.15 / 1.8.9 /
@@ -741,6 +761,16 @@
   `0700`, 64 random bits, removed on `Drop`) rather than pulling `tempfile` into the core.
 - **`legacy_v5` is written by real cryptofs 1.3.2** instead of re-stamping a format 6 masterkey
   file, which is what the plan had proposed: the genuine artefact is worth the extra Maven module.
+- **A skipped node keeps `m/` alive, and that is the one place the 6 → 7 step leaves Java behind.**
+  Java logs a `SKIP` line and deletes `m/` anyway; the node then keeps a name nothing can inflate,
+  in the one command that rewrites every name in the vault, and no health check looks at it.
+  Keeping the directory costs nothing and is the difference between "repairable" and "lost".
+- **The `TrailingBytesInNameFile` fix stages and renames** (`name.c9s.tmp` → `name.c9s`) instead of
+  truncating in place: a crash in the middle of `std::fs::write` would turn a `WARN` into a
+  `CRITICAL` (`MissingLongName`) that has no fix at all.
+- **The orphan adoption's cross-device fallback refuses anything but files and directories.** It is
+  the one repair that copies and then deletes, so following an OS symlink there would rewrite what
+  it was meant to move.
 
 #### Known limitations and follow-ups
 
@@ -770,6 +800,14 @@
   has nothing to catch it with. Java has the same hole.
 - **`restore --config` and `restore --masterkey` hard-wire `masterkey.cryptomator`**, as Java does:
   a vault whose config named a different masterkey file cannot be rebuilt with them.
+- **The desktop-app warning is best effort.** It is a connect to the app's IPC socket, so an app
+  that is running without one — or one whose socket path was overridden — is not noticed, and the
+  warning is printed for *any* running app, not only for one holding this vault. There is no way to
+  ask it which vaults it has unlocked.
+- **The capability probe deletes a pre-existing `<vault>/c`.** `FileSystemCapabilityChecker`
+  removes the probe directory recursively whether or not it created it, and `crypto migrate` keeps
+  that behaviour; a `c/` directory of the user's own in a vault root does not survive a migration.
+  `--dry-run` never probes.
 - **The report always lands in the working directory** unless `--report` says otherwise, and its
   timestamp is UTC. There is no `--report-dir`.
 - **`crypto health` is single-threaded.** Java streams results from an `ExecutorService` as they

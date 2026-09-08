@@ -78,11 +78,24 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
     // Before the command runs, not after it wrote: the `flock` only serialises `crypto` against
     // `crypto`, and the user should know about the remaining gap while there is still time to
     // quit the app. stderr, so `--json` output stays machine-readable.
-    if writes_settings(&cli.command) && ctx.store.desktop_app_running() {
-        eprintln!(
-            "warning: the Cryptomator desktop app is running; changes to settings.json may be \
-             overwritten by it"
-        );
+    // One probe for both warnings: `desktop_app_running` connects to a socket, and a command that
+    // writes settings *and* vault content (there is none today, but the two predicates are
+    // independent) must not pay for it twice.
+    let settings_at_risk = writes_settings(&cli.command);
+    let content_at_risk = writes_vault_content(&cli.command);
+    if (settings_at_risk || content_at_risk) && ctx.store.desktop_app_running() {
+        if settings_at_risk {
+            eprintln!(
+                "warning: the Cryptomator desktop app is running; changes to settings.json may be \
+                 overwritten by it"
+            );
+        }
+        if content_at_risk {
+            eprintln!(
+                "warning: the Cryptomator desktop app is running; lock this vault there before \
+                 continuing -- crypto only checks its own daemon"
+            );
+        }
     }
     match cli.command {
         Command::Vault { command } => match command {
@@ -152,7 +165,8 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
 /// Read-only commands stay silent: nothing they do can be lost, and a warning on every
 /// `crypto status` would train the user to ignore it. `password change` and `recovery-key` are
 /// silent too -- they rewrite the masterkey file inside the vault, which the desktop app does not
-/// hold a competing copy of.
+/// hold a competing copy of. What the app *can* be doing to that vault is
+/// [`writes_vault_content`]'s subject, and its warning is a separate line.
 fn writes_settings(command: &Command) -> bool {
     match command {
         // `list` and `info` only read; everything else in `vault` rewrites the vault list.
@@ -181,6 +195,33 @@ fn writes_settings(command: &Command) -> bool {
         // `keychain test` writes into the keychain, never into settings.json.
         | Command::Keychain { .. }
         | Command::Daemon(_) => false,
+    }
+}
+
+/// Whether `command` rewrites the **contents of a vault** -- its key files or the names below
+/// `d/` -- and therefore whether a desktop app that has this vault unlocked and mounted can be
+/// serving files out from under it.
+///
+/// This is a different hazard from [`writes_settings`], and a much larger one: `settings.json` is
+/// a list that can be retyped, while `health --fix` moves and deletes nodes, `migrate` renames
+/// every file in the vault and `recovery-key restore` swaps the masterkey. All three refuse a
+/// vault *`crypto`'s own daemon* is serving (`commands::vault_in_state`), but a vault the desktop
+/// app has unlocked looks LOCKED from here -- its key files are untouched -- so the warning is the
+/// only thing standing between the user and a repair applied to a live mount.
+///
+/// `password change` and `recovery-key reset-password` are deliberately left out: they need a
+/// LOCKED vault and rewrite only the masterkey file, which a running mount does not re-read. The
+/// commands here either rewrite ciphertext (`health --fix`, `migrate`) or replace the key files of
+/// a vault that is by definition damaged (`recovery-key restore`, which also accepts an
+/// unregistered vault and therefore skips even the daemon check).
+fn writes_vault_content(command: &Command) -> bool {
+    match command {
+        // Without `--fix` the check only reads; the report goes next to the vault, not into it.
+        Command::Health(args) => args.fix,
+        // A `--dry-run` writes nothing at all, not even the capability probe.
+        Command::Migrate(args) => !args.dry_run,
+        Command::RecoveryKey { command } => matches!(command, RecoveryKeyCommand::Restore(_)),
+        _ => false,
     }
 }
 

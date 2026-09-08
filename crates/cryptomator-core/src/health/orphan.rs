@@ -343,10 +343,29 @@ fn move_path(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// The copy half of [`move_path`]'s `CrossesDevices` fallback -- the one place in the adoption
+/// that copies and then deletes the original.
+///
+/// `symlink_metadata` throughout, so an OS symlink is never followed: `std::fs::copy` would
+/// otherwise duplicate the *target's* content under the link's name and the `remove_dir_all` that
+/// follows would then delete the link, which is not what was copied. A vault holds no OS symlinks
+/// of its own (a Cryptomator symlink is a `symlink.c9r` file), so anything but a regular file or a
+/// directory is something this function must not silently rewrite -- it is refused by name
+/// instead, leaving the orphan where it is for the user to look at.
 fn copy_recursively(from: &Path, to: &Path) -> io::Result<()> {
-    if !from.symlink_metadata()?.is_dir() {
+    let file_type = from.symlink_metadata()?.file_type();
+    if file_type.is_file() {
         std::fs::copy(from, to)?;
         return Ok(());
+    }
+    if !file_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is neither a regular file nor a directory ({file_type:?}); refusing to copy it                  into /LOST+FOUND",
+                from.display()
+            ),
+        ));
     }
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
@@ -767,6 +786,40 @@ mod tests {
         std::fs::remove_file(&to).unwrap();
         move_path(&from, &to).expect("a free target is moved onto");
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
+    }
+
+    /// The cross-device fallback copies and *then* deletes, so it must never follow an OS symlink:
+    /// copying the target's bytes under the link's name and deleting the link afterwards would
+    /// silently rewrite what the adoption was supposed to move. Anything but a regular file or a
+    /// directory is refused by name instead.
+    #[test]
+    fn the_copy_fallback_refuses_a_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"not mine to copy").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let error = copy_recursively(&link, &dir.path().join("copy"))
+            .expect_err("a symlink is not something to copy");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("link"), "{error}");
+        assert!(!dir.path().join("copy").exists(), "nothing was written");
+
+        // The same inside a directory, where the walk has to notice it one level down.
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("plain.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink(&secret, tree.join("link")).unwrap();
+        let error = copy_recursively(&tree, &dir.path().join("tree-copy"))
+            .expect_err("a symlink below the directory is refused too");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        // A plain tree still copies.
+        std::fs::remove_file(tree.join("link")).unwrap();
+        let target = dir.path().join("tree-copy-2");
+        copy_recursively(&tree, &target).expect("a regular tree copies");
+        assert_eq!(std::fs::read(target.join("plain.txt")).unwrap(), b"payload");
     }
 
     #[test]

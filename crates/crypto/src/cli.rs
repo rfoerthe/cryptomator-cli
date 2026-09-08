@@ -521,6 +521,13 @@ pub struct RestoreArgs {
     /// Read the recovery key from a file
     #[arg(long, value_name = "FILE", group = "restore-recovery-key-source")]
     pub recovery_key_file: Option<PathBuf>,
+    // The vault's *old* password, read only by `--config` -- which signs the new config with the
+    // key already in the masterkey file. `--masterkey` and `--all` take the recovery key and a
+    // **new** password instead, and the command refuses a `--password-*` flag there (exit 2),
+    // exactly as it refuses `--cipher-combo` under `--masterkey`: ignoring it would let somebody
+    // believe the old password was used, and `--password-stdin` next to `--recovery-key-stdin`
+    // would put two readers on the same stdin. clap cannot express "only with --config", so the
+    // rule lives in `commands::recovery::restore`.
     #[command(flatten)]
     pub password: PasswordArgs,
     #[command(flatten)]

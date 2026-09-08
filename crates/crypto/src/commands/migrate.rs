@@ -105,10 +105,14 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
                 "to": plan.to.number(),
                 "steps": step_names,
                 "renames": renames_json(&plan),
+                "skipped": plan.skipped,
                 "dryRun": true,
             }),
             || render_dry_run(&label, &plan),
         )?;
+        // Also on stderr, because `--json` swallows the rendering above and this is the one part
+        // of a dry run the user has to act on before migrating for real.
+        report_skips(&plan.skipped);
         return Ok(exit::OK);
     }
 
@@ -127,16 +131,20 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
     let backups_before = backup_files(&path);
     let mut renamed = 0u64;
     let mut reported = 0u64;
+    let mut skipped: Vec<PathBuf> = Vec::new();
     let json_output = ctx.out.json;
     let outcome = with_legacy_passphrase(from, &passphrase, |passphrase| {
         renamed = 0;
         reported = 0;
+        skipped.clear();
         let mut progress = |event: MigrationEvent| {
-            if let MigrationEvent::StepProgress { done, .. } = event {
-                renamed = done;
+            match &event {
+                MigrationEvent::StepProgress { done, .. } => renamed = *done,
+                MigrationEvent::NodeSkipped { path } => skipped.push(path.clone()),
+                _ => {}
             }
             if !json_output {
-                if let Some(line) = progress_line(event, &mut reported) {
+                if let Some(line) = progress_line(&event, &mut reported) {
                     eprintln!("  {line}");
                 }
             }
@@ -196,6 +204,7 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
             "steps": step_names,
             "migrated": true,
             "renamed": renamed,
+            "skipped": skipped,
             "backups": backups,
             "keychainUpdated": keychain_updated,
         }),
@@ -207,10 +216,35 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
                 &args.vault,
                 &backups,
                 keychain_updated,
+                &skipped,
             )
         },
     )?;
+    // After the result and on stderr: `--json` suppresses the rendering above, and this is the one
+    // outcome of a successful migration the user still has to do something about.
+    report_skips(&skipped);
     Ok(exit::OK)
+}
+
+/// The skipped nodes, one per line on stderr, whatever `--json` says.
+///
+/// Not through [`note`]: a `--json` run's caller reads `skipped` from the object, but the person
+/// watching the terminal has to see the paths too -- these are files that kept their old,
+/// unreadable names, and no health check looks at them.
+fn report_skips(skipped: &[PathBuf]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {} node(s) could not be migrated and were left with their old names:",
+        skipped.len()
+    );
+    for path in skipped {
+        eprintln!("  {}", path.display());
+    }
+    eprintln!(
+        "The metadata directory `m/` was kept, because it holds the only copy of their long          names. Repair or remove these nodes and run `crypto migrate` again to finish the job."
+    );
 }
 
 /// Adds "where it stopped, and how to go on" to an error out of `migration::migrate`.
@@ -291,19 +325,22 @@ fn is_invalid_passphrase(err: &anyhow::Error) -> bool {
 }
 
 /// One line on stderr for an event, or `None` for the progress events between two reports.
-fn progress_line(event: MigrationEvent, reported: &mut u64) -> Option<String> {
+fn progress_line(event: &MigrationEvent, reported: &mut u64) -> Option<String> {
     match event {
         MigrationEvent::StepStarted { step } => Some(format!("step {step} …")),
         MigrationEvent::StepProgress { step, done, total } => {
             // The last one always, so the line the user is left with is the final count.
             (done == total || done - *reported >= PROGRESS_EVERY).then(|| {
-                *reported = done;
+                *reported = *done;
                 format!("{step}: {done}/{total} entries")
             })
         }
         MigrationEvent::StepFinished { step, version } => Some(format!(
             "step {step} done; the vault is at format {version}"
         )),
+        // Reported by `report_skips` in one block at the end instead: interleaved with the
+        // progress counter these would scroll past unread.
+        MigrationEvent::NodeSkipped { .. } => None,
     }
 }
 
@@ -378,13 +415,19 @@ fn render_dry_run(label: &str, plan: &MigrationPlan) -> String {
         .iter()
         .map(|rename| format!("{} → {}", rename.from.display(), rename.to.display()))
         .collect();
+    lines.extend(
+        plan.skipped
+            .iter()
+            .map(|path| format!("{} → (skipped, keeps its old name)", path.display())),
+    );
     lines.push(format!(
-        "{} would be migrated from format {} to format {}: {} rename(s), nothing was changed \
-         (--dry-run)",
+        "{} would be migrated from format {} to format {}: {} rename(s), {} skip(s), nothing was \
+         changed (--dry-run)",
         label,
         plan.from,
         plan.to,
-        plan.renames.len()
+        plan.renames.len(),
+        plan.skipped.len()
     ));
     if !plan.renames.is_empty() {
         // `MigrationPlan::renames` lists what each name *would* become; two sources landing on the
@@ -403,8 +446,17 @@ fn render_result(
     reference: &str,
     backups: &[PathBuf],
     keychain_updated: bool,
+    skipped: &[PathBuf],
 ) -> String {
     let mut lines = vec![format!("Migrated {label} from format {from} to {reached}")];
+    if !skipped.is_empty() {
+        // The paths themselves go to stderr through `report_skips`, which runs whatever `--json`
+        // says; this line is the summary the result object's reader sees.
+        lines.push(format!(
+            "{} node(s) were left with their old names; see above",
+            skipped.len()
+        ));
+    }
     if backups.is_empty() {
         // Only when every step found its backup already there, byte for byte: `attempt_backup`
         // never overwrites one.
@@ -449,6 +501,7 @@ mod tests {
                     to: PathBuf::from(to),
                 })
                 .collect(),
+            skipped: Vec::new(),
         }
     }
 
@@ -519,6 +572,7 @@ mod tests {
                 "/vaults/legacy_v6/masterkey.cryptomator.AABBCCDD.bkup",
             )],
             false,
+            &[],
         );
         assert!(
             text.starts_with("Migrated legacy_v6 from format 6 to 8"),
@@ -534,7 +588,15 @@ mod tests {
         );
         assert!(!text.contains("keychain"), "{text}");
 
-        let text = render_result("v5", VaultVersion::V5, VaultVersion::V8, "v5", &[], true);
+        let text = render_result(
+            "v5",
+            VaultVersion::V5,
+            VaultVersion::V8,
+            "v5",
+            &[],
+            true,
+            &[],
+        );
         assert!(text.contains("already backed up"), "{text}");
         assert!(
             text.contains("The stored password in the keychain was updated."),
@@ -549,14 +611,14 @@ mod tests {
         let step = MigrationStep::SixToSeven;
         let mut reported = 0;
         assert_eq!(
-            progress_line(MigrationEvent::StepStarted { step }, &mut reported),
+            progress_line(&MigrationEvent::StepStarted { step }, &mut reported),
             Some("step 6->7 …".to_string())
         );
         let total = 250;
         let reported_lines: Vec<String> = (1..=total)
             .filter_map(|done| {
                 progress_line(
-                    MigrationEvent::StepProgress { step, done, total },
+                    &MigrationEvent::StepProgress { step, done, total },
                     &mut reported,
                 )
             })
@@ -571,7 +633,7 @@ mod tests {
         );
         assert_eq!(
             progress_line(
-                MigrationEvent::StepFinished {
+                &MigrationEvent::StepFinished {
                     step,
                     version: VaultVersion::V7
                 },

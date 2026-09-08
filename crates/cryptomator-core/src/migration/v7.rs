@@ -11,7 +11,9 @@
 //! | `<32 chars>.lng` + `m/xx/yy/<32 chars>.lng` | the inflated name, migrated as above |
 //! | a name longer than 220 characters | `BASE64URL(SHA1(name)).c9s/` with `name.c9s` |
 //!
-//! and the `m/` directory disappears, because format 7 keeps the inflated name inside the node.
+//! and the `m/` directory disappears, because format 7 keeps the inflated name inside the node --
+//! unless at least one node had to be skipped, in which case `m/` is kept, because it holds the
+//! only copy of those nodes' long names (see [`migrate_reporting`]; Java deletes it regardless).
 //!
 //! Nothing is re-encrypted: the ciphertext of a name is the same bytes in both formats, only its
 //! encoding and the way its type is expressed change. That is why the masterkey is loaded merely
@@ -342,9 +344,39 @@ fn read_metadata_file(path: &Path) -> Option<String> {
 
 /// Java's two `catch` blocks in the visitors: a name that cannot be inflated
 /// (`UninflatableFileException`) is skipped and logged, never fatal.
-fn parse_or_skip(vault_root: &Path, file: &Path) -> Option<FilePathMigration> {
-    // `parse` fails only when `inflate` does, so the error arm *is* the skip.
-    FilePathMigration::parse(vault_root, file).unwrap_or_default()
+///
+/// Unlike Java, the skip is not only logged: `on_skip` is told about it, so the migration can keep
+/// `m/` and the caller can name the node. `parse` fails only when `inflate` does, so the error arm
+/// *is* the skip; a name that is simply not a Cryptomator name (`Ok(None)`) is no skip at all.
+fn parse_or_skip(
+    vault_root: &Path,
+    file: &Path,
+    on_skip: &mut dyn FnMut(&Path, &CoreError),
+) -> Option<FilePathMigration> {
+    match FilePathMigration::parse(vault_root, file) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            on_skip(file, &reason);
+            None
+        }
+    }
+}
+
+/// The sink the two passes that report skips share: warn, and remember the vault-relative path.
+///
+/// Sorted-and-deduplicated is the caller's job; the walk visits every node once, so neither is
+/// needed in practice.
+fn note_skip(
+    vault_root: &Path,
+    skipped: &mut Vec<PathBuf>,
+    file: &Path,
+    reason: &dyn std::fmt::Display,
+) {
+    log::warn!(
+        "SKIP {}: {reason}; the node keeps its old name",
+        file.display()
+    );
+    skipped.push(relativize(vault_root, file));
 }
 
 /// `SimpleFileVisitor`, reduced to the two callbacks the two v7 passes override.
@@ -455,7 +487,10 @@ fn pre_migration_scan(vault_root: &Path, determine_lengths: bool) -> Result<PreM
             assert_not_blacklisted(file)?;
             self.stats.total_files += 1;
             if self.stats.determined_lengths {
-                if let Some(migration) = parse_or_skip(self.vault_root, file) {
+                // The skips are not recorded here: this pass measures name lengths and is walked
+                // again by `migrate_file_names`, which reports the very same set. Recording both
+                // would list every skipped node twice.
+                if let Some(migration) = parse_or_skip(self.vault_root, file, &mut |_, _| {}) {
                     let vault_root = self.vault_root;
                     self.stats.update(vault_root, &migration);
                 }
@@ -474,26 +509,37 @@ fn pre_migration_scan(vault_root: &Path, determine_lengths: bool) -> Result<PreM
     Ok(visitor.stats)
 }
 
-/// The renames the 6 → 7 step would perform, both paths relative to the vault directory.
+/// The renames the 6 → 7 step would perform and the nodes it would skip, all paths relative to
+/// the vault directory.
 ///
 /// This is the `--dry-run` at core level: nothing is written, not even the `c/` probe directory.
 /// Collisions are *not* resolved — two sources landing on the same target are both listed with
-/// that target, and the migration gives the second one a `_1` suffix when it gets there.
-pub fn plan_renames(vault_root: &Path) -> Result<Vec<PlannedRename>> {
+/// that target, and the migration gives the second one a `_1` suffix when it gets there. The
+/// skips, on the other hand, are exactly the ones the migration itself would report, minus the
+/// ones only a real rename can discover (three occupied targets in a row).
+pub fn plan_renames(vault_root: &Path) -> Result<(Vec<PlannedRename>, Vec<PathBuf>)> {
     struct Visitor<'a> {
         vault_root: &'a Path,
         renames: Vec<PlannedRename>,
+        skipped: Vec<PathBuf>,
     }
     impl DataDirVisitor for Visitor<'_> {
         fn visit_file(&mut self, file: &Path) -> Result<()> {
-            if let Some(migration) = parse_or_skip(self.vault_root, file) {
-                // A name that is not valid BASE32 has no target; Java only logs it too.
-                if let Ok(target) = migration.target_path("") {
-                    self.renames.push(PlannedRename {
-                        from: relativize(self.vault_root, file),
-                        to: relativize(self.vault_root, &target),
-                    });
-                }
+            let vault_root = self.vault_root;
+            let skipped = &mut self.skipped;
+            let Some(migration) = parse_or_skip(vault_root, file, &mut |file, reason| {
+                note_skip(vault_root, skipped, file, reason)
+            }) else {
+                return Ok(());
+            };
+            // A name that is not valid BASE32 has no target, and the migration cannot move it
+            // either: it is a skip there and is listed as one here.
+            match migration.target_path("") {
+                Ok(target) => self.renames.push(PlannedRename {
+                    from: relativize(self.vault_root, file),
+                    to: relativize(self.vault_root, &target),
+                }),
+                Err(reason) => note_skip(self.vault_root, &mut self.skipped, file, &reason),
             }
             Ok(())
         }
@@ -501,9 +547,10 @@ pub fn plan_renames(vault_root: &Path) -> Result<Vec<PlannedRename>> {
     let mut visitor = Visitor {
         vault_root,
         renames: Vec::new(),
+        skipped: Vec::new(),
     };
     walk_data_dir(&vault_root.join(DATA_DIR_NAME), 0, &mut visitor)?;
-    Ok(visitor.renames)
+    Ok((visitor.renames, visitor.skipped))
 }
 
 fn relativize(vault_root: &Path, path: &Path) -> PathBuf {
@@ -514,22 +561,41 @@ fn relativize(vault_root: &Path, path: &Path) -> PathBuf {
 ///
 /// Renaming while the directory is being read would make the walk stumble over the `.c9r`
 /// directories it just created, which is why Java defers the moves — and why we do.
+///
+/// Returns the vault-relative paths of the nodes that were left with their old names; each of them
+/// is also reported as a [`MigrationEvent::NodeSkipped`] the moment it is skipped.
 fn migrate_file_names(
     vault_root: &Path,
     total_files: u64,
     progress: &mut dyn FnMut(MigrationEvent),
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     struct Visitor<'a> {
         vault_root: &'a Path,
         progress: &'a mut dyn FnMut(MigrationEvent),
         total_files: u64,
         migrated_files: u64,
         in_current_dir: Vec<FilePathMigration>,
+        skipped: Vec<PathBuf>,
+    }
+    impl Visitor<'_> {
+        fn skip(&mut self, file: &Path, reason: &dyn std::fmt::Display) {
+            note_skip(self.vault_root, &mut self.skipped, file, reason);
+            if let Some(path) = self.skipped.last() {
+                (self.progress)(MigrationEvent::NodeSkipped { path: path.clone() });
+            }
+        }
     }
     impl DataDirVisitor for Visitor<'_> {
         fn visit_file(&mut self, file: &Path) -> Result<()> {
-            if let Some(migration) = parse_or_skip(self.vault_root, file) {
-                self.in_current_dir.push(migration);
+            let vault_root = self.vault_root;
+            let mut reason: Option<String> = None;
+            let parsed = parse_or_skip(vault_root, file, &mut |_, why| {
+                reason = Some(why.to_string())
+            });
+            match (parsed, reason) {
+                (Some(migration), _) => self.in_current_dir.push(migration),
+                (None, Some(reason)) => self.skip(file, &reason),
+                (None, None) => {}
             }
             Ok(())
         }
@@ -545,8 +611,14 @@ fn migrate_file_names(
                 match migration.migrate() {
                     Ok(_) => {}
                     // Java's `catch (FileAlreadyExistsException)`: a sync conflict or a node that
-                    // another machine has already migrated. Logged and skipped, never fatal.
-                    Err(CoreError::MigrationBlocked(_)) => {}
+                    // another machine has already migrated -- and, unlike Java, a name that does
+                    // not base32-decode, which cannot be moved anywhere either. Java logs both and
+                    // carries on; we also remember them, so `m/` survives and the caller can name
+                    // them.
+                    Err(e @ (CoreError::MigrationBlocked(_) | CoreError::InvalidArgument(_))) => {
+                        let path = migration.old_path().to_path_buf();
+                        self.skip(&path, &e);
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -559,8 +631,10 @@ fn migrate_file_names(
         total_files,
         migrated_files: 0,
         in_current_dir: Vec::new(),
+        skipped: Vec::new(),
     };
-    walk_data_dir(&vault_root.join(DATA_DIR_NAME), 0, &mut visitor)
+    walk_data_dir(&vault_root.join(DATA_DIR_NAME), 0, &mut visitor)?;
+    Ok(visitor.skipped)
 }
 
 /// Java's `continuationListener.continueMigrationOnEvent(REQUIRES_FULL_VAULT_DIR_SCAN)`.
@@ -646,17 +720,34 @@ pub(crate) fn migrate_reporting(
         });
     }
 
-    if stats.total_files > 0 {
-        migrate_file_names(vault_root, stats.total_files, progress)?;
-    }
+    let skipped = if stats.total_files > 0 {
+        migrate_file_names(vault_root, stats.total_files, progress)?
+    } else {
+        Vec::new()
+    };
 
     // `Files.walkFileTree(vaultRoot.resolve("m"), DeletingFileVisitor.INSTANCE)`. Format 7 keeps
     // the inflated names inside the nodes, so the metadata directory has no purpose any more —
     // including the unreferenced `.lng` files the 1.x releases left behind in it.
-    match std::fs::remove_dir_all(vault_root.join(OLD_METADATA_DIR_NAME)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(CoreError::Io(e)),
+    //
+    // **Deliberate deviation from Java**, which deletes `m/` unconditionally: every node this pass
+    // could not migrate still carries its format 5/6 `<32 chars>.lng` name, and `m/` holds the only
+    // copy of what that name inflates to. Deleting it would make those names unrecoverable — the
+    // node would keep its data but lose its identity, in the one command that rewrites every name
+    // in the vault. A leftover `m/` costs nothing: formats 7 and 8 never look at it, and a later
+    // run of this step (after the user repaired whatever blocked the node) removes it.
+    if skipped.is_empty() {
+        match std::fs::remove_dir_all(vault_root.join(OLD_METADATA_DIR_NAME)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    } else {
+        log::warn!(
+            "{} node(s) kept their old names, so {}/{OLD_METADATA_DIR_NAME} is kept as well",
+            skipped.len(),
+            vault_root.display()
+        );
     }
 
     // Last, so that an interrupted run is picked up again as a format 6 vault and simply repeats
@@ -870,7 +961,12 @@ mod tests {
             matches!(&err, CoreError::MigrationBlocked(m) if m.contains("failed to read metadata file")),
             "{err}"
         );
-        assert!(parse_or_skip(root, &orphan).is_none());
+        // The sink is told about it, once, with the path it was given.
+        let mut seen: Vec<PathBuf> = Vec::new();
+        assert!(
+            parse_or_skip(root, &orphan, &mut |file, _| seen.push(file.to_path_buf())).is_none()
+        );
+        assert_eq!(seen, std::slice::from_ref(&orphan));
         // An oversized metadata file is refused just as loudly.
         std::fs::create_dir_all(root.join("m/AA/AA")).unwrap();
         std::fs::write(
@@ -878,7 +974,19 @@ mod tests {
             vec![b'A'; MAX_FILENAME_BUFFER_SIZE as usize + 1],
         )
         .unwrap();
-        assert!(parse_or_skip(root, &orphan).is_none());
+        seen.clear();
+        assert!(
+            parse_or_skip(root, &orphan, &mut |file, _| seen.push(file.to_path_buf())).is_none()
+        );
+        assert_eq!(seen, std::slice::from_ref(&orphan));
+        // A name that is simply not a Cryptomator name is no skip: the sink stays untouched.
+        let plain = content_dir.join("notes.txt");
+        std::fs::write(&plain, b"x").unwrap();
+        seen.clear();
+        assert!(
+            parse_or_skip(root, &plain, &mut |file, _| seen.push(file.to_path_buf())).is_none()
+        );
+        assert!(seen.is_empty());
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::crypto::masterkey::Masterkey;
 use crate::crypto::rng::{OsRng, Rng};
 use crate::error::{CoreError, Result};
 use crate::masterkey_file::{MasterkeyFileAccess, DEFAULT_MASTERKEY_FILE_VERSION};
+use crate::migration::v7::OLD_METADATA_DIR_NAME;
 use crate::recovery::key::decode_recovery_key;
 use crate::recovery::words::WordEncoder;
 use crate::vault::open::{open_vault, read_vault_config};
@@ -297,6 +298,32 @@ pub fn detect_cipher_combo(vault_path: &Path, masterkey: &Masterkey) -> Result<C
     Err(undetectable())
 }
 
+/// Refuses a restore into a vault that still has the format 5/6 layout, before anything is
+/// written.
+///
+/// The tell is `<vault>/m`, the metadata directory of the long names, which only formats 5 and 6
+/// have (7 and 8 keep the inflated name inside the node, so stamping a format 8 config onto a
+/// format 7 vault is right and is left alone here).
+///
+/// Without this check a legacy vault that lost **both** key files -- state `ALL_MISSING`, which
+/// `crypto recovery-key restore` accepts -- would be given a `format: 8` config and a masterkey
+/// file claiming version 999. `determine_vault_version` would then answer 8, `crypto migrate`
+/// would refuse it as "already migrated", and nothing would ever rename the BASE32 names below
+/// `d/` again: the vault would be unopenable by any Cryptomator. Migrating first and restoring
+/// afterwards is the only order that works, and the migration needs the passphrase, not the
+/// recovery key.
+fn assert_not_legacy_layout(vault_path: &Path) -> Result<()> {
+    if vault_path.join(OLD_METADATA_DIR_NAME).is_dir() {
+        return Err(CoreError::MigrationBlocked(format!(
+            "{} still has the format 5/6 layout (its `{OLD_METADATA_DIR_NAME}` directory is \
+             there); restoring would stamp a format {VAULT_VERSION} config onto it and no \
+             Cryptomator would open it again -- migrate it first",
+            vault_path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Reads the staged masterkey file back and checks that it really holds `expected`.
 fn assert_staged_masterkey(
     access: &MasterkeyFileAccess,
@@ -336,6 +363,11 @@ pub fn restore_masterkey(
     new_passphrase: &str,
     rng: &mut dyn Rng,
 ) -> Result<()> {
+    // Not only `restore_all`/`restore_config`: the file this writes carries version 999, which is
+    // what `determine_vault_version` reads when there is no config -- so stamping it onto a format
+    // 5/6 vault mislabels that vault as format 8 just as thoroughly. See
+    // [`assert_not_legacy_layout`].
+    assert_not_legacy_layout(vault_path)?;
     let raw = decode_recovery_key(encoder, recovery_key)?;
     let masterkey = Masterkey::from_zeroizing(raw);
     let dir = RecoveryDirectory::create(vault_path)?;
@@ -373,6 +405,7 @@ pub fn restore_config(
     options: ConfigOptions,
     rng: &mut dyn Rng,
 ) -> Result<VaultConfig> {
+    assert_not_legacy_layout(vault_path)?;
     let masterkey = access.load(&vault_path.join(MASTERKEY_FILENAME), passphrase)?;
     let combo = options.combo(vault_path, &masterkey)?;
     write_config_via_recovery_dir(
@@ -439,6 +472,7 @@ pub fn restore_all(
     options: ConfigOptions,
     rng: &mut dyn Rng,
 ) -> Result<VaultConfig> {
+    assert_not_legacy_layout(vault_path)?;
     let raw = decode_recovery_key(encoder, recovery_key)?;
     let masterkey = Masterkey::from_zeroizing(raw);
     // The detection needs the key but no written file, so it happens here -- before anything
@@ -472,7 +506,19 @@ pub fn restore_all(
         ));
     }
     drop(opened);
-    for name in [MASTERKEY_FILENAME, VAULTCONFIG_FILENAME] {
+    // The config **first**, the masterkey second. The two moves are not one transaction, and the
+    // order decides what a failure between them leaves behind:
+    //
+    // * config, then masterkey (this order): a new config next to the *old* masterkey file. The
+    //   config is signed with the recovered key, which is the key the new masterkey file would
+    //   have held, so `restore --masterkey` with the same recovery key finishes the job -- and
+    //   until then nothing was lost, because the old masterkey file is still there and still
+    //   backed up as `masterkey.cryptomator.<checksum>.bkup`.
+    // * masterkey, then config (the other order): a new masterkey file, wrapping the recovered
+    //   key under the *new* password, next to a config signed by the *old* key. Neither password
+    //   opens that vault, and repairing it needs `restore --config`, i.e. the new password plus
+    //   the knowledge that this is what happened.
+    for name in [VAULTCONFIG_FILENAME, MASTERKEY_FILENAME] {
         let target = vault_path.join(name);
         if target.exists() {
             attempt_backup(&target)?;
@@ -533,6 +579,154 @@ mod tests {
             path
         };
         assert!(!path.exists(), "the recovery directory survived its scope");
+    }
+
+    /// `tests/fixtures/<name>` copied into a fresh temp directory, which the caller keeps alive.
+    fn fixture_copy(name: &str) -> (tempfile::TempDir, PathBuf) {
+        fn copy(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap().flatten() {
+                let target = dst.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join(name);
+        copy(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures")
+                .join(name),
+            &vault,
+        );
+        (tmp, vault)
+    }
+
+    /// A vault that still has the format 5/6 layout must not be given format 8 key files: the
+    /// names below `d/` are BASE32 and only `crypto migrate` can rewrite them.
+    #[test]
+    fn a_vault_with_a_metadata_directory_is_refused_before_anything_is_written() {
+        let (_tmp, vault) = fixture_copy("legacy_v6");
+        assert!(vault.join("m").is_dir(), "the tell of formats 5 and 6");
+        let access = MasterkeyFileAccess::new(Vec::new());
+        let encoder = WordEncoder::new();
+        // A well-formed key for a vault of our own: the refusal comes before it is looked at.
+        let (_other_tmp, _other, masterkey) = vault_with(CipherCombo::SivGcm);
+        let key = crate::recovery::key::create_recovery_key(&encoder, masterkey.raw());
+
+        for outcome in [
+            restore_all(
+                &encoder,
+                &access,
+                &vault,
+                key.as_str(),
+                "new-passphrase",
+                ConfigOptions::default(),
+                &mut DetRng::default(),
+            )
+            .map(|_| ()),
+            restore_masterkey(
+                &encoder,
+                &access,
+                &vault,
+                key.as_str(),
+                "new-passphrase",
+                &mut DetRng::default(),
+            ),
+            restore_config(
+                &access,
+                &vault,
+                "test-password-123",
+                ConfigOptions::default(),
+                &mut DetRng::default(),
+            )
+            .map(|_| ()),
+        ] {
+            let err = outcome.expect_err("a legacy layout is refused");
+            assert!(
+                matches!(&err, CoreError::MigrationBlocked(m) if m.contains("format 5/6 layout")),
+                "{err}"
+            );
+        }
+        // And nothing moved: the fixture's own masterkey file is untouched and no config appeared.
+        assert!(!vault.join(VAULTCONFIG_FILENAME).exists());
+        assert!(!vault.join("masterkey.cryptomator.bkup").exists());
+    }
+
+    /// Formats 7 and 8 share the on-disk layout, so a format 7 vault has no `m/` and stamping a
+    /// format 8 config onto it is exactly right -- the restore is the 7 → 8 step with new key
+    /// files. The vault opens afterwards.
+    #[test]
+    fn a_format_seven_vault_is_restored_because_it_shares_the_layout() {
+        let (_tmp, vault) = fixture_copy("legacy_v7");
+        assert!(!vault.join("m").exists(), "format 7 has no metadata dir");
+        let access = MasterkeyFileAccess::new(Vec::new());
+        let encoder = WordEncoder::new();
+        let masterkey = access
+            .load(&vault.join(MASTERKEY_FILENAME), "test-password-123")
+            .expect("the fixture's passphrase");
+        let key = crate::recovery::key::create_recovery_key(&encoder, masterkey.raw());
+
+        let config = restore_all(
+            &encoder,
+            &access,
+            &vault,
+            key.as_str(),
+            "new-passphrase",
+            ConfigOptions::default(),
+            &mut DetRng::default(),
+        )
+        .expect("a format 7 vault can be restored");
+        assert_eq!(config.cipher_combo, CipherCombo::SivCtrMac);
+        let opened = open_vault(&vault, &access, "new-passphrase").expect("the vault opens");
+        assert_eq!(opened.masterkey.raw(), masterkey.raw());
+    }
+
+    /// `restore_all` moves the config first, so the one repairable half-state is the one a
+    /// failure between the two moves leaves behind.
+    ///
+    /// The masterkey move is made to fail by turning the vault's own masterkey file into a
+    /// directory: `attempt_backup` reads it and reports `EISDIR`. The config is by then already
+    /// in place -- which is exactly the state `restore --masterkey` finishes off.
+    #[test]
+    fn the_config_is_moved_before_the_masterkey_so_a_half_state_is_repairable() {
+        let (_tmp, vault, _masterkey) = vault_with(CipherCombo::SivGcm);
+        let access = MasterkeyFileAccess::new(Vec::new());
+        let encoder = WordEncoder::new();
+        let (_other, _other_vault, other_key) = vault_with(CipherCombo::SivGcm);
+        let key = crate::recovery::key::create_recovery_key(&encoder, other_key.raw());
+        std::fs::remove_file(vault.join(MASTERKEY_FILENAME)).unwrap();
+        std::fs::create_dir(vault.join(MASTERKEY_FILENAME)).unwrap();
+        let config_before = std::fs::read(vault.join(VAULTCONFIG_FILENAME)).unwrap();
+
+        let err = restore_all(
+            &encoder,
+            &access,
+            &vault,
+            key.as_str(),
+            "new-passphrase",
+            ConfigOptions {
+                // The vault holds no encrypted file, and the key is a foreign one anyway.
+                cipher_combo: Some(CipherCombo::SivGcm),
+                ..ConfigOptions::default()
+            },
+            &mut DetRng::default(),
+        )
+        .expect_err("the masterkey cannot be backed up over a directory");
+        assert!(matches!(err, CoreError::Io(_)), "{err}");
+
+        assert_ne!(
+            std::fs::read(vault.join(VAULTCONFIG_FILENAME)).unwrap(),
+            config_before,
+            "the config was moved before the masterkey"
+        );
+        assert!(
+            vault.join(MASTERKEY_FILENAME).is_dir(),
+            "the masterkey move never happened"
+        );
     }
 
     #[test]

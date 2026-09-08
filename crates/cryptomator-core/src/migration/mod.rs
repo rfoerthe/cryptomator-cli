@@ -148,6 +148,14 @@ pub struct MigrationPlan {
     /// step. Collisions are not resolved here: two sources landing on the same target are both
     /// listed with it, and the migration gives the second one a `_1` suffix when it gets there.
     pub renames: Vec<PlannedRename>,
+    /// The nodes the 6 → 7 step would **not** migrate, vault-relative — a `.lng` whose `m/` entry
+    /// is missing, unreadable or absurdly large, and a name that does not base32-decode. They keep
+    /// their format 5/6 names, and the migration keeps `m/` for them; see
+    /// [`MigrationEvent::NodeSkipped`].
+    ///
+    /// The three-attempts-exhausted case (`_1`, `_2` both taken) cannot be predicted here, because
+    /// nothing has been renamed yet; only the migration itself reports those.
+    pub skipped: Vec<PathBuf>,
 }
 
 /// How [`migrate`] should behave. [`Default`] is "change the vault, and refuse a migration that
@@ -174,7 +182,9 @@ pub struct MigrationOptions {
 }
 
 /// What [`migrate`] reports while it works (`migration/api/MigrationProgressListener.java`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not [`Copy`]: [`MigrationEvent::NodeSkipped`] carries the path of the node it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationEvent {
     /// A step is about to run (Java's `INITIALIZING`).
     StepStarted { step: MigrationStep },
@@ -190,12 +200,30 @@ pub enum MigrationEvent {
         step: MigrationStep,
         version: VaultVersion,
     },
+    /// The 6 → 7 step could not migrate this node and left it with its format 5/6 name; `path` is
+    /// relative to the vault directory.
+    ///
+    /// Java only writes a `LOG.warn` line for such a node and deletes `m/` regardless, which
+    /// destroys the only copy of a long name it could not inflate. We report it instead, and
+    /// [`v7::migrate`] keeps `m/` whenever at least one node was skipped — the one deliberate
+    /// deviation of the 6 → 7 step. A leftover `m/` is harmless: formats 7 and 8 ignore it.
+    NodeSkipped { path: PathBuf },
 }
 
 /// `FileSystemCapabilityChecker.assertAllCapabilities`: first read, then write.
 ///
 /// Java probes with `Files.createTempDirectory(checkDir, "write-access")`; a fixed name does the
 /// same job and keeps the test deterministic, because the directory disappears immediately.
+///
+/// # This deletes `<vault>/c`
+///
+/// The probe directory is `<vault>/c`, and the `finally` block of Java's
+/// `assertWriteAccess` — `deleteRecursivelySilently(checkDir)` — removes it **whether or not the
+/// probe created it**. A `c/` directory that was already sitting in the vault root is therefore
+/// gone after a migration. This is Java parity and deliberate: a vault has no business holding a
+/// `c/` of its own (the format puts everything under `d/`), and diverging here would leave a
+/// vault on which every migration attempt failed for a reason the user could not see. `--dry-run`
+/// never reaches this function, so previewing a migration never deletes anything.
 pub fn assert_all_capabilities(vault_path: &Path) -> Result<()> {
     std::fs::read_dir(vault_path).map_err(|_| CoreError::MissingCapability {
         path: vault_path.to_path_buf(),
@@ -242,7 +270,9 @@ pub fn plan(vault_path: &Path, passphrase: &str) -> Result<MigrationPlan> {
     if plan.steps.contains(&MigrationStep::SixToSeven) {
         // Formats 5 and 6 share the on-disk layout, so the renames can be listed for a format 5
         // vault too, long before its own step has run.
-        plan.renames = v7::plan_renames(vault_path)?;
+        let (renames, skipped) = v7::plan_renames(vault_path)?;
+        plan.renames = renames;
+        plan.skipped = skipped;
     }
     Ok(plan)
 }
@@ -268,6 +298,7 @@ fn plan_steps(vault_path: &Path, passphrase: &str) -> Result<MigrationPlan> {
         to: version,
         steps,
         renames: Vec::new(),
+        skipped: Vec::new(),
     })
 }
 
@@ -390,6 +421,25 @@ mod tests {
             ]
         );
         assert_eq!(steps[0].to_string(), "5->6");
+    }
+
+    /// Java's `finally` block deletes the probe directory whether or not the probe created it, so
+    /// a `c/` that was already in the vault root is gone afterwards. Documented on
+    /// [`assert_all_capabilities`] and pinned here, because it is the one thing the capability
+    /// check removes.
+    #[test]
+    fn the_capability_probe_removes_a_pre_existing_c_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        std::fs::create_dir(vault.join("c")).unwrap();
+        std::fs::write(vault.join("c/mine.txt"), b"whatever this was").unwrap();
+
+        assert_all_capabilities(vault).unwrap();
+
+        assert!(
+            !vault.join("c").exists(),
+            "Java parity: the probe directory is removed recursively, pre-existing or not"
+        );
     }
 
     #[test]

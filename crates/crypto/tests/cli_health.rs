@@ -335,6 +335,60 @@ fn a_wrong_password_is_exit_four_and_writes_no_report() {
     );
 }
 
+/// `crypto` only knows about its own daemon, so a vault the *desktop app* has unlocked and
+/// mounted looks LOCKED here. `--fix` moves and deletes nodes under that live mount, and the
+/// warning is the only thing that says so.
+///
+/// The fake desktop app is a `UnixListener` on the socket the CLI probes -- the same pattern as
+/// `cli_daemon.rs`'s `settings.json` warning.
+#[test]
+fn a_running_desktop_app_is_warned_about_before_a_fix_touches_the_vault() {
+    let fx = Sandbox::new();
+    vault(&fx, "broken_health");
+    std::fs::create_dir_all(fx.path("d")).expect("socket directory");
+    let socket = fx.path("d/ipc.socket");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("a fake desktop app");
+
+    let assertion = fx
+        .crypto(&["--json", "health", "broken_health", "--fix", "--no-report"])
+        .env("CRYPTO_DESKTOP_IPC_SOCKET", &socket)
+        .assert()
+        .code(11);
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(stderr.contains("desktop app"), "{stderr}");
+    assert!(stderr.contains("lock this vault there"), "{stderr}");
+    assert!(
+        stderr.contains("only checks its own daemon"),
+        "the warning says what the automatic check does and does not cover: {stderr}"
+    );
+    assert!(
+        !stderr.contains("settings.json"),
+        "health writes no settings: {stderr}"
+    );
+
+    // A run that only reads says nothing -- and neither does a migration that only previews.
+    let fx2 = Sandbox::new();
+    vault(&fx2, "siv_gcm_basic");
+    fx2.add_fixture("legacy_v6");
+    for args in [
+        vec!["--json", "health", "siv_gcm_basic", "--no-report"],
+        vec!["--json", "migrate", "legacy_v6", "--dry-run"],
+    ] {
+        let assertion = fx2
+            .crypto(&args)
+            .env("CRYPTO_DESKTOP_IPC_SOCKET", &socket)
+            .env("CRYPTO_PASSWORD", "test-password-123")
+            .assert()
+            .success();
+        let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+        assert!(
+            !stderr.contains("desktop app"),
+            "{args:?} changes nothing in the vault: {stderr}"
+        );
+    }
+    drop(listener);
+}
+
 /// `--fix --json` on a sandbox copy of a fixture: the parsed object of the run.
 fn fix_run(fx: &Sandbox, args: &[&str], code: i32) -> Value {
     let out = fx

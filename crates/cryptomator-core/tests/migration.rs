@@ -250,7 +250,7 @@ fn migrate_collecting_with(
 fn step_events(seen: &[MigrationEvent]) -> Vec<MigrationEvent> {
     seen.iter()
         .filter(|e| !matches!(e, MigrationEvent::StepProgress { .. }))
-        .copied()
+        .cloned()
         .collect()
 }
 
@@ -471,8 +471,9 @@ fn five_to_six_rewraps_the_key_file_with_the_nfc_passphrase() {
 fn six_to_seven_renames_every_node_and_drops_the_metadata_dir() {
     let (_tmp, vault) = common::fixture_copy_at("legacy_v6");
     let meta = legacy_meta("legacy_v6");
-    let planned = migration::v7::plan_renames(&vault).unwrap();
+    let (planned, skipped) = migration::v7::plan_renames(&vault).unwrap();
     assert!(planned.len() >= 6, "{planned:#?}");
+    assert!(skipped.is_empty(), "an intact fixture skips nothing");
     assert!(
         planned.iter().all(|r| name_of(&r.to).ends_with(".c9r")
             || name_of(&r.to).ends_with(".c9s")
@@ -518,6 +519,81 @@ fn six_to_seven_renames_every_node_and_drops_the_metadata_dir() {
             "{rename:?} is still there"
         );
     }
+}
+
+/// A `.lng` node whose `m/` entry is gone cannot be migrated -- and its long name lives nowhere
+/// else, so `m/` has to survive with it.
+///
+/// Java logs such a node and deletes `m/` regardless, which is the one thing that would make the
+/// name unrecoverable. Everything else in the vault is migrated exactly as it would have been.
+#[test]
+fn a_node_whose_metadata_entry_is_gone_is_skipped_and_the_metadata_directory_is_kept() {
+    let (_tmp, vault) = common::fixture_copy_at("legacy_v6");
+    let meta = legacy_meta("legacy_v6");
+    let (deflated, long_node) = lone_deflated_node(&vault);
+    // The only copy of the long name, removed the way a half-finished sync would.
+    let metadata_file = vault
+        .join("m")
+        .join(&deflated[0..2])
+        .join(&deflated[2..4])
+        .join(format!("{deflated}.lng"));
+    assert!(metadata_file.is_file(), "{metadata_file:?}");
+    std::fs::remove_file(&metadata_file).unwrap();
+
+    // The dry run warns first: the node is a skip, not a rename.
+    let (renames, skipped) = migration::v7::plan_renames(&vault).unwrap();
+    assert_eq!(skipped, std::slice::from_ref(&long_node));
+    assert!(
+        !renames.iter().any(|r| r.from == long_node),
+        "a node that cannot be inflated has no target: {renames:#?}"
+    );
+    let plan = migration::plan(&vault, &meta.passphrase).unwrap();
+    assert_eq!(plan.skipped, std::slice::from_ref(&long_node));
+
+    let (result, events) = migrate_collecting(&vault, &meta.passphrase);
+    assert_eq!(result.unwrap(), VaultVersion::V8);
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|e| match e {
+                MigrationEvent::NodeSkipped { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&long_node),
+        "the migration reports the same skip it planned"
+    );
+
+    // Kept, and with the node it belongs to still where it was.
+    assert!(
+        vault.join("m").is_dir(),
+        "the metadata directory holds the only copy of the skipped node's name"
+    );
+    assert!(vault.join(&long_node).is_file(), "{long_node:?} was moved");
+
+    // Everything else was migrated and still reads back byte for byte; only the skipped node is
+    // missing from the tree, because nothing can work out what it is called any more.
+    let mut expected = meta.expected;
+    expected.retain(|entry| !entry.path.starts_with("/llll"));
+    expected.sort();
+    assert!(
+        expected.len() + 1 == legacy_meta("legacy_v6").expected.len(),
+        "exactly one entry -- the long-named one -- is expected to be unreachable"
+    );
+    assert_eq!(migrated_tree(&vault, &meta.passphrase_nfc), expected);
+}
+
+/// The vault-relative path of `legacy_v6`'s single `<32 chars>.lng` node, and those 32 characters.
+fn lone_deflated_node(vault: &Path) -> (String, PathBuf) {
+    let mut hits: Vec<PathBuf> = data_paths(vault)
+        .into_iter()
+        .filter(|path| name_of(path).ends_with(".lng"))
+        .collect();
+    hits.sort();
+    assert_eq!(hits.len(), 1, "legacy_v6 has exactly one shortened name");
+    let node = hits.remove(0);
+    let name = name_of(&node);
+    (name[..name.len() - 4].to_string(), node)
 }
 
 /// `plan` is the dry run: it lists every rename and leaves the vault exactly as it found it.
@@ -705,7 +781,7 @@ fn a_taken_target_name_gets_an_attempt_suffix() {
     let (_tmp, vault) = common::fixture_copy_at("legacy_v6");
     let meta = legacy_meta("legacy_v6");
     // A plain file rename: the target is the node itself, not a directory around it.
-    let plan = migration::v7::plan_renames(&vault).unwrap();
+    let (plan, _) = migration::v7::plan_renames(&vault).unwrap();
     let rename = plan
         .iter()
         .find(|r| name_of(&r.to).ends_with(".c9r") && !r.from.to_string_lossy().ends_with(".lng"))
@@ -764,7 +840,7 @@ fn a_half_migrated_vault_is_picked_up_where_it_stopped() {
     );
     // The planner now only lists what is left.
     assert_eq!(
-        migration::v7::plan_renames(&vault).unwrap().len(),
+        migration::v7::plan_renames(&vault).unwrap().0.len(),
         files.len() - migrated_by_hand
     );
 

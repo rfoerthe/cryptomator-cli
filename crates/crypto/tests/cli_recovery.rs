@@ -503,6 +503,77 @@ fn restore_rejects_the_combinations_that_cannot_work() {
             .code(2)
             .stderr(predicate::str::contains(flag[0]));
     }
+    // Only `--config` reads the vault's *old* password. Under `--masterkey`/`--all` a
+    // `--password-*` flag was silently ignored -- and `--password-stdin` next to
+    // `--recovery-key-stdin` would have put two readers on the same stdin.
+    for mode in ["--masterkey", "--all"] {
+        for flag in [
+            vec!["--password-stdin"],
+            vec!["--password-file", "/nonexistent"],
+            vec!["--password-env", "NP"],
+            vec!["--password-keychain"],
+        ] {
+            let mut args = vec![
+                "recovery-key",
+                "restore",
+                "siv_gcm_basic",
+                mode,
+                "--recovery-key-stdin",
+            ];
+            args.extend(flag.iter().copied());
+            fx.crypto(&args)
+                .env("NP", NEW_PW)
+                .write_stdin("x\n")
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains(flag[0]))
+                .stderr(predicate::str::contains(mode));
+        }
+    }
+}
+
+/// A format 5/6 vault that lost both key files is `ALL_MISSING`, which this command accepts -- and
+/// restoring it would write a `format: 8` config over BASE32 names. `detect_version` would then
+/// answer 8, `crypto migrate` would refuse it, and no Cryptomator would ever open it again. So the
+/// restore is refused before a single byte is written, and it names the way out.
+#[test]
+fn a_restore_that_would_skip_a_migration_is_refused_before_it_writes() {
+    let fx = Sandbox::new();
+    fx.add_fixture("siv_gcm_basic");
+    // Any well-formed key: the refusal happens before the key is ever matched against the vault.
+    let key = recovery_key(&fx, "siv_gcm_basic");
+    let key_file = fx.path("key.txt");
+    std::fs::write(&key_file, &key).unwrap();
+    let new_password_file = fx.path("np.txt");
+    std::fs::write(&new_password_file, NEW_PW).unwrap();
+
+    let path = fx.add_fixture("legacy_v6");
+    delete_key_file(&path, "masterkey.cryptomator");
+    assert!(path.join("m").is_dir(), "the tell of a format 5/6 layout");
+
+    for mode in ["--all", "--masterkey"] {
+        fx.crypto(&[
+            "recovery-key",
+            "restore",
+            "legacy_v6",
+            mode,
+            "--recovery-key-file",
+            key_file.to_str().unwrap(),
+            "--new-password-file",
+            new_password_file.to_str().unwrap(),
+        ])
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains("crypto migrate legacy_v6"));
+        assert!(
+            !path.join("masterkey.cryptomator").exists(),
+            "{mode} wrote a key file after all"
+        );
+        assert!(
+            !path.join("vault.cryptomator").exists(),
+            "{mode} wrote a config after all"
+        );
+    }
 }
 
 /// A legacy vault has no format 8 key files to restore; it is sent to `crypto migrate` instead.

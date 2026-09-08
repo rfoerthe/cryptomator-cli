@@ -266,12 +266,30 @@ impl Fix for TruncateTrailingBytes {
             .find(CRYPTOMATOR_FILE_SUFFIX)
             .map(|pos| pos + CRYPTOMATOR_FILE_SUFFIX.len())
             .unwrap_or(self.long_name.len());
+        // Not `std::fs::write` over the original, which truncates first and writes second: a
+        // crash in that window leaves an empty `name.c9s`, turning a WARN
+        // (`TrailingBytesInNameFile`, still holding the long name) into a CRITICAL
+        // (`MissingLongName`) that no fix can undo. The staged file plus `rename` is the same
+        // pattern `health::report` uses, and it is what makes this the only fix in the module
+        // that could otherwise lose data.
+        //
         // Writing the truncated name over the old one is what makes the fix idempotent: a second
         // run writes the same bytes again.
-        std::fs::write(
-            ctx.resolve(&self.name_file),
-            &self.long_name.as_bytes()[..end],
-        )
+        let target = ctx.resolve(&self.name_file);
+        let mut staged = target.clone().into_os_string();
+        staged.push(".tmp");
+        let staged = PathBuf::from(staged);
+        if let Err(e) = std::fs::write(&staged, &self.long_name.as_bytes()[..end]) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+        // `rename` replaces the original in one step; a leftover `<name>.c9s.tmp` from a killed
+        // run is overwritten by the next attempt rather than blocking it.
+        if let Err(e) = std::fs::rename(&staged, &target) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -506,6 +524,39 @@ mod tests {
         let after = run(&ctx);
         assert_eq!(after.len(), 1, "{after:#?}");
         assert_eq!(after[0].kind, "ValidShortenedFile");
+        // The fix stages the truncated bytes next to the name file and renames over it, so the
+        // original is replaced in one step and never sits there empty. Nothing of that staging is
+        // left behind -- a `name.c9s.tmp` would be the only entry the check does not know.
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [CONTENTS_FILE_NAME, INFLATED_FILE_NAME]);
+    }
+
+    /// A leftover `name.c9s.tmp` from a run that was killed between the write and the rename does
+    /// not block the next attempt: the fix overwrites it and renames over the original.
+    #[test]
+    fn a_leftover_staging_file_does_not_block_the_fix() {
+        let (_dir, ctx) = vault();
+        let name = long_name(300);
+        let dir = c9s(
+            &ctx,
+            &deflate_name(&name),
+            Some(format!("{name}garbage").as_bytes()),
+        );
+        let staged = dir.join(format!("{INFLATED_FILE_NAME}.tmp"));
+        std::fs::write(&staged, b"leftover from a killed run").unwrap();
+
+        let results = run(&ctx);
+        let fix = results[0].fix.as_ref().expect("the trailing bytes are cut");
+        fix.apply(&ctx).expect("the fix applies over the leftover");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(INFLATED_FILE_NAME)).unwrap(),
+            name
+        );
+        assert!(!staged.exists(), "the staging file was renamed away");
     }
 
     #[test]

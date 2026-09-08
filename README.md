@@ -118,9 +118,26 @@ then reports `"vault": null` and `"registered": false`:
 
 Both files are written into a temporary directory first, validated there (the masterkey is loaded
 back, the config's signature checked, and `--all` opens the whole pair as a vault) and only then
-moved into place, so a restore that fails leaves the vault exactly as it was. An existing file is
-backed up as `<name>.<checksum>.bkup` before it is replaced; `--json` lists the backups it made
-under `backups`, alongside `restored`, `cipherCombo`, `shorteningThreshold` and `keychainUpdated`.
+moved into place. An existing file is backed up as `<name>.<checksum>.bkup` before it is replaced;
+`--json` lists the backups it made under `backups`, alongside `restored`, `cipherCombo`,
+`shorteningThreshold` and `keychainUpdated`.
+
+Nothing is written until the validation passed, so a restore that fails leaves the vault as it was
+— with one window: `--all` moves two files, and the two moves are not one transaction. It moves
+`vault.cryptomator` first and `masterkey.cryptomator` second, so a failure between them leaves the
+new config next to the *old* masterkey file, and `restore --masterkey` with the same recovery key
+finishes the job. Both replaced files are in the `.bkup` copies named above until then.
+
+A vault of format 5 or 6 is refused (exit `5`, naming `crypto migrate`), even when it lost both key
+files and therefore looks restorable: those formats keep their long names in `m/`, and writing a
+format 8 config over their BASE32 names would make the vault unmigratable and unopenable. Migrate
+first, restore afterwards. A format 7 vault has no `m/` and shares its layout with format 8, so a
+restore on one is fine — it does the 7 → 8 step's job with new key files.
+
+`crypto` checks that *its own* daemon is not serving the vault, and nothing else: a vault the
+**Cryptomator desktop app** has unlocked looks `LOCKED` here. `restore` therefore prints a warning
+to stderr when the app answers on its IPC socket (see [Settings file](#settings-file)); lock the
+vault in the app before restoring its key files.
 
 ## Exit codes
 
@@ -532,7 +549,12 @@ if you can):
     crypto health Secret --no-report           # do not write the log file
 
 The vault must be `LOCKED` (exit `5` otherwise), and a vault of an older format is sent to
-`crypto migrate` rather than checked.
+`crypto migrate` rather than checked. "Locked" here means locked *as far as `crypto` can tell*: the
+runtime check only asks `crypto`'s own daemon, and a vault the **Cryptomator desktop app** has
+unlocked and mounted is indistinguishable from a locked one on disk. `--fix` moves, renames and
+deletes nodes, so it prints a warning to stderr when the desktop app answers on its IPC socket (see
+[Settings file](#settings-file)) — lock the vault there first. A run without `--fix` only reads and
+stays silent.
 
 ### `--fix`
 
@@ -580,7 +602,7 @@ until it is a format 8 vault:
 | Step | What changes |
 |---|---|
 | 5 → 6 | the passphrase is re-encoded as Unicode NFC and the masterkey file is rewritten |
-| 6 → 7 | every name in the vault is rewritten from BASE32 to base64url, directories and symlinks become `.c9r` directories, long names move from `m/…lng` into `name.c9s`, and `m/` is deleted |
+| 6 → 7 | every name in the vault is rewritten from BASE32 to base64url, directories and symlinks become `.c9r` directories, long names move from `m/…lng` into `name.c9s`, and `m/` is deleted (but see *skipped nodes* below) |
 | 7 → 8 | `vault.cryptomator` is written (format 8, `SIV_CTRMAC`, shortening threshold 220) and the masterkey file loses its version |
 
     crypto migrate Old --dry-run     # list the steps and the renames, change nothing
@@ -607,8 +629,32 @@ directory-id backups (that format had none), which `crypto health` reports as `I
 MissingDirIdBackup` — `crypto health <VAULT> --fix --fix-severity INFO` writes them, and the command
 says so when it is done.
 
-`--json` prints `{vault, path, from, to, steps, migrated, renamed, backups, keychainUpdated}`, or
-`{…, renames: [{old, new}], dryRun: true}` for `--dry-run`.
+### Skipped nodes
+
+The 6 → 7 step cannot migrate every node: a `<32 chars>.lng` whose entry under `m/` is missing,
+unreadable or absurdly large has no readable long name, a name that is not valid BASE32 decodes to
+nothing, and a node whose target name is taken three times over (`""`, `_1`, `_2`) has nowhere to
+go. Such a node keeps its old name, and `crypto migrate` says so — on stderr, in the summary line
+(`N node(s) were left with their old names`) and under `skipped` in `--json`. `--dry-run` lists the
+same nodes before anything is written.
+
+**`m/` is then kept**, which is a deliberate deviation from the desktop app: it deletes the
+metadata directory unconditionally, and with it the only copy of those nodes' long names. A
+leftover `m/` costs nothing (formats 7 and 8 never look at it) and a later `crypto migrate` run
+removes it once the nodes are dealt with.
+
+While it works, the migration probes the storage by creating and deleting `<vault>/c` — Java's
+`FileSystemCapabilityChecker`, which removes that directory recursively whether or not the probe
+created it. A `c/` directory of your own in the vault root will be gone afterwards. `--dry-run`
+never probes and never deletes anything.
+
+Like `crypto health --fix`, `crypto migrate` only knows about `crypto`'s own daemon. A vault the
+**Cryptomator desktop app** has unlocked looks `LOCKED` here, so the command warns on stderr when
+the app answers on its IPC socket (see [Settings file](#settings-file)); `--dry-run` writes nothing
+and stays silent.
+
+`--json` prints `{vault, path, from, to, steps, migrated, renamed, skipped, backups,
+keychainUpdated}`, or `{…, renames: [{old, new}], skipped, dryRun: true}` for `--dry-run`.
 
 ## Password sources
 
@@ -802,6 +848,12 @@ it takes no lock, so `settings.json.lock` cannot serialise against it. A command
 app answers on its IPC socket, `ipc.socket` next to `settings.json` (the app's own
 `-Dcryptomator.ipcSocketPath`; `$CRYPTO_DESKTOP_IPC_SOCKET` overrides the path). A socket file with
 nobody listening — what a crashed app leaves behind — does not count as running.
+
+The same probe carries a second, larger warning: `crypto health --fix`, `crypto migrate` and
+`crypto recovery-key restore` rewrite the *contents* of a vault, and the automatic "is anybody
+serving this vault?" check only asks `crypto`'s own daemon. A vault the desktop app has unlocked
+and mounted looks `LOCKED` on disk, so those three commands say **lock this vault in the app
+first** when it answers.
 A `settings.json` that cannot be parsed is reported as an error — unlike the desktop app, `crypto`
 never silently replaces it.
 

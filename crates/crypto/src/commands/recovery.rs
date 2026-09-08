@@ -180,6 +180,35 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
             }
         }
     }
+    // The same rule for the *old* password: only `--config` reads it (it signs the new config with
+    // the key already in the masterkey file). `--masterkey` and `--all` take the recovery key and a
+    // **new** password instead, so a `--password-*` flag there is not merely ignored -- with
+    // `--password-stdin` next to `--recovery-key-stdin` two readers would race for the same
+    // stdin. Refusing beats reading the recovery key out of the password's line.
+    if args.masterkey || args.all {
+        for (flag, given) in [
+            ("--password-stdin", args.password.password_stdin),
+            ("--password-file", args.password.password_file.is_some()),
+            ("--password-env", args.password.password_env.is_some()),
+            ("--password-keychain", args.password.password_keychain),
+        ] {
+            if given {
+                return Err(AppError::InvalidValue {
+                    key: flag.to_string(),
+                    message: format!(
+                        "{} takes the recovery key and a new password, not the vault's old one; \
+                         use --new-password-* (and --recovery-key-stdin/--recovery-key-file)",
+                        if args.masterkey {
+                            "--masterkey"
+                        } else {
+                            "--all"
+                        }
+                    ),
+                }
+                .into());
+            }
+        }
+    }
     let config_options = restore::ConfigOptions {
         cipher_combo: match args.cipher_combo.as_deref() {
             None | Some("auto") => None,
@@ -232,7 +261,8 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
         )?;
         let config =
             restore::restore_config(&access, &path, &passphrase, config_options, &mut OsRng)
-                .map_err(|err| name_the_combo(err, false))?;
+                .map_err(|err| name_the_combo(err, false))
+                .map_err(|err| name_the_migration(err, &args.vault))?;
         Restored {
             files: vec![VAULTCONFIG_FILENAME],
             config: Some(config),
@@ -274,7 +304,8 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
             &mut io,
         )?;
         let (files, config) = if args.masterkey {
-            restore::restore_masterkey(&encoder, &access, &path, &recovery_key, &new, &mut OsRng)?;
+            restore::restore_masterkey(&encoder, &access, &path, &recovery_key, &new, &mut OsRng)
+                .map_err(|err| name_the_migration(err.into(), &args.vault))?;
             (vec![MASTERKEY_FILENAME], None)
         } else {
             let config = restore::restore_all(
@@ -286,7 +317,8 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
                 config_options,
                 &mut OsRng,
             )
-            .map_err(|err| name_the_combo(err, true))?;
+            .map_err(|err| name_the_combo(err, true))
+            .map_err(|err| name_the_migration(err, &args.vault))?;
             (vec![MASTERKEY_FILENAME, VAULTCONFIG_FILENAME], Some(config))
         };
         // Same reasoning as `password change` and `reset-password`: a stored passphrase follows the
@@ -337,7 +369,9 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
 
 /// What a restore did, for the two renderings below.
 struct Restored {
-    /// The file names that were written, in the order they were written in.
+    /// The file names that were written. This is the order they are *named* in, which for `--all`
+    /// is not the order they are moved in -- `restore_all` moves the config first, so that a
+    /// failure between the two moves can be repaired with `restore --masterkey`.
     files: Vec<&'static str>,
     /// The config that was written, if one was.
     config: Option<VaultConfig>,
@@ -407,6 +441,27 @@ fn name_the_combo(err: CoreError, from_key: bool) -> anyhow::Error {
         message,
     }
     .into()
+}
+
+/// Adds the way out to the refusal `restore.rs` raises for a vault that still has the format 5/6
+/// layout: `crypto migrate` first, then restore.
+///
+/// Only the message is added -- the typed [`CoreError::MigrationBlocked`] stays in the chain, so
+/// the exit code remains `5` (wrong state), which is what every other "this vault has to be
+/// migrated first" refusal in the CLI reports.
+fn name_the_migration(err: anyhow::Error, reference: &str) -> anyhow::Error {
+    let legacy = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CoreError>(),
+            Some(CoreError::MigrationBlocked(_))
+        )
+    });
+    if !legacy {
+        return err;
+    }
+    err.context(format!(
+        "run `crypto migrate {reference}` first and restore the key files afterwards"
+    ))
 }
 
 #[cfg(test)]

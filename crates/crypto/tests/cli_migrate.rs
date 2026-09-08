@@ -310,6 +310,94 @@ fn a_dry_run_lists_the_renames_and_changes_nothing() {
         .stdout(predicate::str::contains("--dry-run"));
 }
 
+/// A node whose `m/` entry is gone is reported -- by `--dry-run` before anything happens, and by
+/// the migration itself afterwards -- and `m/` survives, because it holds the only copy of that
+/// node's long name.
+#[test]
+fn a_node_that_cannot_be_migrated_is_reported_and_keeps_the_metadata_directory() {
+    let fx = Sandbox::new();
+    let path = fx.add_fixture("legacy_v6");
+    let pw = passphrase("legacy_v6");
+    let node = break_the_long_name(&path);
+
+    // `--dry-run` first: the skip is announced before a single file is touched.
+    let assertion = migrate(&fx, &["--json", "migrate", "legacy_v6", "--dry-run"], &pw)
+        .assert()
+        .success();
+    let value = json(&assertion.get_output().stdout);
+    assert_eq!(value["skipped"], serde_json::json!([node]), "{value:#}");
+    assert!(
+        !value["renames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["old"] == node.as_str()),
+        "{value:#}"
+    );
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(stderr.contains(&node), "{stderr}");
+    assert!(stderr.contains("old names"), "{stderr}");
+
+    // And now for real.
+    let assertion = migrate(&fx, &["--json", "migrate", "legacy_v6", "--yes"], &pw)
+        .assert()
+        .success();
+    let value = json(&assertion.get_output().stdout);
+    assert_eq!(value["to"], 8, "{value:#}");
+    assert_eq!(value["migrated"], true, "{value:#}");
+    assert_eq!(value["skipped"], serde_json::json!([node]), "{value:#}");
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(stderr.contains(&node), "{stderr}");
+
+    assert!(
+        path.join("m").is_dir(),
+        "the metadata directory holds the only copy of the skipped node's name"
+    );
+    assert!(path.join(&node).is_file(), "{node} was moved after all");
+
+    // The human rendering carries the same summary on stdout.
+    let fx2 = Sandbox::new();
+    let path2 = fx2.add_fixture("legacy_v6");
+    break_the_long_name(&path2);
+    migrate(&fx2, &["migrate", "legacy_v6", "--yes"], &pw)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 node(s) were left with their old names; see above",
+        ));
+
+    // Everything else came through: the manifest's tree minus the one entry whose name is gone.
+    let mut expected = expected_tree("legacy_v6");
+    expected.retain(|path, _| !path.starts_with("/llll"));
+    assert_eq!(actual_tree(&fx, "legacy_v6", &pw), expected);
+}
+
+/// Deletes the `m/xx/yy/<32 chars>.lng` entry of `legacy_v6`'s single shortened node and returns
+/// that node's vault-relative path.
+fn break_the_long_name(vault: &Path) -> String {
+    let mut hits: Vec<PathBuf> = layout(vault)
+        .into_iter()
+        .filter(|path| {
+            path.starts_with("d")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".lng"))
+        })
+        .collect();
+    hits.sort();
+    assert_eq!(hits.len(), 1, "legacy_v6 has exactly one shortened name");
+    let node = hits.remove(0);
+    let name = node.file_name().unwrap().to_string_lossy().into_owned();
+    let deflated = &name[..name.len() - 4];
+    let metadata_file = vault
+        .join("m")
+        .join(&deflated[0..2])
+        .join(&deflated[2..4])
+        .join(&name);
+    std::fs::remove_file(&metadata_file).unwrap();
+    node.to_string_lossy().into_owned()
+}
+
 #[test]
 fn without_yes_and_without_a_terminal_it_is_a_usage_error() {
     let fx = Sandbox::new();
