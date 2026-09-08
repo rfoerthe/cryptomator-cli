@@ -1,19 +1,16 @@
-//! `crypto` – Cryptomator command line interface.
-mod cli;
-mod commands;
-mod exit;
-mod output;
-
+//! The `crypto` binary: argument parsing, the two desktop-app warnings, and the dispatch into
+//! `crypto::commands`. Everything with a test lives in the library next to it (`src/lib.rs`).
 use anyhow::Context;
 use clap::Parser;
-use cli::{
+use crypto::cli::{
     Cli, Command, ConfigCommand, KeychainCommand, PasswordCommand, RecoveryKeyCommand, VaultCommand,
 };
-use commands::Ctx;
+use crypto::commands::{self, Ctx};
+use crypto::exit;
+use crypto::output::Output;
 use cryptomator_app::settings::SettingsStore;
 use cryptomator_app::StateDir;
 use cryptomator_core::recovery::{validate_recovery_key, WordEncoder};
-use output::Output;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
