@@ -78,6 +78,8 @@ pub enum Command {
     Mounters(MountersArgs),
     /// Check a vault for structural damage and optionally repair it
     Health(HealthArgs),
+    /// Bring a vault of format 5, 6 or 7 up to format 8
+    Migrate(MigrateArgs),
     /// Inspect and self-test the keychain
     Keychain {
         #[command(subcommand)]
@@ -196,6 +198,22 @@ pub struct HealthArgs {
     /// Lowest severity that makes the command exit 11
     #[arg(long, value_name = "WARN|CRITICAL", default_value = "CRITICAL")]
     pub fail_on: String,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// Vault id, display name or path
+    // Vault ids are base64url and may start with `-`; clap would otherwise read one as a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub vault: String,
+    /// Migrate without asking for confirmation; required when there is no terminal to ask at
+    #[arg(long)]
+    pub yes: bool,
+    /// List the steps and the renames and exit without touching the vault
+    #[arg(long)]
+    pub dry_run: bool,
     #[command(flatten)]
     pub password: PasswordArgs,
 }

@@ -166,6 +166,10 @@ pub struct MigrationOptions {
     /// Report what would happen and change nothing. [`migrate`] then returns the format the vault
     /// is at, having written nothing and reported no [`MigrationEvent`]; the renames it would make
     /// are what [`plan`] lists.
+    ///
+    /// "Written nothing" is meant literally: the dry run short-circuits ahead of
+    /// [`assert_all_capabilities`], whose write probe would otherwise be the one thing it does
+    /// touch, so previewing a read-only copy of a vault works.
     pub dry_run: bool,
 }
 
@@ -289,10 +293,18 @@ fn migrate_with_rng(
     progress: &mut dyn FnMut(MigrationEvent),
     rng: &mut dyn Rng,
 ) -> Result<VaultVersion> {
+    // Before `assert_all_capabilities`, which probes for write access by creating and removing
+    // `<vault>/c/write-access-probe`: a dry run must be readable-only, so that a preview of a
+    // read-only copy or a snapshot prints the plan instead of failing with
+    // [`CoreError::MissingCapability`].
+    if options.dry_run {
+        // Verifies the passphrase, and nothing else: `plan_steps` only reads.
+        return Ok(plan_steps(vault_path, passphrase)?.from);
+    }
     assert_all_capabilities(vault_path)?;
     // Also verifies the passphrase, so a wrong one leaves the vault untouched.
     let planned = plan_steps(vault_path, passphrase)?;
-    if planned.steps.is_empty() || options.dry_run {
+    if planned.steps.is_empty() {
         return Ok(planned.from);
     }
     // The passphrase changes in 5 → 6 (NFC); the following steps need the new form.

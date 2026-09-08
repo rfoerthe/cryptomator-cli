@@ -6,6 +6,7 @@ pub mod fs;
 pub mod health;
 pub mod keychain;
 pub mod lock;
+pub mod migrate;
 pub mod mounters;
 pub mod name;
 pub mod password;
@@ -311,7 +312,14 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
     if state != VaultState::Locked {
         return Err(AppError::WrongState {
             expected: VaultState::Locked.as_str().to_string(),
-            actual: state.as_str().to_string(),
+            // A vault of format 5, 6 or 7 is not broken, it is old: every command that resolves it
+            // this way works once it has been migrated, so the state names the way out. The
+            // reference is the one the user typed, so the hint can be pasted back into the shell.
+            actual: if state == VaultState::NeedsMigration {
+                format!("{state} (run `crypto migrate {reference}` first)")
+            } else {
+                state.as_str().to_string()
+            },
         }
         .into());
     }
@@ -321,6 +329,38 @@ pub fn locked_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, Pa
     // `recovery-key reset-password` do -- would leave the running mount serving a vault whose key
     // no longer opens it. So every command that resolves a vault this way requires it to be
     // locked in the runtime sense too; `crypto lock --force` is the way out of a stale mount.
+    ctx.registry().require_locked(&vault)?;
+    Ok((vault, path))
+}
+
+/// [`locked_vault`] for `crypto migrate`: `NEEDS_MIGRATION` is allowed as well, because it is the
+/// very state the command exists to end.
+///
+/// The runtime half of [`locked_vault`] is unchanged and is the reason this is not simply a
+/// version check: a daemon serving the vault holds its files open, and the migration renames every
+/// one of them. (A daemon cannot be serving a *legacy* vault -- it could not open it -- but it can
+/// be serving a format 8 one, and that is exactly the vault this command must refuse before it
+/// reports "already at format 8".)
+pub fn migratable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
+    let settings = ctx.store.load()?;
+    let index = resolve_vault_index(&settings, reference)?;
+    let vault = settings.directories[index].clone();
+    let path = vault.path_buf().ok_or_else(|| AppError::InvalidValue {
+        key: "path".to_string(),
+        message: format!("vault {} has no path", vault.id),
+    })?;
+    let state = determine_vault_state(&path)?;
+    if !matches!(state, VaultState::Locked | VaultState::NeedsMigration) {
+        return Err(AppError::WrongState {
+            expected: format!(
+                "{} or {}",
+                VaultState::Locked.as_str(),
+                VaultState::NeedsMigration.as_str()
+            ),
+            actual: state.as_str().to_string(),
+        }
+        .into());
+    }
     ctx.registry().require_locked(&vault)?;
     Ok((vault, path))
 }

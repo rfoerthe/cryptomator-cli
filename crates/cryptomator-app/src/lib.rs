@@ -30,7 +30,7 @@ pub use mounting::{
     choose_service, conflicts_with, mount, MountHandle, MountOverrides, MountRequest,
 };
 pub use password::{
-    min_password_length, normalize_passphrase, read_new_passphrase,
+    decompose_passphrase, min_password_length, normalize_passphrase, read_new_passphrase,
     read_new_passphrase_no_env_fallback, read_passphrase, read_passphrase_with_keychain,
     read_secret_file, KeychainSource, NewPasswordArgs, PasswordArgs, PasswordIo, SystemIo,
 };

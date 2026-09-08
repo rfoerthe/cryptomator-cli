@@ -566,6 +566,61 @@ fn the_dry_run_lists_every_rename_and_writes_nothing() {
     );
 }
 
+/// A dry run must not need write access: previewing a migration of a read-only copy or a snapshot
+/// is exactly the case `--dry-run` exists for, and the write probe of `assert_all_capabilities`
+/// would be the only thing such a run touched.
+#[test]
+fn a_dry_run_previews_a_vault_it_cannot_write_to() {
+    if is_root() {
+        return; // root ignores the permission bits, so there is nothing to observe
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, vault) = common::fixture_copy_at("legacy_v6");
+    let meta = legacy_meta("legacy_v6");
+    let before = digests(&vault);
+
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (result, seen) = migrate_collecting_with(
+        &vault,
+        &meta.passphrase,
+        MigrationOptions {
+            full_scan_allowed: true,
+            dry_run: true,
+        },
+    );
+    // Restore before the assertions, so a failure still leaves a removable temp dir behind.
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(result.unwrap(), VaultVersion::V6);
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(digests(&vault), before, "not a byte moved");
+    assert!(
+        !vault.join("c").exists(),
+        "no capability probe directory was left behind"
+    );
+    // The same vault without `dry_run` does need the write access it has not got.
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (result, _) = migrate_collecting_with(
+        &vault,
+        &meta.passphrase,
+        MigrationOptions {
+            full_scan_allowed: true,
+            dry_run: false,
+        },
+    );
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(CoreError::MissingCapability {
+                capability: "write access",
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+}
+
 /// The whole chain, on all three legacy vaults: the migrated vault opens with the (NFC) passphrase
 /// and holds exactly the tree its manifest describes.
 #[test]

@@ -65,6 +65,12 @@ fn is_base32_char(byte: u8) -> bool {
 /// hit in the middle of a name would be one Java migrates only by accident. Anchoring also keeps a
 /// name that merely *contains* eight base32 characters (`my report ABCDEFGH.txt`) out of the
 /// migration instead of renaming it to garbage.
+///
+/// The asymmetry to [`find_32_base32_chars`] below — which does scan every position, like Java —
+/// is deliberate, so do not "fix" one half to match the other: the shortened pattern has to find
+/// the 32 characters inside `<name>.lng` (and inside whatever a syncer prefixed to it, e.g. a
+/// macOS AppleDouble companion `._<32 chars>.lng`), while the canonical pattern decides what a
+/// *whole* name is, where a hit at position 0 is the only one that can be trusted.
 fn canonical(file_name: &str) -> Option<String> {
     for prefix in [OLD_SYMLINK_PREFIX, OLD_DIRECTORY_PREFIX, ""] {
         let Some(rest) = file_name.strip_prefix(prefix) else {
@@ -408,7 +414,14 @@ impl PreMigrationStats {
             self.max_path_length = path_length;
             self.longest_path = Some(new_path.clone());
         }
-        // Java's `relativeToVaultRoot.getName(3)`: the node name in `d/XX/YYY…/<name>`.
+        // Java's `relativeToVaultRoot.getName(3)`: the node name in `d/XX/YYY…/<name>`. A target
+        // with fewer than four components -- a migratable file sitting directly in `d/` or
+        // `d/XX` -- has no such name, and is deliberately left out of the measurement rather than
+        // aborting the migration: Java's `getName(3)` throws `IllegalArgumentException` there,
+        // which `updateMaxCiphertextPathLength` does not catch (it catches only
+        // `InvalidOldFilenameException`), so such a vault cannot be migrated by Cryptomator at
+        // all. The file is still migrated here, only its name never meets `filename_limit` -- the
+        // path length above, which every target has, still does.
         if let Some(name) = relative.components().nth(3) {
             let name_length = name.as_os_str().to_string_lossy().chars().count();
             if name_length > self.max_name_length {
