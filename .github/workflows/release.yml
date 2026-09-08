@@ -218,7 +218,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: deb-${{ matrix.target }}
-      - run: cargo install cargo-deb --locked
+      # Pinned: `--locked` only fixes cargo-deb's *own* dependencies, not which cargo-deb runs, and
+      # two releases of it can write different control files from the same manifest. 3.8.0 is the
+      # version the packaging metadata was written against.
+      - name: install cargo-deb
+        run: cargo install cargo-deb --locked --version 3.8.0
       - uses: actions/download-artifact@v4
         with:
           name: crypto-${{ matrix.target }}
@@ -232,7 +236,8 @@ jobs:
           cp prebuilt/crypto "target/${{ matrix.target }}/release/crypto"
           chmod +x "target/${{ matrix.target }}/release/crypto"
       # Renders the manpages and completion scripts the package installs, then runs cargo-deb.
-      - run: cargo xtask deb --target ${{ matrix.target }} --no-build
+      - name: build the .deb
+        run: cargo xtask deb --target ${{ matrix.target }} --no-build
       # The package has to install and the binary has to run before anyone downloads it.
       - name: install the package and run it
         run: |

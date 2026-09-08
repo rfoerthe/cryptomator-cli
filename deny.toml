@@ -1,0 +1,69 @@
+# `cargo deny check` -- run by the `supply-chain` job in .github/workflows/ci.yml, and runnable
+# by hand with `cargo install cargo-deny --locked && cargo deny check`.
+#
+# The licence allow list below is measured, not guessed: it is the set of licences the current
+# lock file actually resolves to, plus our own AGPL-3.0-only. A new dependency with anything else
+# turns the job red on purpose, so that choice is made deliberately rather than by `cargo add`.
+# `xtask/tests/workflows.rs` re-measures it on every `cargo test`, over `cargo metadata`.
+
+[graph]
+# The four targets the release builds for; cfg-gated dependencies for anything else (Windows,
+# WASM, Android) are irrelevant here and would only add noise.
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+# The optional back ends (`webdav`, the keychain providers) are exactly the code a release ships,
+# so their dependencies are checked too.
+all-features = true
+
+[advisories]
+# `db-path` and `db-urls` stay at their defaults: the RustSec database from its own repository.
+# A yanked crate in the lock file is a supply-chain problem even when no advisory names it.
+yanked = "deny"
+# Nothing is ignored. An advisory is answered by raising the dependency; if no fixed version
+# exists, an entry goes here *with a comment* saying why the path is not reachable from here.
+ignore = []
+
+[licenses]
+# Explicit, one line each. No `allow-osi-fsf-free`: that would wave through anything an SPDX
+# database happens to call free.
+allow = [
+    # Our own crates (workspace `license` field).
+    "AGPL-3.0-only",
+    # The dependency tree, as measured over the lock file.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# The default. Every licence in the tree is recognised from the crate's `license` field, so no
+# text has to be matched against a template at all; lowering it would only start guessing.
+confidence-threshold = 0.8
+# Empty on purpose: every package in the tree declares a `license` expression, so none needs to
+# be excused by hand. A `license-file`-only crate would need an entry here.
+exceptions = []
+
+[bans]
+# Two versions of one crate are normal in a tree this size (the workspace already carries two
+# `clap` generations through dev-dependencies) -- worth seeing in the log, not worth failing on.
+multiple-versions = "warn"
+# `cargo` itself refuses a wildcard version for a published crate, and nothing here is published;
+# the lock file is what pins the build (`--locked` everywhere), so this adds nothing.
+wildcards = "allow"
+deny = []
+
+[sources]
+# crates.io and nothing else. The vendored `fuser` (see `[patch.crates-io]`) is a path
+# dependency, which has no source at all and is therefore not a git one either.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

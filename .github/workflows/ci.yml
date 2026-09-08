@@ -6,8 +6,13 @@ on:
 jobs:
   test:
     strategy:
+      # A red macOS run must not hide a Linux one, and vice versa: this matrix exists precisely to
+      # find the architecture-specific failures a two-runner matrix could not.
+      fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15]
+        # Both architectures on both systems: macos-15 is arm64 and macos-13 is x86_64,
+        # ubuntu-22.04 is x86_64 and ubuntu-22.04-arm is arm64.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-13]
     runs-on: ${{ matrix.os }}
     env:
       # The daemon tests (crates/crypto/tests/cli_daemon.rs) mount through the null mounter, which
@@ -20,6 +25,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # `cargo fmt` and `cargo clippy` produce the same answer on every runner; running them four
+      # times costs a minute each and buys nothing. They stay on the matrix all the same, because
+      # splitting them into a fifth job would mean a fifth checkout and a fifth cold cache.
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # This covers the M7 command tests too -- `cli_health.rs`, `cli_migrate.rs` and
@@ -257,3 +265,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: CRYPTO_E2E_KEYCHAIN=1 cargo test -p cryptomator-app --test keychain_e2e --locked -- --ignored --nocapture
+
+  # Advisories, licences, banned crates and registries in one pass over `deny.toml`. Deliberately
+  # not a second `cargo audit` job: both read the same RustSec database, and two configurations for
+  # one statement is one too many (M8 ruling 6).
+  #
+  # `command: check` with no argument runs *every* check cargo-deny has. Naming today's four would
+  # freeze the list and silently skip whatever it grows next.
+  supply-chain:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # The floor the workspace promises (`rust-version` in Cargo.toml). `cargo check` rather than
+  # `cargo test`: what has to hold on 1.89 is that the code compiles, not that it passes -- the
+  # `test` job above already ran the suite on stable. `--all-targets` puts the test and example
+  # targets, and with them the dev-dependencies, on the hook as well; if that is ever what turns
+  # this job red, the answer is to raise `rust-version`, not to drop the flag.
+  #
+  # The repository's `rust-toolchain.toml` pins `channel = "stable"` and would otherwise win over
+  # whatever is installed here. `dtolnay/rust-toolchain` exports `RUSTUP_TOOLCHAIN`, which beats
+  # the file -- that is the only reason this job checks anything at all. `@1.89` is the action's
+  # branch for that release; a test asserts it still equals the workspace's `rust-version`, so
+  # raising the MSRV without touching this job turns red rather than quiet.
+  msrv:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-targets --locked
