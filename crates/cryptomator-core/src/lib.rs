@@ -7,6 +7,7 @@ pub mod constants;
 pub mod crypto;
 pub mod error;
 pub mod fs;
+pub mod health;
 pub mod masterkey_file;
 pub mod recovery;
 pub mod vault;
@@ -31,6 +32,10 @@ pub use fs::{
     CiphertextDirectory, CiphertextFilePath, CiphertextFileType, CleartextPath, CryptoFs,
     CryptoFsOptions, CryptoPathMapper, DirEntry, DirIdLoader, EventSink, FileAttributes,
     FileHandle, FilesystemEvent, FilesystemLoop, OpenOptions,
+};
+pub use health::{
+    all_checks, checks_by_ids, run_checks, CheckContext, DiagnosticResult, Fix, HealthCheck,
+    Severity, CHECK_IDS,
 };
 pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};
 pub use vault::init::{

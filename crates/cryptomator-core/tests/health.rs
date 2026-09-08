@@ -99,3 +99,32 @@ fn the_broken_fixture_still_unlocks() {
     )
     .expect("the damaged vault still opens");
 }
+
+#[test]
+fn a_check_context_is_built_from_the_unlocked_broken_fixture() {
+    let (_tmp, vault) = common::fixture_copy_at("broken_health");
+    let meta = common::fixture_meta(&vault);
+    let opened = cryptomator_core::open_vault(
+        &vault,
+        &cryptomator_core::MasterkeyFileAccess::new(Vec::new()),
+        &meta.passphrase,
+    )
+    .expect("the damaged vault still opens");
+
+    let ctx = cryptomator_core::CheckContext::from_opened(opened);
+    assert_eq!(ctx.vault_path, vault);
+    assert_eq!(ctx.data_dir(), vault.join("d"));
+    assert!(ctx.data_dir().is_dir());
+    assert_eq!(ctx.shortening_threshold, meta.shortening_threshold as usize);
+    assert_eq!(ctx.config.vault_version, cryptomator_core::VAULT_VERSION);
+    assert_eq!(ctx.config.cipher_combo.as_str(), meta.cipher_combo);
+
+    // The context carries a working cryptor: the root content dir it addresses must exist.
+    let root = cryptomator_core::root_content_dir(&ctx.vault_path, &ctx.cryptor);
+    assert!(root.is_dir(), "{} is missing", root.display());
+
+    // The placeholder catalogue runs against a real vault without reporting anything (Tasks 4/6).
+    let findings = cryptomator_core::run_checks(&cryptomator_core::CHECK_IDS, &ctx, &mut |_| {})
+        .expect("the catalogue ids are known");
+    assert!(findings.is_empty(), "{findings:#?}");
+}
