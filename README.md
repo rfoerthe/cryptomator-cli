@@ -4,7 +4,7 @@
 for macOS and Linux. It shares the desktop app's `settings.json` and keychain entries.
 
 Status: early development. Vault format 8 read and write, mount-less access, FUSE mounting with a
-per-vault daemon and a loopback WebDAV server work; the keychain, `crypto health`, restore and
+per-vault daemon, a loopback WebDAV server and the keychain work; `crypto health`, restore and
 migration do not exist yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the
 design and `docs/daemon-protocol.md` for the daemon's wire protocol.
 
@@ -34,6 +34,9 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `config get` | Prints one or all settings, from `settings.json` and `cli.json` together | `crypto config get port` |
 | `config set` | Changes a setting (`mountService`, `port`, `useKeychain`, `keychainProvider`, `debugMode`, `mountPointsDir`, `defaultMounter`, `logLevel`, `forceUnmountOnSignalAfterSecs`, `webdavBind`) | `crypto config set port 42427` |
 | `password change` | Changes the vault password and backs the old masterkey file up as `.bkup` | `crypto password change Secret --new-password-stdin` |
+| `password store` | Verifies a password and saves it in the keychain | `crypto password store Secret` |
+| `password forget` | Removes a vault's password from the keychain | `crypto password forget Secret` |
+| `keychain test` | Names the keychain provider and self-tests it | `crypto keychain test --json` |
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
@@ -84,12 +87,12 @@ input.
 | `5` | wrong vault state: already unlocked, not unlocked, needs migration, read-only, or an `fs`/`name`/`password change`/`recovery-key show`/`recovery-key reset-password` command on a vault that is not `LOCKED` |
 | `6` | the mount failed — a mount point that cannot be used, a mounter that refused, a conflicting mount service, a WebDAV port that is already in use, or a daemon that stopped answering while it mounted |
 | `7` | the unmount failed; a volume still in use needs `crypto lock … --force` |
+| `8` | the keychain could not serve the request: no usable provider, `--no-keychain` or `useKeychain false` on a keychain command, a locked keyring, a call that timed out after 30 s, or `--password-keychain` for a vault with nothing stored |
 | `9` | a Hub vault, which this build cannot open |
 | `10` | the vault's daemon cannot be reached |
 | `12` | the path is not a vault directory |
 
-`8` (keychain unavailable) and `11` (health findings) are reserved for M6 and M7 and are never
-returned today.
+`11` (health findings) is reserved for M7 and is never returned today.
 
 ## Mounting
 
@@ -314,8 +317,9 @@ same one the desktop app uses (the AppleScript mounter appends the volume name, 
 
 - **macOS Finder:** *Go → Connect to Server* (Cmd-K), paste the `http://…` URL, *Connect*, and the
   volume appears under `/Volumes`. macOS asks whether you really want to connect to an unencrypted
-  server — there is no keychain entry to suppress that yet (the desktop app writes one; that is
-  M6's job). Without Finder: `mount_webdav -S -i "<url>" <empty directory>`.
+  server — there is no keychain entry to suppress that. The desktop app writes an anonymous
+  *internet* password for the WebDAV server first; `crypto` does not, and that item has nothing to
+  do with the vault passwords below. Without Finder: `mount_webdav -S -i "<url>" <empty directory>`.
 - **GNOME:** `gio mount "dav://127.0.0.1:<port>/<vault id>"` — note the `dav:` scheme, not `http:` —
   or Nautilus's *Other Locations → Connect to Server* with the same `dav://` address.
 - **Anything else:** `curl -X PROPFIND -H 'Depth: 1' <url>/`, `rclone`, a WebDAV-capable editor.
@@ -455,11 +459,22 @@ above.
 A password is taken from the first source that is present, so a password never has to appear on the
 command line:
 
+0. `--password-keychain` – the keychain and nothing else. It is checked before every other source,
+   including `$CRYPTO_PASSWORD`, and a vault with nothing stored fails with exit `8` instead of
+   falling back or asking
 1. `--password-stdin` – the next line of standard input (the trailing newline is removed)
 2. `--password-file <FILE>` – at most 5000 bytes of UTF-8, one trailing newline removed
 3. `--password-env <VAR>` – the named environment variable (it must be set)
 4. `$CRYPTO_PASSWORD` – the implicit fallback when no flag is given
-5. an interactive prompt, but only when standard input is a terminal
+5. the keychain, implicitly – when `useKeychain` is on, a provider works on this machine, you did
+   not pass `--no-keychain`, and a password is stored for this vault. Nothing stored means this step
+   is simply skipped
+6. an interactive prompt, but only when standard input is a terminal
+
+`$CRYPTO_PASSWORD` deliberately outranks the implicit keychain step: it is a source a script sets on
+purpose, and it can never make the operating system open a dialog. `--no-keychain` removes steps 0
+and 5 from the list for one run, whatever `settings.json` says — and the flags are mutually
+exclusive, so `--password-keychain` together with any other `--password-*` flag is a usage error.
 
 Without a usable source the command fails with a usage error instead of hanging. Passwords are NFC
 normalised like the desktop app and never appear in error messages or logs.
@@ -478,6 +493,106 @@ the current one, and silently reusing it would keep the old password.
 a crashed daemon left mounted, holds a live key that rewriting the masterkey file would invalidate.
 `crypto lock` — with `--force` for the volume a crashed daemon left behind — is the way out.
 `recovery-key validate` takes no vault and is unaffected.
+
+## Stored passwords (keychain)
+
+`crypto` keeps vault passwords where the Cryptomator desktop app keeps them, so a password saved in
+one program is found by the other.
+
+| | macOS | Linux |
+|---|---|---|
+| backend | the login keychain, generic password | FreeDesktop Secret Service (gnome-keyring, KeePassXC, …) |
+| provider classes | `org.cryptomator.macos.keychain.MacSystemKeychainAccess` (alias `macos`), `…TouchIdKeychainAccess` (alias `touchid`) | `org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess` (alias `gnome-keyring`, the default), `…SecretServiceKeychainAccess` (alias `secret-service`), `…KDEWalletKeychainAccess` (aliases `kde`, `kwallet`) |
+| where the entry lives | service `Cryptomator`, account = the vault id | the default collection (falling back to `login`), item label `Cryptomator`, attributes `Vault` = the vault id and — for `secret-service` only — `Name` = the display name |
+| found by | service and account | the `Vault` attribute alone, so a renamed vault keeps its password |
+
+`$CRYPTO_KEYCHAIN_SERVICE` overrides the service name (macOS) and the item label (Linux) for a whole
+environment; it is the equivalent of the desktop app's
+`cryptomator.integrationsMac.keychainServiceName`.
+
+On macOS the *label* Keychain Access shows for an item `crypto` writes is the vault's display name
+(its id when it has no name), while the desktop app labels its items `Cryptomator`. Only the label
+differs: both programs address the same item by service and account, so each finds what the other
+wrote.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `crypto password store <VAULT>` | asks for the password, **verifies it against the vault** and only then saves it |
+| `crypto password forget <VAULT>` | removes the saved password; nothing stored is not an error |
+| `crypto unlock <VAULT> --store-password` | saves the password once the vault is mounted (`--no-store-password` spells out the default) |
+| `crypto vault create <PATH> --store-password` | saves the new password |
+| `crypto vault remove <VAULT> --forget-password` | removes the saved password along with the registration |
+| `crypto keychain test` | names the provider and does a store/load/delete round trip with a throwaway key |
+
+`crypto password change` and `crypto recovery-key reset-password` carry a stored password along by
+themselves, exactly like the desktop app: if one is stored it follows the change, and if none is
+stored nothing happens. A keychain that refuses at that point is a warning, not a failed password
+change — the new password is already on disk by then, and `crypto password store <VAULT>` repairs the
+entry. A `--store-password` that fails *after* the vault is mounted is a warning too, for the same
+reason: the mount stands.
+
+### Settings
+
+    crypto config set useKeychain false                 # never touch a keychain
+    crypto config set keychainProvider secret-service   # pick a backend by alias or class name
+
+`keychainProvider` takes an alias — `macos`, `touchid`, `secret-service`, `gnome-keyring`, `kde`,
+`kwallet` — or a fully qualified Java class name; what is written to `settings.json` is always the
+class name, so the desktop app keeps reading its own setting. Anything else is refused with exit `2`.
+A provider that names nothing usable on this machine is *not* an error: the highest-priority
+provider that does work takes over, exactly as `KeychainModule.provideKeychainAccessProvider` does.
+`--no-keychain` overrides both settings for one run.
+
+`crypto keychain test` is the command to run when an unlock does not find a stored password. It
+prints the provider, whether it is supported and whether it is locked, and the result of a round
+trip — and only *then* fails with exit `8` if something went wrong, so the diagnosis is on standard
+output either way:
+
+    $ crypto keychain test --json
+    {
+      "provider": "org.cryptomator.macos.keychain.MacSystemKeychainAccess",
+      "displayName": "macOS Keychain",
+      "supported": true,
+      "locked": false,
+      "roundTrip": "ok"
+    }
+
+The throwaway key is `crypto-selftest-<random>` and is deleted again, so the test can never touch a
+vault's own entry.
+
+### Things worth knowing
+
+- **Every keychain call gives up after 30 seconds**, and choosing a provider gives each candidate 5
+  seconds to say whether it works at all. A call that runs out of time reports exit `8` with *the
+  keychain did not answer within 30 s; a system dialog may be waiting for you*. Without that, a
+  dialog nobody is looking at would hang the command forever. Both budgets are compiled in.
+- **macOS asks the first time.** An entry written by Cryptomator.app belongs, as far as the keychain
+  ACL is concerned, to Cryptomator.app; `crypto` is a different program, so macOS puts up a dialog
+  asking whether it may be read. Choose **“Always Allow”** and it asks once. Until release binaries
+  are signed with a stable Developer-ID identity, a rebuilt or re-signed binary can count as a
+  different program and ask again. Entries `crypto` wrote itself do not prompt. Over SSH or in any
+  session without a window server there is nobody to answer, so use `--password-stdin`,
+  `--password-file` or `$CRYPTO_PASSWORD` there.
+- **Touch ID is read-only in effect.** A `keychainProvider` of `TouchIdKeychainAccess` is served by
+  the plain macOS backend — the items are the same ones, so reading, updating and deleting all work
+  — but a password `crypto` writes carries no Touch-ID access control.
+- **macOS: old entries are migrated when they are read.** Cryptomator once stored items under the
+  service name `"Cryptomator\0"`, with a trailing NUL. When nothing is found under the current
+  service name, `crypto` looks there too and moves a hit across, the way
+  `MacKeychain.tryMigratePassword` does.
+- **Linux needs a running Secret Service** on the session bus — `gnome-keyring-daemon
+  --components=secrets`, KeePassXC with its Secret Service integration, and so on. Without one the
+  implicit keychain step is simply skipped, and `crypto keychain test` says why.
+- **KWallet is not supported.** `KDEWalletKeychainAccess` exists only to report itself unusable and
+  to point at `crypto config set keychainProvider secret-service`, which KWallet's own Secret Service
+  bridge serves.
+- **Keychain calls are not concurrent.** One `crypto` process makes one keychain call at a time; two
+  processes racing for the same entry are not coordinated by anything but the backend itself.
+- **`$CRYPTO_KEYCHAIN_FAKE=<file>` is for tests only.** It replaces every real backend with a JSON
+  file (mode 0600) and, while it is set, it is the *only* provider — nothing can reach the real
+  keychain by accident. It stores passwords in the clear; do not point it at anything you keep.
 
 ## Settings file
 
