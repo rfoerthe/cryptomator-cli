@@ -123,8 +123,218 @@ fn a_check_context_is_built_from_the_unlocked_broken_fixture() {
     let root = cryptomator_core::root_content_dir(&ctx.vault_path, &ctx.cryptor);
     assert!(root.is_dir(), "{} is missing", root.display());
 
-    // The placeholder catalogue runs against a real vault without reporting anything (Tasks 4/6).
-    let findings = cryptomator_core::run_checks(&cryptomator_core::CHECK_IDS, &ctx, &mut |_| {})
+    // `type` and `shortened` are still placeholders and report nothing (Task 6); `dirid` is real
+    // and has its own tests below.
+    let findings = cryptomator_core::run_checks(&["type", "shortened"], &ctx, &mut |_| {})
         .expect("the catalogue ids are known");
     assert!(findings.is_empty(), "{findings:#?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 4: the `dirid` check against the damaged fixture.
+// ---------------------------------------------------------------------------------------------
+
+use cryptomator_core::{
+    CheckContext, CleartextPath, CryptoFs, CryptoFsOptions, DiagnosticResult, Masterkey,
+    OpenedVault, Severity,
+};
+use data_encoding::HEXLOWER;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Unlocks a fixture copy with its raw masterkey — no scrypt, so a test may unlock repeatedly.
+fn unlock(vault: &Path) -> OpenedVault {
+    let meta = common::fixture_meta(vault);
+    let raw = HEXLOWER
+        .decode(meta.masterkey_hex.as_bytes())
+        .expect("the manifest carries a hex masterkey");
+    let mut key = [0u8; 64];
+    key.copy_from_slice(&raw);
+    cryptomator_core::open_vault_with_key(vault, Masterkey::from_raw(key))
+        .expect("the fixture unlocks")
+}
+
+fn context(name: &str) -> (tempfile::TempDir, PathBuf, CheckContext) {
+    let (tmp, vault) = common::fixture_copy_at(name);
+    let ctx = CheckContext::from_opened(unlock(&vault));
+    (tmp, vault, ctx)
+}
+
+fn dirid(ctx: &CheckContext) -> Vec<DiagnosticResult> {
+    cryptomator_core::run_checks(&["dirid"], ctx, &mut |_| {}).expect("`dirid` is a known check")
+}
+
+/// How often each result kind occurs. The manifest names the findings by kind, and only by kind:
+/// two of the nine paths are named after random directory ids and the `DirIdCollision` path depends
+/// on the directory order, so counting kinds is the only stable comparison (Task 1 report).
+fn by_kind(results: &[DiagnosticResult]) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for result in results {
+        *counts.entry(result.kind).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn count_kind(results: &[DiagnosticResult], kind: &str) -> usize {
+    results.iter().filter(|r| r.kind == kind).count()
+}
+
+fn slashed(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// The manifest's `dirid` entries, folded to `kind -> (count, severity)`.
+fn expected_dirid() -> BTreeMap<String, (usize, String)> {
+    let mut expected: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for finding in expected_findings()
+        .into_iter()
+        .filter(|f| f.check == "dirid")
+    {
+        let entry = expected
+            .entry(finding.result.clone())
+            .or_insert((0, finding.severity.clone()));
+        entry.0 += 1;
+        assert_eq!(
+            entry.1, finding.severity,
+            "the manifest gives {} two severities",
+            finding.result
+        );
+    }
+    expected
+}
+
+/// Applies every fix except the orphan adoption, which only arrives with Task 5.
+fn apply_simple_fixes(ctx: &CheckContext, results: &[DiagnosticResult]) {
+    for result in results {
+        if let Some(fix) = &result.fix {
+            fix.apply(ctx)
+                .unwrap_or_else(|e| panic!("{} fix failed: {e}", result.kind));
+        }
+    }
+}
+
+#[test]
+fn the_dirid_check_finds_exactly_the_manifest_findings() {
+    let (_tmp, _vault, ctx) = context("broken_health");
+    let results = dirid(&ctx);
+    assert!(results.iter().all(|r| r.check == "dirid"), "{results:#?}");
+
+    let expected = expected_dirid();
+    assert_eq!(expected.len(), 5, "{expected:#?}");
+    let found = by_kind(&results);
+    for (kind, (count, severity)) in &expected {
+        assert_eq!(
+            found.get(kind.as_str()).copied().unwrap_or(0),
+            *count,
+            "{kind}: {results:#?}"
+        );
+        for result in results.iter().filter(|r| r.kind == kind.as_str()) {
+            assert_eq!(result.severity.as_str(), severity, "{kind}");
+        }
+    }
+
+    // The intact directories are still good, and nothing beyond the manifest is reported.
+    assert!(
+        found.get("HealthyDir").copied().unwrap_or(0) >= 1,
+        "{results:#?}"
+    );
+    for result in &results {
+        assert!(
+            expected.contains_key(result.kind) || result.severity == Severity::Good,
+            "unexpected finding: {result:#?}"
+        );
+    }
+
+    // Every reported path is vault-relative and points into the data dir.
+    assert!(
+        results
+            .iter()
+            .flat_map(|r| &r.paths)
+            .all(|p| p.is_relative() && p.starts_with("d")),
+        "{results:#?}"
+    );
+}
+
+#[test]
+fn the_stable_manifest_paths_are_reported_verbatim() {
+    // Only these two `dirid` paths are stable: `OrphanContentDir` and `MissingDirIdBackup` are named
+    // after random directory ids, and which of the two colliding `dir.c9r` files `DirIdCollision`
+    // names depends on the directory order (Task 1 report).
+    let (_tmp, _vault, ctx) = context("broken_health");
+    let results = dirid(&ctx);
+    for kind in ["LooseDirFile", "MissingContentDir"] {
+        let expected = expected_findings()
+            .into_iter()
+            .find(|f| f.result == kind)
+            .unwrap_or_else(|| panic!("no {kind} in the manifest"))
+            .path;
+        assert!(
+            results
+                .iter()
+                .filter(|r| r.kind == kind)
+                .any(|r| r.paths.iter().any(|p| slashed(p) == expected)),
+            "{kind} does not name {expected}: {results:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_intact_vault_yields_only_good_dirid_results() {
+    let (_tmp, _vault, ctx) = context("nested");
+    let results = dirid(&ctx);
+    assert!(!results.is_empty());
+    assert!(
+        results.iter().all(|r| r.severity == Severity::Good),
+        "{results:#?}"
+    );
+    assert!(results.iter().all(|r| !r.fixable()), "{results:#?}");
+}
+
+#[test]
+fn the_simple_dirid_fixes_repair_the_vault_and_are_idempotent() {
+    let (_tmp, vault, ctx) = context("broken_health");
+    let before = dirid(&ctx);
+    // The adoption fix arrives with Task 5; until then the orphan is reported without one.
+    assert!(
+        before
+            .iter()
+            .any(|r| r.kind == "OrphanContentDir" && !r.fixable()),
+        "{before:#?}"
+    );
+    // Before the repair the directory whose content dir is missing is not even listable.
+    let fs = CryptoFs::open(unlock(&vault), CryptoFsOptions::default());
+    assert!(
+        !fs.read_dir(&CleartextPath::root())
+            .expect("the root lists")
+            .iter()
+            .any(|e| e.cleartext_name == "nocontent"),
+        "the broken directory is filtered out while its content dir is missing"
+    );
+    drop(fs);
+
+    apply_simple_fixes(&ctx, &before);
+    let after = dirid(&ctx);
+    for kind in ["LooseDirFile", "MissingDirIdBackup", "MissingContentDir"] {
+        assert_eq!(count_kind(&after, kind), 0, "{kind}: {after:#?}");
+    }
+    // Untouched: the orphan fix was not implemented yet, the collision is unfixable in Java too.
+    assert_eq!(count_kind(&after, "OrphanContentDir"), 1, "{after:#?}");
+    assert_eq!(count_kind(&after, "DirIdCollision"), 1, "{after:#?}");
+
+    // Applying the same fixes a second time changes nothing.
+    apply_simple_fixes(&ctx, &after);
+    assert_eq!(by_kind(&dirid(&ctx)), by_kind(&after));
+
+    // The repaired vault still opens and the repaired directory now lists (empty, its content was
+    // never there — the fix restores the structure, not the data).
+    let fs = CryptoFs::open(unlock(&vault), CryptoFsOptions::default());
+    let root = fs.read_dir(&CleartextPath::root()).expect("the root lists");
+    assert!(
+        root.iter().any(|e| e.cleartext_name == "nocontent"),
+        "{root:#?}"
+    );
+    assert!(fs
+        .read_dir(&CleartextPath::parse("/nocontent"))
+        .expect("the repaired directory lists")
+        .is_empty());
 }

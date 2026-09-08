@@ -20,6 +20,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod dir_id;
+
 /// The ids of all checks, in the order they run and are reported.
 pub const CHECK_IDS: [&str; 3] = ["dirid", "type", "shortened"];
 
@@ -195,11 +197,7 @@ impl CheckContext {
 /// The catalogue, in report order.
 pub fn all_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
-        // Task 4 replaces this with the real `DirIdCheck`.
-        Box::new(Placeholder {
-            id: "dirid",
-            name: "Directory Check",
-        }),
+        Box::new(dir_id::DirIdCheck),
         // Task 6 replaces this with the real `CiphertextFileTypeCheck`.
         Box::new(Placeholder {
             id: "type",
@@ -266,12 +264,12 @@ fn run_selected(
 
 fn unknown_check(id: &str) -> CoreError {
     CoreError::InvalidArgument(format!(
-        "unknown health check {id}; known: {}",
+        "unknown check {id:?}; valid checks are {}",
         CHECK_IDS.join(", ")
     ))
 }
 
-/// Only until Tasks 4 and 6 land: a check that reports nothing, so the catalogue, `run_checks`,
+/// Only until Task 6 lands: a check that reports nothing, so the catalogue, `run_checks`,
 /// `--check` and the report can be built and tested before the real traversals exist.
 #[derive(Debug)]
 struct Placeholder {
@@ -372,7 +370,7 @@ mod tests {
     fn an_unknown_check_names_the_valid_ones() {
         let err = checks_by_ids(&["bogus"]).unwrap_err().to_string();
         assert!(
-            err.contains("bogus") && err.contains("dirid") && err.contains("shortened"),
+            err.ends_with(r#"unknown check "bogus"; valid checks are dirid, type, shortened"#),
             "{err}"
         );
         assert!(matches!(
@@ -384,7 +382,7 @@ mod tests {
     #[test]
     fn the_placeholders_report_nothing() {
         let mut seen = 0;
-        let results = run_checks(&CHECK_IDS, &ctx(), &mut |_| seen += 1).unwrap();
+        let results = run_checks(&["type", "shortened"], &ctx(), &mut |_| seen += 1).unwrap();
         assert!(results.is_empty());
         assert_eq!(seen, 0);
     }
