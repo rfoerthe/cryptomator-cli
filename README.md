@@ -606,9 +606,11 @@ request, so it works for locked, unlocked and crashed vaults alike:
     crypto status Secret --json                # one object: id, displayName, path, state,
                                                # mountpoint, mounter, pid, readOnly
 
-The states are the ones `crypto vault list` shows plus `UNLOCKED` and `STALE_MOUNT`. Naming a vault
-that is not registered is exit `3`; without an argument the output is an array, with one it is that
-vault's object.
+The states are `LOCKED`, `UNLOCKED`, `STALE_MOUNT`, `MISSING`, `VAULT_CONFIG_MISSING`,
+`ALL_MISSING`, `NEEDS_MIGRATION` and `ERROR`. `crypto vault list` and `crypto vault info` read the
+same registry and report the same state for the same vault, so no two commands disagree about
+whether a vault is unlocked. Naming a vault that is not registered is exit `3`; without an argument
+the output is an array, with one it is that vault's object.
 
 `crypto stats` and `crypto events` ask the daemon, so they need the vault to be **unlocked** (exit
 `5` otherwise, exit `10` if the daemon is gone):

@@ -7,12 +7,12 @@ use cryptomator_app::settings::{
     generate_id, normalize_vault_path, resolve_vault_index, VaultSettingsJson, WhenUnlocked,
 };
 use cryptomator_app::{
-    min_password_length, read_new_passphrase, resolve_mounter, AppError, SystemIo,
+    min_password_length, read_new_passphrase, resolve_mounter, AppError, SystemIo, VaultRegistry,
 };
 use cryptomator_core::recovery::{create_recovery_key, WordEncoder};
 use cryptomator_core::{
-    assert_is_vault_directory, create_vault, determine_vault_state, read_vault_config, CipherCombo,
-    CreateVaultOptions, KeyId, MasterkeyFileAccess, OsRng,
+    assert_is_vault_directory, create_vault, read_vault_config, CipherCombo, CreateVaultOptions,
+    KeyId, MasterkeyFileAccess, OsRng,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -28,19 +28,17 @@ pub fn key_loader_scheme(vault_path: &Path) -> Option<String> {
     })
 }
 
-fn state_of(vault: &VaultSettingsJson) -> String {
-    match vault.path_buf().map(|p| determine_vault_state(&p)) {
-        Some(Ok(state)) => state.as_str().to_string(),
-        _ => "ERROR".to_string(),
-    }
-}
-
-pub fn vault_json(vault: &VaultSettingsJson) -> Value {
+/// The state as `crypto status` reports it: what the vault directory says, corrected by what the
+/// state directory says about a running daemon. Going through the registry rather than
+/// [`cryptomator_core::determine_vault_state`] alone is what keeps `vault info` from calling an
+/// unlocked vault `LOCKED` -- the ciphertext on disk looks the same either way.
+pub fn vault_json(registry: &VaultRegistry, vault: &VaultSettingsJson) -> Result<Value> {
+    let (state, _) = registry.state_of(vault)?;
     let mut value = json!({
         "id": vault.id,
         "displayName": vault.display_name,
         "path": vault.path,
-        "state": state_of(vault),
+        "state": state.as_str(),
         "mountPoint": vault.mount_point,
         "usesReadOnlyMode": vault.uses_read_only_mode,
         "mountFlags": vault.mount_flags,
@@ -64,7 +62,7 @@ pub fn vault_json(vault: &VaultSettingsJson) -> Value {
         value["keyId"] = json!(config.key_id().map(|k| k.to_string()).ok());
         value["keyType"] = json!(key_type);
     }
-    value
+    Ok(value)
 }
 
 fn human_info(value: &Value) -> String {
@@ -235,7 +233,7 @@ pub fn add(ctx: &Ctx, args: AddArgs) -> Result<u8> {
     assert_is_vault_directory(&path)
         .with_context(|| format!("cannot register vault at {}", path.display()))?;
     let vault = register(ctx, &path, args.name)?;
-    ctx.out.emit(vault_json(&vault), || {
+    ctx.out.emit(vault_json(&ctx.registry(), &vault)?, || {
         format!(
             "Registered {} as {} ({})",
             path.display(),
@@ -297,7 +295,12 @@ pub fn remove(ctx: &Ctx, reference: &str, forget_password: bool) -> Result<u8> {
 
 pub fn list(ctx: &Ctx) -> Result<u8> {
     let settings = ctx.store.load()?;
-    let rows: Vec<Value> = settings.directories.iter().map(vault_json).collect();
+    let registry = ctx.registry();
+    let rows: Vec<Value> = settings
+        .directories
+        .iter()
+        .map(|vault| vault_json(&registry, vault))
+        .collect::<Result<_>>()?;
     ctx.out.emit(Value::Array(rows.clone()), || {
         if rows.is_empty() {
             return "No vaults registered. Use `crypto vault create` or `crypto vault add`."
@@ -325,7 +328,7 @@ pub fn list(ctx: &Ctx) -> Result<u8> {
 pub fn info(ctx: &Ctx, reference: &str) -> Result<u8> {
     let settings = ctx.store.load()?;
     let index = resolve_vault_index(&settings, reference)?;
-    let value = vault_json(&settings.directories[index]);
+    let value = vault_json(&ctx.registry(), &settings.directories[index])?;
     ctx.out.emit(value.clone(), || human_info(&value))?;
     Ok(exit::OK)
 }
@@ -411,7 +414,7 @@ pub fn set(ctx: &Ctx, args: SetArgs) -> Result<u8> {
         }
         Ok(vault.clone())
     })?;
-    let value = vault_json(&updated);
+    let value = vault_json(&ctx.registry(), &updated)?;
     ctx.out.emit(value.clone(), || human_info(&value))?;
     Ok(exit::OK)
 }

@@ -1846,3 +1846,38 @@ fn unlock_store_password_warns_when_the_keychain_refuses() {
         !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
     });
 }
+
+/// `crypto vault info` and `crypto vault list` used to answer from the vault directory alone --
+/// where ciphertext looks the same locked or unlocked -- and therefore called an unlocked vault
+/// `LOCKED`, contradicting `crypto status` on the very same vault.
+#[test]
+fn vault_info_and_list_report_the_runtime_state_like_status_does() {
+    let fx = Fixture::new("v");
+    assert_eq!(
+        json_out(&fx, &["--json", "vault", "info", "v"])["state"],
+        "LOCKED"
+    );
+
+    unlock(&fx);
+
+    let status = json_out(&fx, &["--json", "status", "v"]);
+    assert_eq!(status["state"], "UNLOCKED");
+    assert_eq!(
+        json_out(&fx, &["--json", "vault", "info", "v"])["state"],
+        "UNLOCKED"
+    );
+    assert_eq!(
+        json_out(&fx, &["--json", "vault", "list"])[0]["state"],
+        "UNLOCKED"
+    );
+    fx.crypto_daemon(&["vault", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("UNLOCKED"));
+
+    fx.crypto_daemon(&["lock", "v"]).assert().success();
+    assert_eq!(
+        json_out(&fx, &["--json", "vault", "info", "v"])["state"],
+        "LOCKED"
+    );
+}
