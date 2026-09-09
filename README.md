@@ -3,15 +3,105 @@
 `crypto` is a Rust command line client for [Cryptomator](https://cryptomator.org) vaults (vault format 8)
 for macOS and Linux. It shares the desktop app's `settings.json` and keychain entries.
 
-Status: early development. Vault format 8 read and write, mount-less access, FUSE mounting with a
-per-vault daemon, a loopback WebDAV server, the keychain, the health checks, the migration of older
-vault formats and the rebuilding of lost key files all work; packaging, manpages and shell
-completions do not exist yet. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the
-design and `docs/daemon-protocol.md` for the daemon's wire protocol.
+Status: 0.1.0, the first release. Vault format 8 read and write, mount-less access, FUSE mounting
+with a per-vault daemon, a loopback WebDAV server, the keychain, the health checks, the migration of
+older vault formats, the rebuilding of lost key files, shell completions, manpages and packages for
+macOS and Debian. See `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` for the design,
+`docs/daemon-protocol.md` for the daemon's wire protocol and [`docs/release.md`](docs/release.md)
+for how a release is cut.
 
-## Build
+## Install
 
-    cargo build --release
+`crypto` does not ship a file system driver, and it does not need one to run: every command except
+a real mount works without any FUSE software, and `crypto unlock --mounter webdav` serves a vault
+over loopback HTTP instead. [Prerequisites](#prerequisites) says what a real mount needs.
+
+### macOS
+
+    brew install --formula packaging/homebrew/crypto.rb
+
+**Not before the first release.** The committed formula's checksums are placeholders (sixty-four
+zeroes) and its download URLs point at a release that does not exist yet, so the command above
+fails until someone has back-ported the rendered formula from the first release — see
+[`docs/release.md`](docs/release.md). **Until then, build from source** (below), or take the
+tarball: download `crypto-<version>-universal-apple-darwin.tar.gz` from the
+[releases](https://github.com/rfoerthe/cryptomator-cli/releases), check it against `SHA256SUMS`
+and unpack it. That binary is a Universal Mach-O — arm64 and x86_64 in one file — built for macOS
+12 and later. Single-architecture tarballs (`aarch64-apple-darwin`, `x86_64-apple-darwin`) exist
+too, and are the smaller download.
+
+The release binaries are **not signed with a Developer ID**. Gatekeeper therefore quarantines a
+downloaded tarball (`xattr -d com.apple.quarantine crypto` clears it) and, more visibly, macOS
+re-asks for keychain access after every new build — see *macOS asks the first time* under
+[Stored passwords](#stored-passwords-keychain). `docs/release.md` has the `codesign`/`notarytool`
+commands for anyone who wants to sign their own build.
+
+### Debian and Ubuntu
+
+    sudo apt install ./crypto_<version>_<arch>.deb     # amd64 and arm64
+
+The package depends on `fuse3` (for `fusermount3`, which the Linux mount back end calls at run
+time) and recommends `gnome-keyring` and `libsecret-tools` — the keychain is optional, and
+`secret-tool` is only for inspecting the entries by hand. It installs the binary, all 43 manpages
+and the bash, zsh and fish completions. `dpkg -i` works too, with `sudo apt-get install -f`
+afterwards to pull the dependencies in.
+
+### Any Linux, from the tarball
+
+    tar xzf crypto-<version>-x86_64-unknown-linux-gnu.tar.gz
+    cd crypto-<version>-x86_64-unknown-linux-gnu
+    sudo install -m 755 crypto /usr/local/bin/crypto
+    sudo install -m 644 man/*.1 /usr/local/share/man/man1/
+
+`aarch64-unknown-linux-gnu` is built as well. The binaries link against glibc (built on Ubuntu
+22.04, so glibc 2.35 or newer) and *not* against libfuse; there is no musl build.
+
+### From source
+
+    cargo install --path crates/crypto --locked
+
+or, for a build tree, `cargo build --release` — the binary lands in `target/release/crypto`. Rust
+1.89 or newer. `cargo install` places only the binary; the manpages and completion scripts come
+from `cargo xtask man` and `cargo xtask completions` (see below).
+
+### Verifying a download
+
+    sha256sum --ignore-missing -c SHA256SUMS      # shasum -a 256 --ignore-missing -c on macOS
+
+`SHA256SUMS` covers every tarball and both `.deb`s of a release, so `--ignore-missing` is what
+keeps it quiet about the ones you did not download.
+
+### Shell completions
+
+The packages install them. To install one by hand, or for a shell they do not cover:
+
+    crypto completions zsh    > ~/.zfunc/_crypto
+    crypto completions bash   > /etc/bash_completion.d/crypto
+    crypto completions fish   > ~/.config/fish/completions/crypto.fish
+    crypto completions elvish >> ~/.config/elvish/rc.elv
+    crypto completions powershell                              # paste into $PROFILE
+
+zsh needs `~/.zfunc` on its `fpath` (`fpath+=~/.zfunc` before `compinit`); the other four are
+picked up from the paths above as they are.
+
+The script is generated from the live grammar, so it can never fall behind the commands. The
+tarballs carry the same five scripts in `completions/`.
+
+### Manpages
+
+`man crypto` for the overview and `man crypto-vault-create`, `man crypto-fs-put` and so on for the
+subcommands — 43 pages, one per visible command. They are **generated, not committed**: a checked-in
+manpage is wrong from the first commit that touches the grammar. The packages and the tarballs
+(`man/`) ship them; in a build tree, `cargo xtask man` writes them into `target/man/`.
+
+### Which build is this?
+
+    $ crypto --version
+    crypto 0.1.0 (33dbe47, aarch64-apple-darwin)
+
+Version, short commit and target triple — quote the whole line in a bug report. A build from a
+source tarball with no git repository around it says `unknown` for the commit unless
+`$CRYPTO_GIT_SHA` is set.
 
 ## Commands
 
@@ -38,6 +128,7 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `password store` | Verifies a password and saves it in the keychain | `crypto password store Secret` |
 | `password forget` | Removes a vault's password from the keychain | `crypto password forget Secret` |
 | `keychain test` | Names the keychain provider and self-tests it | `crypto keychain test --json` |
+| `completions` | Prints the completion script for one shell to standard output | `crypto completions zsh > ~/.zfunc/_crypto` |
 | `recovery-key show` | Prints the 44-word recovery key of a vault (needs the password) | `crypto recovery-key show Secret` |
 | `recovery-key reset-password` | Sets a new password from a recovery key, without the old one | `crypto recovery-key reset-password Secret --recovery-key-stdin` |
 | `recovery-key validate` | Checks whether a recovery key is well-formed | `printf '%s' "$KEY" \| crypto recovery-key validate --recovery-key-stdin` |
@@ -269,7 +360,7 @@ cannot swallow the next flag); `crypto vault set <VAULT> --mount-flags="…"` st
 
 ### Still to verify by hand
 
-Three things the automated tests cannot reach. Until someone has run them, the README does not
+Five things the automated tests cannot reach. Until someone has run them, the README does not
 claim they work:
 
 1. **macFUSE**, at all — install it, `crypto unlock <VAULT> --mounter macfuse`, and run the same
@@ -284,6 +375,12 @@ claim they work:
    builds and the gvfs path it derives, but no machine this port was tested on had a gvfs session,
    and hosted CI runners have none either. The macOS side (`webdav-applescript`) and the server
    itself are covered end to end.
+5. **The anonymous WebDAV internet password** that `--mounter webdav-applescript` writes before it
+   mounts (see [WebDAV](#webdav)). Only the argument vector is under test: running
+   `security add-internet-password` writes to the real login keychain and can open a dialog, so it
+   was never executed unattended. What is unverified is whether the item it writes actually stops
+   macOS from asking about the unencrypted connection — the failure mode is a dialog too many, not
+   a failed mount.
 
 ### Unlocking and locking
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.0 – 2026-09-09
+
+The first release. The sections below are the eight milestones it was built in; everything in them
+is in 0.1.0.
+
+> `release.yml` takes the release notes from the **first** `## ` section of this file. Remove the
+> empty `## Unreleased` heading above in the version-bump commit and put it back after the release
+> is published — see [`docs/release.md`](docs/release.md).
+
 ### M0 – Scaffold and spikes
 
 - Cargo workspace (`cryptomator-core`, `cryptomator-mount`, `cryptomator-app`, `crypto`), AGPL-3.0-only,
@@ -825,7 +834,53 @@
   Java writes before the AppleScript mount is still M8, and coexistence with a running desktop app
   is still a manual step nobody has taken.
 
-### M8 – Release
+### M8 – Release, packaging and hardening
+
+#### The command line
+
+- **`crypto completions <bash|zsh|fish|elvish|powershell>`** prints a completion script to standard
+  output, generated from the live grammar rather than checked in, so it cannot fall behind the
+  commands. It is dispatched *before* the settings store is built — a broken `settings.json` must
+  not be able to break a shell's startup — and the hidden `__daemon` command is filtered out of the
+  grammar first (`clap_complete` 4.6.9 skips hidden *values*, not hidden subcommands, and would
+  otherwise advertise it in every user's shell).
+- **`crypto --version`** prints `crypto <version> (<commit>, <target>)`. The short commit comes from
+  a dependency-free `build.rs` that watches `HEAD` through `git rev-parse --git-path`;
+  `$CRYPTO_GIT_SHA` overrides it for builds from a source tarball, and a build with no git
+  repository around it says `unknown` rather than failing.
+- `crates/crypto` is a library plus a thin binary. Nothing about the CLI changed; it is what lets
+  `xtask` build the very same `clap::Command` the binary runs, so manpages, completion scripts and
+  help can never describe a different grammar.
+
+#### Packaging
+
+- **`xtask`**, run as `cargo xtask`, a sixth workspace member that is never published:
+  `man` (43 roff pages, one per visible command, recursing into nested subcommands so that every
+  cross-reference a page prints actually exists, named git's way — `crypto-vault-create.1`),
+  `completions` (the five scripts as files), `dist` (build `--release --locked --target …`, stage
+  the binary with `README.md`, `CHANGELOG.md`, `LICENSE`, `man/` and `completions/`, pack, append
+  the checksum to `target/dist/SHA256SUMS`), `lipo` (the two macOS binaries into a Universal
+  Mach-O, refusing a result that is not actually fat, then packing it like any other target),
+  `deb` and `formula`. `MACOSX_DEPLOYMENT_TARGET=12.0` is set for every `*-apple-darwin` build.
+- **Debian packaging** through `cargo-deb`, configured in `[package.metadata.deb]` rather than a
+  `debian/` directory: `Depends: $auto, fuse3`, `Recommends: gnome-keyring, libsecret-tools`, and
+  as contents the binary, all 43 manpages, the bash, zsh and fish completion scripts, `README.md`,
+  `CHANGELOG.md` and the licence.
+- **A Homebrew formula**, `packaging/homebrew/crypto.rb`, rendered by `cargo xtask formula` rather
+  than hand-edited — a test fails if the committed file is not what the renderer produces — with
+  caveats naming FUSE-T, macFUSE and the WebDAV fallback.
+- **`release.yml`**: on a `v*` tag, four target builds, the Universal Mach-O, five tarballs, two
+  `.deb`s (each installed and run on its own runner before it is uploaded), one `SHA256SUMS` and a
+  **draft** GitHub release whose notes are this file's top section. Only the `release` job has
+  `contents: write`; the rendered formula is attached and printed into the job summary, not
+  committed back. A failed run can be repeated against the same tag with `workflow_dispatch`.
+  [`docs/release.md`](docs/release.md) is the runbook, including the `codesign`/`notarytool`
+  commands that stay manual.
+- **CI**: the `test` matrix is complete — `ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-15`,
+  `macos-13`, so both architectures on both systems — plus a `supply-chain` job (`cargo deny check`
+  over advisories, bans, licences and sources, with an explicit licence allow list measured over
+  the lock file rather than guessed, and yanked crates denied) and an `msrv` job pinned to the
+  declared 1.89, with a test that fails if the two ever disagree.
 
 #### Hardening
 
@@ -879,3 +934,104 @@
   is a `warn` line and the mount goes ahead, with macOS asking as before. It happens only for
   `--mounter webdav-applescript`; `--mounter webdav` hands out a URL and touches no keychain, and
   `webdav-gio` needs no such item. See *WebDAV* in the README.
+
+#### Decisions
+
+Eleven rulings shaped this milestone; each of them left a comment or a document behind, so the
+reasoning is next to the code rather than only here.
+
+- **The changelog gets a `## 0.1.0` section, not a rolling `## Unreleased`.** The release notes are
+  the file's top section verbatim, so the two have to be the same thing.
+- **`build.rs` takes no dependency** to learn the commit — one `git rev-parse --short HEAD` and a
+  `cargo:rerun-if-changed` on the path `git rev-parse --git-path HEAD` prints. A build-time crate
+  for four lines of output is a supply-chain entry for nothing.
+- **Manpages and completion scripts are generated, never committed** (`target/man`,
+  `target/completions`). A checked-in page is wrong from the first commit that touches the grammar,
+  and nothing in CI would notice. `packaging/README.md` is the table of what is generated by what.
+  As a consequence `packaging/deb/` and `packaging/man/`, which the spec's tree drew, do not exist:
+  the Debian metadata lives in `crates/crypto/Cargo.toml`, which is where `cargo-deb` reads it.
+- **One generator for both.** `crypto completions` and `cargo xtask completions` call the same
+  function on the same `public_command()`, so what a user installs by hand and what a package ships
+  cannot differ.
+- **Signing and notarisation stay manual.** There is no Developer-ID certificate in CI, and a
+  signing step that can only ever be red is worse than none. The exact command sequence is in
+  `docs/release.md`.
+- **No separate `cargo audit` job.** `cargo deny check advisories` reads the same RustSec database;
+  two jobs would mean two configurations for one statement.
+- **The internet password's `-s` is the address the server is bound to**, not Java's hard-coded
+  `localhost` — that is the host `NetAuthSysAgent` looks up, and `webdavBind` can move it.
+- **Two known-rough spots stay as they are.** `CryptoFs::copy` gets no destination-clearing and no
+  open-file guard: there is no `crypto copy` command, the method is reached only from the FUSE back
+  end, and a guard with no caller that needs it is dead code with a test bill. `encrypt_chunk`
+  keeps its `assert!`s on an oversized chunk: they are invariants of a caller inside the same crate
+  — the size comes from `cleartext_chunk_size()` — not a path foreign data can take, and a `Result`
+  would give every caller an unreachable error arm.
+- **The scrypt limits are named constants with the error message quoting them**
+  (`MAX_SCRYPT_COST_PARAM`, `MAX_SCRYPT_BLOCK_SIZE`, `MAX_SCRYPT_MEMORY_BYTES`), because a user who
+  hits one needs to know both numbers.
+- **The workflow does not commit the rendered Homebrew formula back.** It is attached to the
+  release and printed into the job summary; copying it over `packaging/homebrew/crypto.rb` is a
+  person's job. A workflow with write access to `main` is an attack surface this project does not
+  need.
+- **`xtask dist` builds with `--locked`** and refuses to paper over a lock file that a release
+  build would have had to change.
+
+Smaller ones, resolved during implementation: the workflow tests parse the YAML with
+`YAML.load_file` (the Ruby on the development Mac has no `unsafe_load_file`); artefact paths follow
+`upload-artifact@v4`'s least-common-ancestor stripping, so a `build` artefact contains `crypto` and
+not `target/<triple>/release/crypto`; a `workflow_dispatch` re-run checks out the tag it is given
+(`ref: ${{ inputs.tag || github.ref }}`), not the default branch; `cargo-deb` asset paths resolve
+against `crates/crypto/`, hence the `../../` prefixes; `clap_mangen` is pinned to 0.2.33, which
+builds on 1.89; `lipo` is invoked as `/usr/bin/lipo`, past the pyenv shim that owns the name on the
+development machine; `ci.yml` checks out with `fetch-depth: 0` so the `--version` test can see a
+commit; tests that would have grepped a file the same task wrote were replaced with behavioural
+ones (`deny.toml`'s allow list is checked against every licence `cargo metadata` reports) or
+dropped; and a directory sync that fails *after* a successful rename became the warning described
+under *Hardening* rather than a failed command.
+
+#### Known limitations
+
+Nothing in this list is a bug report; it is what shipped without ever having been executed, so that
+the first person to hit one knows it was expected.
+
+- **`crypto completions <shell>` panics on a closed pipe.** `crypto completions zsh | head -1`
+  prints the first line and then a `BrokenPipe` panic on stderr, exit `101`, because
+  `clap_complete::generate` unwraps its writes internally and never reaches the CLI's own
+  broken-pipe handling (which is what makes every other command exit `0` there, as the exit-code
+  table in the README says). Redirecting to a file — the documented way to install a script — is
+  unaffected. The `deb` job in `release.yml` runs exactly that pipeline under `set -o pipefail`,
+  so a release run is expected to go red on it.
+- **Nothing in `release.yml` has ever run.** It is asserted over as YAML (`xtask/tests/workflows.rs`)
+  and every step it calls was run by hand on the development machine, but the first real execution
+  is the first tag. `lipo` in particular has never combined two real binaries here:
+  `x86_64-apple-darwin` is not installed, so the Universal path exists only on paper.
+- **The `.deb` has never been built on Linux, and never on arm at all.** `cargo deb` on the
+  development Mac proves the metadata and the asset paths, not the package; the `deb` job installs
+  and runs it for the first time, and `cargo install cargo-deb` on `ubuntu-22.04-arm` is itself an
+  untried step.
+- **`macos-13` and `ubuntu-22.04-arm` have never run the test suite.** They join the matrix with
+  this milestone; the first run is the first pull request after it.
+- **The Homebrew formula cannot install anything yet.** Its checksums are zeroes and its URLs point
+  at a release that does not exist; it becomes usable when the rendered formula is back-ported after
+  the first release.
+- **The tarballs are not byte-reproducible on macOS.** `xtask dist` passes the flags that pin
+  mtimes, ownership and order, but the bsdtar that macOS ships ignores some of them, so two runs on
+  the same commit can differ. The checksums in `SHA256SUMS` are of the archives that were actually
+  uploaded; they are integrity, not reproducibility.
+- **`security add-internet-password` has never been executed.** Only the argument vector is tested;
+  running it writes to the real login keychain and can open a dialog. The IPv6 form of `-s` (a bare
+  `::1`, since the flag takes a host name and not a URI authority) is a reading of the flag, not an
+  observation.
+- **Nothing is signed or notarised.** Neither the macOS binaries nor the `.deb`. On macOS that
+  means a quarantine flag on a downloaded tarball and a keychain dialog after every new build; see
+  *Signing and notarisation* in `docs/release.md`.
+- **No musl build.** The spec called a static musl artefact "possible", not promised; the Linux
+  binaries link glibc 2.35 (Ubuntu 22.04) and up.
+- **No `xtask fixtures`.** The fixture regeneration the spec's tree put under `xtask/` already
+  exists as a Maven harness (`tools/fixture-gen/`, documented in the README under *Test fixtures*);
+  a second front end calling `mvn` would be one more place for the command lines to go stale.
+- Still open from earlier milestones, and all of them need a person at a machine: macFUSE is
+  unverified (M4), `LinuxGioMounter` has never run on a real GNOME desktop (M5), an entry written
+  by the Cryptomator desktop app has never been read back (M6 — the macOS ACL dialog needs someone
+  to answer it), the Linux keychain has only ever run in CI and not on real hardware (M6), and
+  coexistence with a running desktop app is still a manual step nobody has taken.
