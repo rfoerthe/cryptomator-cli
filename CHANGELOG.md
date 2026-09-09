@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Packaging: `packaging/homebrew/crypto.rb` carries the four real sha256 values of the 0.1.1
+  archives instead of the sixty-four-zero placeholders, so the formula installs. Back-ported from
+  the release asset as `docs/release.md` step 3 describes.
+
 ## 0.1.1 – 2026-09-09
 
 A bugfix release: `crypto status` and `crypto vault info` no longer disagree about whether a vault
