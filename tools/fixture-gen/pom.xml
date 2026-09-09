@@ -6,7 +6,11 @@
   <artifactId>fixture-gen</artifactId>
   <version>0.1.0</version>
   <properties>
-    <maven.compiler.release>21</maven.compiler.release>
+    <!-- cryptofs 2.10.0 is built with `maven.compiler.release` 25 (class file version 69), so
+         anything below 25 cannot even read its class files: "bad class file ... has wrong version
+         69.0, should be 65.0". The legacy generators next door still target 21; their cryptofs
+         releases are old enough not to care. -->
+    <maven.compiler.release>25</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <exec.mainClass>org.cryptomator.cli.fixtures.Gen</exec.mainClass>
     <!-- Command line passed to Gen: `gen <outputDir>` by default, `verify <vaultDir> <passphrase>`

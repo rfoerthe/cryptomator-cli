@@ -1,9 +1,9 @@
-//! Vaults created by `crypto` must open with the real cryptofs. Needs Java 21+ and Maven; run with
+//! Vaults created by `crypto` must open with the real cryptofs. Needs Java 25+ and Maven; run with
 //! `cargo test -p crypto --test java_interop -- --ignored` (CI job `interop-java`).
 use assert_cmd::Command;
 use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions, OpenOptions};
 use cryptomator_core::{open_vault, MasterkeyFileAccess};
-use cryptomator_mount::api::{Mount, MountBuilder, MountError, MountService};
+use cryptomator_mount::api::{Mount, MountBuilder, MountCapability, MountError, MountService};
 use cryptomator_mount::mounttab::is_mountpoint;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -544,7 +544,12 @@ impl TestMount {
         let configure = |builder: &mut Box<dyn MountBuilder>| -> Result<(), MountError> {
             builder.set_mountpoint(&mountpoint)?;
             builder.set_mount_flags(&service.default_mount_flags())?;
-            builder.set_volume_name("java-interop")
+            // Only where the service advertises it: the Linux libfuse3 provider has no
+            // VOLUME_NAME capability and its setter fails the whole mount.
+            if service.has_capability(MountCapability::VolumeName) {
+                builder.set_volume_name("java-interop")?;
+            }
+            Ok(())
         };
         configure(&mut builder).map_err(|err| format!("configuring the mount: {err}"))?;
         let mount = builder.mount().map_err(|err| format!("mounting: {err}"))?;

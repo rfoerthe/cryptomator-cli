@@ -1017,7 +1017,8 @@ tests read them without Java. Eight of them are ordinary format 8 vaults written
   that actually produced each format (1.9.15, 1.8.9 and 1.3.2), with `.lng` long names in 6 and 5
   and, in `legacy_v5`, an NFD umlaut passphrase that only the 5 → 6 migration step normalises.
 
-To regenerate them you need a JDK 21+ and Maven:
+To regenerate them you need a JDK 25+ and Maven (cryptofs 2.10.0 is compiled for 25; the three
+legacy generators are content with 21):
 
     mvn -q -f tools/fixture-gen/pom.xml compile exec:exec                       # the eight format 8 vaults
     mvn -q -f tools/fixture-gen/pom.xml compile exec:exec \

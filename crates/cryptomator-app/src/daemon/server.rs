@@ -2508,11 +2508,23 @@ mod tests {
             || {},
         );
         assert!(!visible, "the volume never appears");
-        // ~1s of 50ms looks (20) plus ~1s of 250ms looks (4), plus the very first look before any
-        // sleep -- a range wide enough for scheduling jitter without pinning an exact count.
+        // Undisturbed this is ~1s of 50ms looks (20) plus ~1s of 250ms looks (4), plus the very
+        // first look before any sleep -- around 25.
+        //
+        // The two bounds are deliberately lopsided, because the jitter only goes one way:
+        // `thread::sleep` may overshoot without limit but never returns early, so a loaded runner
+        // can only ever produce *fewer* looks (a hosted macOS runner managed 15). The upper bound
+        // is therefore the one carrying the claim -- 40 looks is what a 2s wait that never backed
+        // off would give, so staying well under that is the backoff. The lower bound only says
+        // the wait kept polling at all instead of sleeping through to the deadline.
         assert!(
-            (18..=30).contains(&looks),
-            "expected roughly 20 fast + 4 slow polls, got {looks}"
+            looks >= 5,
+            "the wait must keep polling until the deadline, got {looks} looks"
+        );
+        assert!(
+            looks <= 30,
+            "past the first second the polls must slow to 250ms; \
+             {looks} looks in 2s is the unslowed 50ms cadence"
         );
     }
 

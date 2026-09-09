@@ -6,7 +6,7 @@ for the health-check tests, and it opens a vault written by `crypto` to prove th
 implementation accepts it. The three generators for the pre-format-8 reference vaults live in the
 standalone modules `legacy-v7/`, `legacy-v6/` and `legacy-v5/` — see "Legacy fixtures" below.
 
-Regenerate the fixtures (JDK 21+, Maven):
+Regenerate the fixtures (JDK 25+, Maven — cryptofs 2.10.0 is compiled for 25):
 
     mvn -q -f tools/fixture-gen/pom.xml compile exec:exec
 
