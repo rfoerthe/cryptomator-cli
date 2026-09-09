@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.1 – 2026-09-09
+
+A bugfix release: `crypto status` and `crypto vault info` no longer disagree about whether a vault
+is unlocked, plus the CI and packaging fixes that accumulated since 0.1.0. No changes to the vault
+format, the settings file or the daemon protocol.
+
 - Fixed: `crypto vault info`, `crypto vault list` and `crypto vault set` called an unlocked vault
   `LOCKED`, contradicting `crypto status` on the same vault. They answered from the vault directory
   alone, where ciphertext looks the same whether or not a daemon serves it, and `VaultState` has no
@@ -19,6 +25,11 @@
 - CI: Dependabot watches `.github/workflows` weekly and opens one grouped pull request for new
   action majors, so the next runtime deprecation arrives as a pull request rather than as an
   annotation on every job.
+- CI: `mount-e2e-linux` and `keychain-e2e-linux` update the package lists of the Ubuntu archive
+  only (`apt-get update -o Dir::Etc::sourceparts="-"`). The runner image carries vendor
+  repositories these jobs need nothing from, and an inconsistent index in one of them fails
+  `apt-get update` with exit 100 before a single package is installed -- which is what took both
+  jobs down on 2026-09-09, on a Chrome `Packages.gz` that did not match its own `Release` file.
 - Packaging: `packaging/homebrew/crypto.rb` carries the four real sha256 values of the 0.1.0
   archives instead of the sixty-four-zero placeholders, so the formula installs. Back-ported from
   the release asset as `docs/release.md` step 3 describes.
@@ -26,14 +37,13 @@
   out of the committed formula and re-renders everything around them. It compared against the
   placeholders before, which made the back-port of the previous entry fail the very test
   `docs/release.md` tells you to run after it.
+- Fixed: `version_flag_prints_name_and_version` derives the expected version from
+  `CARGO_PKG_VERSION` instead of spelling out `0.1.0`. It was the one place outside
+  `workspace.package.version` that named the version, so `docs/release.md` step 2 -- which promises
+  there is no such place -- left it out and the bump to 0.1.1 failed the gate in step 4.
 - Docs: the install instructions no longer say `brew install --formula <path>`. Homebrew installs a
   formula only from a tap and rejects a file path outright, so README.md and `docs/release.md` show
   the `brew tap-new` / copy / `brew install <tap>/crypto` route instead.
-- CI: `mount-e2e-linux` and `keychain-e2e-linux` update the package lists of the Ubuntu archive
-  only (`apt-get update -o Dir::Etc::sourceparts="-"`). The runner image carries vendor
-  repositories these jobs need nothing from, and an inconsistent index in one of them fails
-  `apt-get update` with exit 100 before a single package is installed -- which is what took both
-  jobs down on 2026-09-09, on a Chrome `Packages.gz` that did not match its own `Release` file.
 
 ## 0.1.0 – 2026-09-09
 
