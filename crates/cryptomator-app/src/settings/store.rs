@@ -184,9 +184,19 @@ impl SettingsStore {
             }
             return Err(AppError::Io(e));
         }
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(AppError::Io(e));
+        // `rename_durably`: `sync_all` above put the JSON on the platter, and the directory
+        // entry that names it needs the directory's own fsync -- otherwise a crash can leave the
+        // settings file missing altogether, which reads as "no vaults registered".
+        // A rename that failed is a failed save (the tmp file goes); a rename that worked and
+        // whose directory sync did not is a warning -- the settings file is there either way.
+        match cryptomator_core::durability::rename_durably(&tmp_path, path) {
+            Ok(outcome) => {
+                outcome.warn_unconfirmed(path.display());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(AppError::Io(e));
+            }
         }
         Ok(())
     }

@@ -8,11 +8,12 @@ use crate::exit;
 use crate::output::{epoch_seconds, format_timestamp};
 use anyhow::{Context, Result};
 use cryptomator_app::{read_passphrase_with_keychain, AppError, PasswordArgs, SystemIo};
+use cryptomator_core::durability::Durability;
 use cryptomator_core::fs::{
     CleartextPath, CryptoFs, CryptoFsOptions, EventSink, FileAttributes,
     DEFAULT_MAX_CLEARTEXT_NAME_LENGTH,
 };
-use cryptomator_core::{open_vault, read_vault_config, MasterkeyFileAccess};
+use cryptomator_core::{durability, open_vault, read_vault_config, MasterkeyFileAccess};
 use data_encoding::HEXLOWER;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -297,13 +298,26 @@ fn stream_to_local(fs: &CryptoFs, path: &CleartextPath, local: &Path) -> Result<
     let copied = fs
         .copy_to_writer(path, &mut file)
         .map_err(io_detail)
-        .with_context(|| format!("cannot read {path}"));
+        .with_context(|| format!("cannot read {path}"))
+        .and_then(|bytes| {
+            // Synced while the file is still open: the rename below gives it the destination's
+            // name, and a name whose contents are still only in the page cache is what a power
+            // cut turns into an empty or truncated file that looks complete.
+            file.sync_all()
+                .map_err(io_detail)
+                .with_context(|| format!("cannot write {}", temp.display()))?;
+            Ok(bytes)
+        });
     // Closed before the rename: Windows is unhappy about renaming a file that is still open.
     drop(file);
     let result = copied.and_then(|bytes| {
-        std::fs::rename(&temp, local)
+        // `rename_durably`: the rename itself lives in the destination's directory, whose dirty
+        // pages nothing else here syncs. Only a rename that did *not* happen fails the command --
+        // once the file carries its final name, a failed directory sync is a warning.
+        let outcome = durability::rename_durably(&temp, local)
             .map_err(io_detail)
             .with_context(|| format!("cannot create {}", local.display()))?;
+        report_durability(&outcome, local.display());
         Ok(bytes)
     });
     if result.is_err() {
@@ -352,6 +366,58 @@ fn get(ctx: &Ctx, args: FsGetArgs) -> Result<u8> {
         || format!("{path} -> {} ({bytes} bytes)", args.local.display()),
     )?;
     Ok(exit::OK)
+}
+
+/// `fsync` on the ciphertext directories that hold the entry `put`'s rename just created.
+///
+/// The rename inside the vault is a `rename(2)` between two names in a ciphertext directory, and
+/// that entry lives in the directory's own dirty pages -- so without this a power cut can leave
+/// the freshly written file under its temporary name, or under no name at all, while its contents
+/// (synced by `write_from_reader`) are safely on the platter.
+///
+/// Two directories can be involved: a name too long for the vault's shortening threshold is stored
+/// as `<hash>.c9s/contents.c9r`, where the `.c9s` directory holds the entry for the contents and
+/// the content directory holds the entry for the `.c9s` directory itself.
+///
+/// Runs after the rename, so it can no longer fail the write: the file is in the vault under its
+/// final name and every error -- resolving the ciphertext path included -- is reported as an
+/// unconfirmed durability.
+fn sync_ciphertext_dirs(fs: &CryptoFs, path: &CleartextPath) -> Durability {
+    let dirs = match ciphertext_dirs(fs, path) {
+        Ok(dirs) => dirs,
+        Err(e) => return Durability::Unconfirmed(e),
+    };
+    for dir in &dirs {
+        match durability::sync_dir_best_effort(dir) {
+            Durability::Confirmed => {}
+            unconfirmed => return unconfirmed,
+        }
+    }
+    Durability::Confirmed
+}
+
+/// The ciphertext directories [`sync_ciphertext_dirs`] syncs, innermost first.
+fn ciphertext_dirs(fs: &CryptoFs, path: &CleartextPath) -> io::Result<Vec<PathBuf>> {
+    let ciphertext = fs.ciphertext_path(path)?;
+    let mut dirs: Vec<PathBuf> = ciphertext
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Some(parent) = path.parent() {
+        let content_dir = fs.ciphertext_path(&parent)?;
+        if !dirs.contains(&content_dir) {
+            dirs.push(content_dir);
+        }
+    }
+    Ok(dirs)
+}
+
+/// The CLI's half of the durability ruling: a write whose directory sync failed *after* the file
+/// reached its final name is reported as `warning: ...` on stderr and the command still succeeds.
+/// Returns the warning it emitted, or `None` when the durability was confirmed.
+fn report_durability(outcome: &Durability, target: impl std::fmt::Display) -> Option<String> {
+    outcome.warn_unconfirmed(target)
 }
 
 fn put(ctx: &Ctx, args: FsPutArgs) -> Result<u8> {
@@ -415,6 +481,9 @@ fn put(ctx: &Ctx, args: FsPutArgs) -> Result<u8> {
             return Err(io_detail(e)).with_context(|| format!("cannot write {path}"));
         }
     };
+    // After the rename: `tmp` is gone and `path` holds the data, so this must not run the cleanup
+    // above nor fail the command -- the only thing left unconfirmed is the durability of the name.
+    report_durability(&sync_ciphertext_dirs(&fs, &path), &path);
     ctx.out
         .emit(json!({ "path": path.to_string(), "bytes": bytes }), || {
             format!("{path} ({bytes} bytes)")
@@ -466,4 +535,39 @@ fn mv(ctx: &Ctx, args: FsMvArgs) -> Result<u8> {
         || format!("{src} -> {dst}"),
     )?;
     Ok(exit::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A confirmed durability says nothing; an unconfirmed one names the file the user asked for
+    /// and what could not be confirmed about it -- and never turns into an error.
+    #[test]
+    fn only_an_unconfirmed_durability_is_reported() {
+        assert_eq!(
+            report_durability(&Durability::Confirmed, Path::new("/tmp/report").display()),
+            None
+        );
+        let warning = report_durability(
+            &Durability::Unconfirmed(io::Error::other("disk on fire")),
+            Path::new("/tmp/report").display(),
+        )
+        .expect("an unconfirmed durability is reported");
+        assert!(warning.contains("/tmp/report"), "{warning}");
+        assert!(warning.contains("durability"), "{warning}");
+        assert!(warning.contains("disk on fire"), "{warning}");
+    }
+
+    /// `put` reports the cleartext path the user typed, not the ciphertext name it renamed.
+    #[test]
+    fn a_cleartext_path_is_reported_as_the_user_wrote_it() {
+        let path = CleartextPath::parse("/notes/todo.txt");
+        let warning = report_durability(
+            &Durability::Unconfirmed(io::Error::other("no fsync here")),
+            &path,
+        )
+        .expect("an unconfirmed durability is reported");
+        assert!(warning.contains("/notes/todo.txt"), "{warning}");
+    }
 }

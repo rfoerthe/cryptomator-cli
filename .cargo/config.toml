@@ -1,0 +1,4 @@
+# `cargo xtask <task>` instead of `cargo run --package xtask -- <task>`. The `--` is part of the
+# alias, so everything after `xtask` on the command line reaches the task, not cargo.
+[alias]
+xtask = "run --package xtask --"

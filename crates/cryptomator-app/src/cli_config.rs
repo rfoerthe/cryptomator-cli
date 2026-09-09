@@ -121,9 +121,17 @@ impl CliConfig {
             let _ = std::fs::remove_file(&tmp);
             return Err(AppError::Io(e));
         }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(AppError::Io(e));
+        // The same durable rename the settings file gets: the contents are synced above, the
+        // entry that names them is synced by the rename.
+        match cryptomator_core::durability::rename_durably(&tmp, path) {
+            // Written and named: an unconfirmed durability is a warning, not a failed write.
+            Ok(outcome) => {
+                outcome.warn_unconfirmed(path.display());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(AppError::Io(e));
+            }
         }
         Ok(())
     }

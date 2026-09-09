@@ -5,9 +5,9 @@
 //! same context path rules -- and then run one command. The difference the user sees is the mount
 //! point: a real directory (`/Volumes/Secret`, `/run/user/1000/gvfs/dav:host=…`) instead of a URL.
 //!
-//! Deliberately **not** ported: Cryptomator runs `security add-internet-password` before the
-//! AppleScript mount so macOS does not ask the user to confirm the anonymous login. Writing to the
-//! keychain is M6's decision (ruling 3), so macOS asks instead.
+//! Before the AppleScript mount, [`store_webdav_credentials`] writes the anonymous *internet*
+//! password Cryptomator writes, so macOS does not put a "connect to an unencrypted server?" dialog
+//! in the way. It is best effort: a failure is a log line, never a failed mount.
 use crate::api::{
     Mount, MountBuilder, MountCapability, MountError, MountService, Mountpoint, UnmountError,
 };
@@ -16,8 +16,11 @@ use crate::registry::{LINUX_GIO_CLASS, MAC_APPLESCRIPT_CLASS};
 use crate::webdav::fallback::WebDavMountBuilder;
 use crate::webdav::server::WebDavServerHandle;
 use cryptomator_core::fs::CryptoFs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +31,18 @@ const DEFAULT_OS_PORT: u16 = 42427;
 const APPLESCRIPT_MOUNT_TIMEOUT: Duration = Duration::from_secs(120);
 /// `ProcessUtil.waitFor(verifyProcess, 10, SECONDS)`.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The helper macOS runs when Finder mounts a WebDAV volume; the keychain item has to grant it
+/// access, or the item is there and the dialog appears anyway.
+const NET_AUTH_SYS_AGENT: &str =
+    "/System/Library/CoreServices/NetAuthAgent.app/Contents/MacOS/NetAuthSysAgent";
+/// The item's kind, exactly as Cryptomator writes it, so the desktop app and `crypto` share one
+/// entry per server instead of creating two.
+const WEBDAV_KEYCHAIN_LABEL: &str = "Cryptomator WebDAV Access";
+/// `ProcessUtil.startAndWaitFor(storeCredentials, 10, SECONDS)`.
+const CREDENTIALS_TIMEOUT: Duration = Duration::from_secs(10);
+/// `security`'s exit code for `errSecDuplicateItem` -- the item is already in the keychain, which
+/// is what every mount of a server after the first sees.
+const ERR_SEC_DUPLICATE_ITEM: i32 = 45;
 /// `ProcessUtil.waitFor(mountProcess, 30, SECONDS)` for `gio mount`.
 const GIO_MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the probes in `is_supported` may take; they run on every `crypto mounters` call.
@@ -205,9 +220,100 @@ fn gvfs_dir() -> PathBuf {
         .join("gvfs")
 }
 
+/// The `security` call that stores the anonymous internet password for the loopback server.
+///
+/// Java (`MacAppleScriptMounter.mount`, webdav-nio-adapter 3.0.2) is followed argument for
+/// argument, with a single deviation: it hard-codes `-s localhost` although its own server listens
+/// on `127.0.0.1`, and NetAuthAgent looks the host up the way the mounted URI spells it -- so the
+/// address the server is actually bound to goes in instead. An IPv6 address is passed bare
+/// (`::1`), because `-s` takes a server *name*: the brackets [`WebDavServerHandle::root_uri`] puts
+/// around it are URI syntax and would become part of that name.
+///
+/// There is no `-w`: Java passes none either, so the item's password stays empty and nothing
+/// secret ever reaches an argument vector `ps` shows. No `-U` either, so an item the user -- or
+/// the desktop app -- created is never overwritten.
+pub(crate) fn add_internet_password_command(host: &IpAddr, port: u16) -> Command {
+    let host = host.to_string();
+    // The absolute path, like `/usr/bin/osascript` above and `/usr/bin/lipo` in `xtask`: a
+    // `security` earlier in `PATH` (a shim, a Homebrew tool of the same name) would be run with
+    // the user's keychain in reach, and this is a mount path a user does not watch.
+    let mut command = Command::new("/usr/bin/security");
+    command
+        .arg("add-internet-password")
+        .args(["-a", "anonymous"])
+        .args(["-s", &host])
+        .arg("-P")
+        .arg(port.to_string())
+        .args(["-r", "http"])
+        .args(["-D", WEBDAV_KEYCHAIN_LABEL])
+        .args(["-T", NET_AUTH_SYS_AGENT]);
+    command
+}
+
+/// Whether `security` refused because the item is already there (`errSecDuplicateItem`), which is
+/// the normal outcome from the second mount of a server on. Matched by exit code *and* message:
+/// the tool's exit codes are not a documented interface, and this only decides a log level.
+fn is_duplicate_item(code: Option<i32>, stderr: &str) -> bool {
+    code == Some(ERR_SEC_DUPLICATE_ITEM) || stderr.contains("already exists")
+}
+
+/// Writes the keychain item for the server behind `server`, best effort -- exactly like Java,
+/// which logs and mounts anyway. A failure means macOS asks the user about the unencrypted
+/// connection: a nuisance, not a broken mount.
+fn store_webdav_credentials(server: &WebDavServerHandle) {
+    let address = server.local_addr();
+    run_add_internet_password(&address.ip(), address.port());
+}
+
+/// Runs the command and turns every outcome into a log line. Nothing logged here can be a secret:
+/// there is none in this call.
+#[cfg(not(test))]
+fn run_add_internet_password(host: &IpAddr, port: u16) {
+    match run_command(
+        add_internet_password_command(host, port),
+        CREDENTIALS_TIMEOUT,
+    ) {
+        Ok(output) if output.success() => {
+            log::debug!("stored the WebDAV keychain item for {host}:{port}");
+        }
+        Ok(output) if is_duplicate_item(output.status.code(), &output.stderr) => {
+            log::debug!("the WebDAV keychain item for {host}:{port} is already there");
+        }
+        Ok(output) => log::warn!(
+            "could not store the WebDAV keychain item for {host}:{port}; macOS may ask about the \
+             unencrypted connection: {}",
+            first_line(&output.stderr)
+        ),
+        Err(e) => log::warn!(
+            "could not run `security add-internet-password` for {host}:{port}: {e}; macOS may ask \
+             about the unencrypted connection"
+        ),
+    }
+}
+
+/// The test build spawns nothing. `security add-internet-password` writes to the user's real login
+/// keychain and can put a dialog on their screen, which no unit test may do -- so here the call is
+/// only counted. *What* the command is stays pinned by the tests on
+/// [`add_internet_password_command`], and that it really runs is exercised by the env-gated
+/// `webdav_e2e` integration test, which links this library without `cfg(test)`.
+#[cfg(test)]
+fn run_add_internet_password(host: &IpAddr, port: u16) {
+    log::debug!("test build: not storing the WebDAV keychain item for {host}:{port}");
+    CREDENTIAL_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How often [`store_webdav_credentials`] has been called in this test binary; see
+/// [`run_add_internet_password`].
+#[cfg(test)]
+static CREDENTIAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
 /// What happens after the server is up on macOS: mount, verify, find the mount point.
 fn applescript_mount(server: WebDavServerHandle) -> Result<Box<dyn Mount>, MountError> {
     let uri = server.root_uri();
+    // Before `mount volume`, in Java's order: without this keychain item macOS asks the user to
+    // confirm the unencrypted connection -- the dialog the 120-second timeout below exists for.
+    // Best effort, exactly like Java's; it never fails the mount.
+    store_webdav_credentials(&server);
     let mut mount = Command::new("/usr/bin/osascript");
     mount.arg("-e").arg(format!("mount volume \"{uri}\""));
     let mounted = run_command(mount, APPLESCRIPT_MOUNT_TIMEOUT)?;
@@ -541,6 +647,7 @@ mod tests {
     use super::*;
     use crate::registry::{alias_for_class, all_services, LINUX_GIO_CLASS, MAC_APPLESCRIPT_CLASS};
     use std::ffi::OsStr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     /// One line of `mount` output as macOS prints it for a WebDAV volume.
     const MOUNT_LINE: &str =
@@ -819,6 +926,140 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             vec![OsStr::new("mount"), OsStr::new(tricky_uri)]
         );
+    }
+
+    /// The arguments of a built `Command`, in order.
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Java's `MacAppleScriptMounter.mount`, argument for argument -- with the one deviation
+    /// Ruling 7 records: the host is the address the server is bound to rather than Java's
+    /// hard-coded `localhost`, because that is the name NetAuthAgent looks up.
+    #[test]
+    fn the_internet_password_argv_matches_java_except_for_the_host() {
+        let command = add_internet_password_command(&IpAddr::V4(Ipv4Addr::LOCALHOST), 42427);
+        // The absolute path, not a `PATH` lookup: nothing shadowing the name may be handed the
+        // keychain.
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/security"));
+        assert_eq!(
+            args_of(&command),
+            vec![
+                "add-internet-password",
+                "-a",
+                "anonymous",
+                "-s",
+                "127.0.0.1",
+                "-P",
+                "42427",
+                "-r",
+                "http",
+                "-D",
+                "Cryptomator WebDAV Access",
+                "-T",
+                "/System/Library/CoreServices/NetAuthAgent.app/Contents/MacOS/NetAuthSysAgent",
+            ]
+        );
+    }
+
+    /// `-s` is a server *name*, not a URI authority: the brackets `root_uri` puts around an IPv6
+    /// address would end up as part of the name, so the address goes in bare.
+    #[test]
+    fn an_ipv6_server_is_named_without_the_uri_brackets() {
+        let command = add_internet_password_command(&IpAddr::V6(Ipv6Addr::LOCALHOST), 42427);
+        let args = args_of(&command);
+        let server = args
+            .iter()
+            .position(|a| a == "-s")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        assert_eq!(server, Some("::1"));
+        assert!(
+            !args.iter().any(|a| a.contains('[')),
+            "no URI syntax in a keychain server name: {args:?}"
+        );
+    }
+
+    /// No `-w`: Java passes none, so the item gets an empty password -- and nothing secret ever
+    /// reaches argv, where `ps` would show it. This is a security property, not a detail.
+    #[test]
+    fn the_internet_password_call_carries_no_secret() {
+        let args = args_of(&add_internet_password_command(
+            &IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1,
+        ));
+        assert!(
+            !args.iter().any(|a| a == "-w"),
+            "a password argument would end up in ps output"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-U"),
+            "-U would overwrite an item the user created"
+        );
+    }
+
+    /// A port is a number, and the argument vector is built rather than formatted into a shell
+    /// string, so nothing here can be interpolated into.
+    #[test]
+    fn the_port_is_rendered_as_a_decimal_argument() {
+        let args = args_of(&add_internet_password_command(
+            &IpAddr::V4(Ipv4Addr::LOCALHOST),
+            65535,
+        ));
+        let port = args
+            .iter()
+            .position(|a| a == "-P")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        assert_eq!(port, Some("65535"));
+    }
+
+    /// `ProcessUtil.startAndWaitFor(storeCredentials, 10, SECONDS)` -- a keychain call that hangs
+    /// must not hold the mount for the AppleScript timeout.
+    #[test]
+    fn the_keychain_call_gets_javas_ten_seconds() {
+        assert_eq!(CREDENTIALS_TIMEOUT, Duration::from_secs(10));
+    }
+
+    /// An item that is already there is the normal case from the second mount on, and must not be
+    /// reported as a failure the user should worry about.
+    #[test]
+    fn an_existing_keychain_item_is_recognised_by_code_and_by_message() {
+        assert!(is_duplicate_item(Some(45), ""));
+        assert!(is_duplicate_item(
+            Some(1),
+            "security: SecKeychainAddInternetPassword: The specified item already exists in the keychain."
+        ));
+        assert!(!is_duplicate_item(
+            Some(1),
+            "security: something else went wrong"
+        ));
+        assert!(!is_duplicate_item(None, ""));
+    }
+
+    /// The keychain item belongs to the AppleScript mount and nowhere else: the plain WebDAV
+    /// fallback hands out a URL that the user mounts themselves, so it must not write to anyone's
+    /// keychain. In a test build the call is counted rather than run (see
+    /// [`run_add_internet_password`]), which is also what keeps every unit test out of the real
+    /// login keychain.
+    #[test]
+    fn the_fallback_mount_stores_no_keychain_item() {
+        let before = CREDENTIAL_CALLS.load(Ordering::Relaxed);
+        let (_vault, fs) = crate::testing::test_fs();
+        let mut builder = crate::webdav::fallback::FallbackMounter.for_file_system(fs);
+        builder.set_loopback_port(0).expect("LOOPBACK_PORT");
+        builder.set_volume_id("no-keychain").expect("VOLUME_ID");
+        let _guard = crate::testing::env_lock();
+        let mount = builder.mount().expect("mount");
+        assert_eq!(
+            CREDENTIAL_CALLS.load(Ordering::Relaxed),
+            before,
+            "the fallback mounter must not touch the keychain"
+        );
+        drop(mount);
     }
 
     /// Finding 5: the probe is a file check, not a spawned `osascript -e 'return 1'`. If this

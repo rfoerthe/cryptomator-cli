@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "crypto",
-    version,
+    version = crate::VERSION,
     about = "Cryptomator vaults from the command line",
     arg_required_else_help = true
 )]
@@ -85,6 +85,8 @@ pub enum Command {
         #[command(subcommand)]
         command: KeychainCommand,
     },
+    /// Print a shell completion script to standard output
+    Completions(CompletionsArgs),
     /// The vault daemon itself; started by `crypto unlock`, never by hand.
     #[command(name = "__daemon", hide = true)]
     Daemon(DaemonArgs),
@@ -259,6 +261,13 @@ pub struct MountersArgs {
     /// Include the services that do not work on this machine
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+    /// Shell to generate the script for
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Args, Debug)]

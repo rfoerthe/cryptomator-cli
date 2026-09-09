@@ -215,9 +215,18 @@ fn split_target(path: &Path) -> io::Result<(&Path, &str)> {
 /// temporary file behind on either failure.
 fn replace_with_temp(dir: &Path, file_name: &str, contents: &str, target: &Path) -> io::Result<()> {
     let temp = write_temp_file(dir, file_name, contents)?;
-    if let Err(e) = std::fs::rename(&temp, target) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(e);
+    // `rename_durably`, not `std::fs::rename`: `write_temp_file` synced the text itself, and the
+    // entry that names it needs the directory's own fsync. A report is evidence about a damaged
+    // vault, and a crash minutes later must not be able to make it vanish again.
+    match crate::durability::rename_durably(&temp, target) {
+        // The report is written and named; only its durability is unconfirmed.
+        Ok(outcome) => {
+            outcome.warn_unconfirmed(target.display());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
     }
     Ok(())
 }

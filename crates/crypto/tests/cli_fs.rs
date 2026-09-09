@@ -401,3 +401,34 @@ fn a_vault_id_starting_with_a_hyphen_is_a_usable_reference() {
     // `--` still works as the general escape hatch for any leading-dash argument
     sb.crypto(&["fs", "ls", "--", id, "/"]).assert().success();
 }
+
+/// `masterkey.cryptomator` comes from wherever the vault comes from, and scrypt's working set is
+/// `128 · N · r` bytes: `"scryptCostParam": 16777216` is a 16 GiB allocation before a password has
+/// even been read. The file is refused when it is *read* -- exit 1, the message names the value,
+/// and the run is over in milliseconds instead of trying the derivation.
+#[test]
+fn a_masterkey_file_with_an_absurd_cost_parameter_is_refused_before_any_derivation() {
+    let sb = Sandbox::new();
+    let vault = sb.add_fixture("siv_gcm_basic");
+    let masterkey = vault.join("masterkey.cryptomator");
+    let hostile = std::fs::read_to_string(&masterkey).unwrap().replace(
+        "\"scryptCostParam\": 32768",
+        "\"scryptCostParam\": 16777216",
+    );
+    assert!(hostile.contains("16777216"), "the fixture was not patched");
+    std::fs::write(&masterkey, hostile).unwrap();
+
+    let started = std::time::Instant::now();
+    sb.crypto(&["fs", "ls", "siv_gcm_basic"])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("scrypt parameters out of range")
+                .and(predicate::str::contains("16777216")),
+        );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the run took {elapsed:?}: the derivation was attempted instead of refused"
+    );
+}

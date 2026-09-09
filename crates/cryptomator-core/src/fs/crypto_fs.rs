@@ -398,6 +398,16 @@ impl CryptoFs {
             handle.write_all_at(&buf[..n], position)?;
             position += n as u64;
         }
+        // `close()` flushes -- it encrypts and writes every dirty chunk -- but it does not sync,
+        // and `crypto fs put` renames this file over its target the moment this returns. Without
+        // the fsync the rename can outlive the contents across a power cut, leaving a file that
+        // exists, has the right size and decrypts to nothing.
+        //
+        // `sync(false)` is `fsync`-without-metadata (`fdatasync`): it puts the ciphertext and the
+        // size needed to read it back on the platter, while the mtime -- the only metadata that
+        // matters here -- is restored by `close()` right after, so syncing it now would be work
+        // done twice.
+        handle.sync(false)?;
         handle.close()?;
         Ok(position)
     }
@@ -918,6 +928,28 @@ mod tests {
         );
         assert_eq!(fs.config().cipher_combo, CipherCombo::SivGcm);
         (dir, fs)
+    }
+
+    /// `crypto fs put` renames this file over its target the moment `write_from_reader` returns,
+    /// so the bytes have to be on the platter by then: `close()` flushes -- it encrypts and writes
+    /// every dirty chunk -- but it does not sync. Whether the `fsync` reached the disk cannot be
+    /// observed from a test; that it was asked for, exactly once per written file, can.
+    #[test]
+    fn write_from_reader_syncs_the_file_before_it_returns() {
+        use crate::fs::open_file::SYNC_CALLS;
+        let (_dir, fs) = test_fs(220, false);
+        let path = CleartextPath::parse("/put.42.tmp");
+        SYNC_CALLS.with(|calls| calls.set(0));
+        let written = fs
+            .write_from_reader(&path, &mut &b"payload"[..], false)
+            .unwrap();
+        assert_eq!(
+            SYNC_CALLS.with(std::cell::Cell::get),
+            1,
+            "write_from_reader must fsync the file it wrote, exactly once"
+        );
+        assert_eq!(written, 7);
+        assert_eq!(fs.read_file(&path).unwrap(), b"payload");
     }
 
     #[test]

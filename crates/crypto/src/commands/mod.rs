@@ -1,4 +1,5 @@
 //! Command implementations; each returns the process exit code.
+pub mod completions;
 pub mod config;
 pub mod daemon;
 pub mod events;

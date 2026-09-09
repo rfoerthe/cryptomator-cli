@@ -767,3 +767,55 @@ fn a_registered_vault_reports_registered_and_a_stray_path_is_still_not_found() {
     .assert()
     .code(3);
 }
+
+/// `crypto recovery-key show v | head -1`: the reader takes the line and closes the pipe, and the
+/// key may still be on its way out.
+///
+/// Same bug class as `crypto completions <shell>` (`cli_release.rs`): a `println!` on a closed
+/// pipe panics, which is exit 101 and a panic message on stderr — for the one command whose output
+/// a user is most likely to pipe into `head`, `pbcopy` or a QR generator. Through `write_line` it
+/// is a `BrokenPipe` the CLI answers with a silent exit 0.
+///
+/// The stdout reader is dropped before the password is even handed over, so the pipe is certainly
+/// closed by the time the key is derived — the write cannot succeed by luck.
+#[test]
+fn a_closed_pipe_ends_recovery_key_show_with_code_0() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let fx = Sandbox::new();
+    fx.add_fixture("siv_gcm_basic");
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("crypto"))
+        .arg("--settings")
+        .arg(fx.settings())
+        .args(["recovery-key", "show", "siv_gcm_basic", "--password-stdin"])
+        .env_remove("CRYPTO_SETTINGS_PATH")
+        .env_remove("CRYPTO_MIN_PW_LENGTH")
+        // `--password-stdin` is the source under test; an inherited variable would not change the
+        // outcome, but it would make the test lie about where the password came from.
+        .env_remove("CRYPTO_PASSWORD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the `crypto` binary starts");
+
+    drop(child.stdout.take().expect("stdout is piped"));
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(format!("{PW}\n").as_bytes())
+        .expect("the password is written");
+
+    let out = child.wait_with_output().expect("the child ends");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "it panicked: {stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed stdout is a successful end; stderr was: {stderr}"
+    );
+    assert!(stderr.is_empty(), "nothing is printed about it: {stderr}");
+}

@@ -17,6 +17,16 @@ use zeroize::Zeroizing;
 
 pub const MAX_CACHED_CLEARTEXT_CHUNKS: usize = 5;
 
+#[cfg(test)]
+thread_local! {
+    /// How often [`OpenCryptoFile::sync`] ran on this thread.
+    ///
+    /// Whether an `fsync` really happened cannot be observed from a test -- no file system reports
+    /// it -- so what a test can pin is that the call was made. Thread-local, because the test
+    /// harness runs tests in parallel and a shared counter would see other tests' writes.
+    pub(crate) static SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `EffectiveOpenOptions` (subset: no APPEND/DSYNC/DELETE_ON_CLOSE – positional API).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenOptions {
@@ -467,6 +477,8 @@ impl OpenCryptoFile {
 
     /// `force`: flush + fsync (+ mtime when `metadata`).
     pub fn sync(&mut self, metadata: bool) -> io::Result<()> {
+        #[cfg(test)]
+        SYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
         self.flush()?;
         if metadata {
             self.file.sync_all()?;

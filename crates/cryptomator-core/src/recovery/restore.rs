@@ -149,13 +149,19 @@ impl RecoveryDirectory {
     /// in place. Every other `rename` failure is returned as it came: only `EXDEV` says "try the
     /// other way round", and a permission or read-only error must not be retried as a copy.
     ///
+    /// The move goes through [`crate::durability::rename_durably`]: a restored masterkey file that
+    /// only exists in the directory's page cache is not restored.
+    ///
     /// # Errors
     /// Whatever the rename, the copy or the removal of the staged file reports.
     pub fn move_recovered_file(&self, file_name: &str) -> Result<()> {
         let from = self.path.join(file_name);
         let to = self.vault_path.join(file_name);
-        match std::fs::rename(&from, &to) {
-            Ok(()) => Ok(()),
+        match crate::durability::rename_durably(&from, &to) {
+            Ok(outcome) => {
+                outcome.warn_unconfirmed(to.display());
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
                 copy_then_rename(&from, &to)
             }
@@ -198,13 +204,22 @@ fn copy_then_rename(from: &Path, to: &Path) -> Result<()> {
     let mut staged = to.as_os_str().to_os_string();
     staged.push(RESTORE_TMP_SUFFIX);
     let staged = PathBuf::from(staged);
-    if let Err(e) = std::fs::copy(from, &staged) {
+    // `fs::copy` leaves the bytes in the page cache and hands back no handle, so the staged file
+    // is synced by path before it takes the name of the file the vault depends on.
+    if let Err(e) = std::fs::copy(from, &staged).and_then(|_| crate::durability::sync_file(&staged))
+    {
         let _ = std::fs::remove_file(&staged);
         return Err(e.into());
     }
-    if let Err(e) = std::fs::rename(&staged, to) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(e.into());
+    match crate::durability::rename_durably(&staged, to) {
+        // The staged file has become `to`; there is nothing left to clean up and nothing to fail.
+        Ok(outcome) => {
+            outcome.warn_unconfirmed(to.display());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e.into());
+        }
     }
     std::fs::remove_file(from)?;
     Ok(())

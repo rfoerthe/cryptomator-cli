@@ -42,8 +42,12 @@ pub fn show(ctx: &Ctx, args: ShowArgs) -> Result<u8> {
         ctx.out
             .emit_secret(json!({ "recoveryKey": key.as_str() }), String::new)?;
     } else {
-        // Printed straight from the wiped buffer.
-        println!("{}", key.as_str());
+        // Printed straight from the wiped buffer, and through `write_line` rather than `println!`:
+        // `crypto recovery-key show v | head -1` closes the pipe, and a `println!` panics on that
+        // (exit 101 and a panic message on stderr) where this returns a `BrokenPipe` error the
+        // CLI turns into a silent exit 0. Same contract as the `--follow` streams and
+        // `crypto completions`.
+        crate::output::write_line(key.as_str())?;
     }
     Ok(exit::OK)
 }
