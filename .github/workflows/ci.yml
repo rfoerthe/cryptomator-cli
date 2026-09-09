@@ -206,8 +206,15 @@ jobs:
 
           # `secret-tool search` prints `secret = ...` too, so only the label and the attributes
           # ever reach the log. These are the raw names the desktop app has to agree with.
+          #
+          # `2>&1`, not `2>/dev/null`: libsecret prints `[path]`, `label`, `secret` and `schema`
+          # on stdout but every `attribute.<name> = <value>` line on *stderr*
+          # (tool/secret-tool.c), so discarding stderr threw away exactly what is asserted
+          # below -- the item was found by its `Vault` attribute and the assertion on that same
+          # attribute then failed. Merging is safe because the `grep` is what keeps the secret
+          # out of this public log, and it drops every line that is not a label or an attribute.
           attributes() {
-            secret-tool search Vault "$ID" 2>/dev/null | grep -E '^(label|attribute\.)' || true
+            secret-tool search Vault "$ID" 2>&1 | grep -E '^(label|attribute\.)' || true
           }
 
           # The default provider on Linux is GnomeKeyringKeychainAccess: `Vault`, no `Name`.
