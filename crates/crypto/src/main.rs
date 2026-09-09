@@ -49,7 +49,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
     // prints a static script and is typically run from a shell's startup file, where a hang or a
     // stray warning on stderr would be the user's problem for every new terminal.
     if let Command::Completions(args) = &cli.command {
-        return commands::completions::completions(&mut std::io::stdout(), args.shell);
+        return commands::completions::completions(&mut std::io::stdout().lock(), args.shell);
     }
     // Before anything can log: the library warns through `log` (a keychain provider that had to
     // be skipped, a self-test entry that could not be removed), and without a logger installed
@@ -163,7 +163,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         // because the dispatch is exhaustive on purpose, and it does the same thing rather than
         // panicking, so a future edit to the early return cannot turn into a crash.
         Command::Completions(args) => {
-            commands::completions::completions(&mut std::io::stdout(), args.shell)
+            commands::completions::completions(&mut std::io::stdout().lock(), args.shell)
         }
     }
 }

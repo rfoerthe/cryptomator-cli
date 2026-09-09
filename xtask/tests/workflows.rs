@@ -385,6 +385,111 @@ fn the_release_is_a_draft_with_notes_from_the_changelog() {
     );
 }
 
+/// The one script in either workflow that is *run* here rather than only read: the release notes.
+///
+/// It is lifted out of the YAML at test time and executed by bash over the repository's own
+/// `CHANGELOG.md`, so the file and the extraction cannot drift apart -- which they silently did
+/// once already, when the empty `## Unreleased` heading that now lives permanently on top of the
+/// changelog made the notes of the first release one byte long.
+///
+/// Two shapes, because both happen: the versioned section is the last one in the file (today's
+/// changelog), and it has an older release under it (every changelog after the second release).
+#[test]
+fn the_release_notes_are_the_first_versioned_section_of_the_changelog() {
+    let ruby = r##"
+        y = YAML.load_file(ARGV[0])
+        s = y['jobs']['release']['steps'].find { |x| x['name'].to_s.include?('release notes') }
+        abort 'no release step takes the release notes from CHANGELOG.md' if s.nil?
+        print s['run']
+    "##;
+    let Some(script) = ruby_over("release.yml", ruby) else {
+        return;
+    };
+    assert!(
+        script.contains("CHANGELOG.md") && script.contains("notes.md"),
+        "not the extraction step: {script}"
+    );
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let changelog = dir.path().join("CHANGELOG.md");
+    std::fs::copy(root().join("CHANGELOG.md"), &changelog).expect("CHANGELOG.md is committed");
+    let script_path = dir.path().join("release-notes.sh");
+    std::fs::write(&script_path, &script).expect("the script is written");
+
+    // The version being released is the one the notes have to describe; the changelog section for
+    // it is written in the version-bump commit, before the tag (`docs/release.md`).
+    let version = workspace_version();
+    let heading = format!("## {version}");
+
+    let Some(notes) = extract_notes(dir.path(), &script_path) else {
+        return;
+    };
+    assert!(
+        notes.starts_with(&heading),
+        "the notes do not start with {heading:?}: {:?}",
+        notes.chars().take(80).collect::<String>()
+    );
+    assert!(
+        notes.len() > 100,
+        "{} bytes of release notes is the empty-section bug again",
+        notes.len()
+    );
+    assert!(
+        !notes.lines().any(|line| line.starts_with("## Unreleased")),
+        "the empty Unreleased section leaked into the release notes"
+    );
+
+    // Now with an older release below it: the extraction has to stop at that heading.
+    let with_predecessor = std::fs::read_to_string(&changelog).expect("the copy is readable")
+        + "\n## 0.0.9 – 2020-01-01\n\nThe release before the first one.\n";
+    std::fs::write(&changelog, with_predecessor).expect("the copy is writable");
+    let Some(bounded) = extract_notes(dir.path(), &script_path) else {
+        return;
+    };
+    assert!(
+        !bounded.contains("0.0.9"),
+        "the notes run on into the previous release"
+    );
+    assert_eq!(
+        bounded.trim_end(),
+        notes.trim_end(),
+        "a successor section changes the notes of the release being made"
+    );
+}
+
+/// Runs the extracted script in `dir` and returns the `notes.md` it writes -- the file
+/// `action-gh-release` is handed as `body_path`. `None` means bash is missing, like `ruby_with`.
+fn extract_notes(dir: &Path, script: &Path) -> Option<String> {
+    let out = match Command::new("bash").arg(script).current_dir(dir).output() {
+        Ok(out) => out,
+        Err(err) => {
+            println!("skipped: cannot run bash ({err}); the release notes are not extracted here");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success(),
+        "the release-notes script failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(std::fs::read_to_string(dir.join("notes.md")).expect("the script writes notes.md"))
+}
+
+/// `[workspace.package] version` from the root manifest: what a `v<version>` tag will carry.
+fn workspace_version() -> String {
+    let manifest: toml_edit::DocumentMut = std::fs::read_to_string(root().join("Cargo.toml"))
+        .expect("the workspace manifest is committed")
+        .parse()
+        .expect("the workspace manifest is valid TOML");
+    manifest
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .expect("[workspace.package] version is set")
+        .to_string()
+}
+
 // -- The CI matrix, the supply chain and the MSRV floor ------------------------------------------
 
 /// The spec's CI matrix, complete: two macOS architectures and two Linux ones. Until M8 only

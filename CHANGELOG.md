@@ -7,10 +7,6 @@
 The first release. The sections below are the eight milestones it was built in; everything in them
 is in 0.1.0.
 
-> `release.yml` takes the release notes from the **first** `## ` section of this file. Remove the
-> empty `## Unreleased` heading above in the version-bump commit and put it back after the release
-> is published — see [`docs/release.md`](docs/release.md).
-
 ### M0 – Scaffold and spikes
 
 - Cargo workspace (`cryptomator-core`, `cryptomator-mount`, `cryptomator-app`, `crypto`), AGPL-3.0-only,
@@ -843,7 +839,10 @@ is in 0.1.0.
   commands. It is dispatched *before* the settings store is built — a broken `settings.json` must
   not be able to break a shell's startup — and the hidden `__daemon` command is filtered out of the
   grammar first (`clap_complete` 4.6.9 skips hidden *values*, not hidden subcommands, and would
-  otherwise advertise it in every user's shell).
+  otherwise advertise it in every user's shell). The script is rendered into memory and written in
+  one go: `clap_complete::generate` unwraps its own writes, so writing to standard output directly
+  turned `crypto completions zsh | head -1` into a panic (exit `101`) as soon as the reader closed
+  the pipe. It now ends the way every other command does there — quietly, with exit `0`.
 - **`crypto --version`** prints `crypto <version> (<commit>, <target>)`. The short commit comes from
   a dependency-free `build.rs` that watches `HEAD` through `git rev-parse --git-path`;
   `$CRYPTO_GIT_SHA` overrides it for builds from a source tarball, and a build with no git
@@ -871,7 +870,9 @@ is in 0.1.0.
   caveats naming FUSE-T, macFUSE and the WebDAV fallback.
 - **`release.yml`**: on a `v*` tag, four target builds, the Universal Mach-O, five tarballs, two
   `.deb`s (each installed and run on its own runner before it is uploaded), one `SHA256SUMS` and a
-  **draft** GitHub release whose notes are this file's top section. Only the `release` job has
+  **draft** GitHub release whose notes are this file's first *versioned* section — the permanent,
+  empty `## Unreleased` on top is skipped, so nothing has to be edited out of the changelog before
+  a tag. Only the `release` job has
   `contents: write`; the rendered formula is attached and printed into the job summary, not
   committed back. A failed run can be repeated against the same tag with `workflow_dispatch`.
   [`docs/release.md`](docs/release.md) is the runbook, including the `codesign`/`notarytool`
@@ -940,8 +941,10 @@ is in 0.1.0.
 Eleven rulings shaped this milestone; each of them left a comment or a document behind, so the
 reasoning is next to the code rather than only here.
 
-- **The changelog gets a `## 0.1.0` section, not a rolling `## Unreleased`.** The release notes are
-  the file's top section verbatim, so the two have to be the same thing.
+- **The changelog gets a `## 0.1.0` section, and the empty `## Unreleased` stays on top of it
+  permanently.** The release notes are the first `## <major>.<minor>.<patch>` section verbatim,
+  heading included, so what a release says and what the changelog says have to be the same thing —
+  and nobody has to remember to delete a heading before tagging.
 - **`build.rs` takes no dependency** to learn the commit — one `git rev-parse --short HEAD` and a
   `cargo:rerun-if-changed` on the path `git rev-parse --git-path HEAD` prints. A build-time crate
   for four lines of output is a supply-chain entry for nothing.
@@ -994,13 +997,6 @@ under *Hardening* rather than a failed command.
 Nothing in this list is a bug report; it is what shipped without ever having been executed, so that
 the first person to hit one knows it was expected.
 
-- **`crypto completions <shell>` panics on a closed pipe.** `crypto completions zsh | head -1`
-  prints the first line and then a `BrokenPipe` panic on stderr, exit `101`, because
-  `clap_complete::generate` unwraps its writes internally and never reaches the CLI's own
-  broken-pipe handling (which is what makes every other command exit `0` there, as the exit-code
-  table in the README says). Redirecting to a file — the documented way to install a script — is
-  unaffected. The `deb` job in `release.yml` runs exactly that pipeline under `set -o pipefail`,
-  so a release run is expected to go red on it.
 - **Nothing in `release.yml` has ever run.** It is asserted over as YAML (`xtask/tests/workflows.rs`)
   and every step it calls was run by hand on the development machine, but the first real execution
   is the first tag. `lipo` in particular has never combined two real binaries here:

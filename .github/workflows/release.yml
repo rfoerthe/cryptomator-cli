@@ -282,12 +282,18 @@ jobs:
           set -euo pipefail
           (cd deb && sha256sum -- *.deb) >> packages/SHA256SUMS
           cat packages/SHA256SUMS
-      # The top section of CHANGELOG.md, without its heading. `generate_release_notes` is off: a
-      # list of commit subjects is not release notes.
+      # The first *versioned* section of CHANGELOG.md, heading included, and everything up to the
+      # next `## ` heading -- or to the end of the file, when it is the last section.
+      # `## Unreleased` sits permanently on top and is skipped: matching the first `## ` of any
+      # kind would make the release notes of every release that empty section.
+      # `generate_release_notes` is off: a list of commit subjects is not release notes.
+      # `xtask/tests/workflows.rs` runs this same script over the real CHANGELOG.md.
       - name: take the release notes from CHANGELOG.md
         run: |
           set -euo pipefail
-          awk '/^## /{ n++; if (n > 1) exit; next } n == 1 { print }' CHANGELOG.md > notes.md
+          awk 'found && /^## / { exit }
+               /^## [0-9]+\.[0-9]+\.[0-9]+/ { found = 1 }
+               found { print }' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then
             echo "See CHANGELOG.md." > notes.md
           fi

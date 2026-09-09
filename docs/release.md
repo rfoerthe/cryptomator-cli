@@ -32,14 +32,15 @@ signing and writing the Homebrew formula back into the repository.
    All four crates and `xtask` inherit `workspace.package.version`; nothing else in the tree
    names it.
 
-3. **`CHANGELOG.md`: the top `## ` section is the release notes, verbatim.** The `release` job
-   runs `awk '/^## /{ n++; if (n > 1) exit; next } n == 1 { print }' CHANGELOG.md` over it, so
-   whatever stands under the *first* `## ` heading becomes the body of the GitHub release.
+3. **`CHANGELOG.md`: write the `## <version> – <date>` section.** It becomes the body of the
+   GitHub release verbatim, heading and all: the `release` job takes the first section whose
+   heading is a version number and everything down to the next `## ` heading (or to the end of the
+   file). The empty `## Unreleased` above it is skipped and **stays where it is** — nothing in the
+   changelog has to be edited for the tag, and nothing has to be put back after it.
 
-   Between releases the file carries an empty `## Unreleased` on top. **Delete that heading in the
-   version-bump commit** and make `## <version> – <date>` the first section, or the draft's notes
-   are the fallback line *See CHANGELOG.md.* and nothing else. A fresh `## Unreleased` goes back in
-   after the release is published (step 3 of *After the workflow*).
+   `the_release_notes_are_the_first_versioned_section_of_the_changelog` in
+   `xtask/tests/workflows.rs` runs the job's own extraction script over this file, so an empty or
+   misplaced section fails `cargo test` rather than the release.
 
 4. **The local gate**, on the commit that will be tagged:
 
@@ -116,17 +117,16 @@ them — but a re-run replaces the draft's assets, so let the first one finish o
 2. **Read the draft release and publish it.** The notes are the CHANGELOG section from step 3
    above; fix them in the release editor if they read badly, then hit *Publish release*.
 
-3. **Back-port the formula and reopen the changelog**, as one pull request:
+3. **Back-port the formula**, as its own pull request:
 
        # the rendered formula is a release asset, and also in the `package` job summary
        curl -sLO https://github.com/rfoerthe/cryptomator-cli/releases/download/v0.1.0/crypto.rb
        mv crypto.rb packaging/homebrew/crypto.rb
        cargo test -p xtask                       # the_committed_formula_is_what_the_renderer_produces
 
-   and put a fresh, empty `## Unreleased` back on top of `CHANGELOG.md`. Until that pull request
-   is merged, `packaging/homebrew/crypto.rb` carries checksums of nothing but zeroes and
-   `brew install --formula` against it cannot succeed. If the formula also lives in a tap, push it
-   there in the same round.
+   Until that pull request is merged, `packaging/homebrew/crypto.rb` carries checksums of nothing
+   but zeroes and `brew install --formula` against it cannot succeed. If the formula also lives in
+   a tap, push it there in the same round. The changelog needs nothing: `## Unreleased` never left.
 
 ## Verifying on a clean VM
 

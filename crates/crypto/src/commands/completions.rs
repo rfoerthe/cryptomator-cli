@@ -10,13 +10,23 @@ use clap_complete::Shell;
 use std::io::Write;
 
 /// Writes the script for `shell` to `out`. The writer is a parameter so a test can render into a
-/// buffer; the command passes `std::io::stdout()`.
+/// buffer; the command passes the locked `std::io::stdout()`.
+///
+/// The script is rendered into memory first and handed to `out` in one `write_all`, because
+/// `clap_complete::generate` `.unwrap()`s every write it makes: given stdout directly, the ~88 kB
+/// zsh script overruns the pipe buffer of `crypto completions zsh | head -1` and the generator
+/// panics (exit 101) somewhere the CLI's own error handling never sees. A `Vec<u8>` cannot fail,
+/// so the only fallible write is the one below -- and its [`std::io::ErrorKind::BrokenPipe`] travels up
+/// through `?` to [`exit::failure_report`], which ends the command the way every other one already
+/// ends on a closed pipe: quietly, with code 0.
 pub fn completions(out: &mut dyn Write, shell: Shell) -> Result<u8> {
     let mut command = public_command();
     // `generate` needs the name separately -- it does not take it from the command -- and it must
     // be the one a user types, not the crate name.
     let name = command.get_name().to_string();
-    clap_complete::generate(shell, &mut command, name, out);
+    let mut script: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut command, name, &mut script);
+    out.write_all(&script)?;
     out.flush()?;
     Ok(exit::OK)
 }
@@ -88,6 +98,37 @@ mod tests {
         for sub in Cli::command().get_subcommands() {
             assert_visible(sub, sub.get_name());
         }
+    }
+
+    /// A writer whose reader has gone away: every write is [`std::io::ErrorKind::BrokenPipe`].
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Broken pipe (os error 32)",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `crypto completions zsh | head -1`: the reader closes the pipe long before the ~88 kB
+    /// script is out. That must arrive as an error the CLI classifies -- [`exit::failure_report`]
+    /// turns it into a silent exit 0 -- and never as a panic out of the generator, which is what
+    /// happened while `generate` wrote to stdout itself.
+    #[test]
+    fn a_closed_pipe_is_reported_rather_than_panicked_over() {
+        let err = completions(&mut ClosedPipe, Shell::Zsh)
+            .expect_err("a closed pipe has to fail the command");
+        assert_eq!(
+            exit::failure_report(&err),
+            None,
+            "not recognised as a closed pipe: {err:#}"
+        );
     }
 
     /// The renderer writes to whatever it is given, and the script carries the program name.

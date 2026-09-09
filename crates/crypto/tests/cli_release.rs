@@ -2,6 +2,8 @@
 //! Nothing here needs a vault, a settings file or a keychain, so there is no `Sandbox`.
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::io::BufRead;
+use std::process::Stdio;
 
 fn crypto() -> Command {
     Command::cargo_bin("crypto").expect("the `crypto` binary is built")
@@ -46,6 +48,51 @@ fn the_bash_script_mentions_the_subcommands() {
         !script.contains("__daemon"),
         "the hidden daemon command leaked into the script"
     );
+}
+
+/// `crypto completions zsh | head -1`, which is what the `deb` job of `.github/workflows/release.yml`
+/// runs and what a user typing `crypto completions zsh | less` does: the reader takes one line and
+/// closes the pipe while ~88 kB of script are still unwritten.
+///
+/// The script no longer goes into stdout as it is generated -- `clap_complete::generate` unwraps
+/// its own writes, and the panic that produced (exit 101, and under `set -o pipefail` a red release
+/// job) happened where the CLI could not see it. Same contract as the `--follow` streams in
+/// `cli_daemon.rs`: a reader that walked away is exit 0 and nothing on stderr.
+#[test]
+fn a_closed_pipe_ends_the_completion_script_with_code_0() {
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("crypto"))
+        .args(["completions", "zsh"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the `crypto` binary starts");
+
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut first = String::new();
+    stdout
+        .read_line(&mut first)
+        .expect("the first line of the script");
+    assert!(
+        first.starts_with("#compdef crypto"),
+        "not the zsh script: {first:?}"
+    );
+    // The pipe buffer holds far less than the script, so the child is certainly still writing:
+    // dropping the reader here is a `BrokenPipe` on its next write and not a lucky no-op.
+    drop(stdout);
+
+    let out = child.wait_with_output().expect("the child ends");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "the generator panicked: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed stdout is a successful end; stderr was: {stderr}"
+    );
+    assert!(stderr.is_empty(), "nothing is printed about it: {stderr}");
 }
 
 /// An unknown shell is a usage error, and clap lists the valid values.
