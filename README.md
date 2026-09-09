@@ -18,13 +18,18 @@ over loopback HTTP instead. [Prerequisites](#prerequisites) says what a real mou
 
 ### macOS
 
-    brew install --formula packaging/homebrew/crypto.rb
+Homebrew installs a formula only from a tap, never from a file path, so the committed formula goes
+through a tap of your own:
 
-**Not before the first release.** The committed formula's checksums are placeholders (sixty-four
-zeroes) and its download URLs point at a release that does not exist yet, so the command above
-fails until someone has back-ported the rendered formula from the first release — see
-[`docs/release.md`](docs/release.md). **Until then, build from source** (below), or take the
-tarball: download `crypto-<version>-universal-apple-darwin.tar.gz` from the
+    brew tap-new "$USER/crypto"
+    cp packaging/homebrew/crypto.rb "$(brew --repository)/Library/Taps/$USER/homebrew-crypto/Formula/"
+    brew install "$USER/crypto/crypto"
+
+The formula downloads the per-architecture tarball of the matching release and verifies it against
+the checksum it carries; Homebrew picks arm64 or x86_64 itself. `brew uninstall crypto` and
+`brew untap "$USER/crypto"` undo all of it.
+
+Or take the tarball by hand: download `crypto-<version>-universal-apple-darwin.tar.gz` from the
 [releases](https://github.com/rfoerthe/cryptomator-cli/releases), check it against `SHA256SUMS`
 and unpack it. That binary is a Universal Mach-O — arm64 and x86_64 in one file — built for macOS
 12 and later. Single-architecture tarballs (`aarch64-apple-darwin`, `x86_64-apple-darwin`) exist

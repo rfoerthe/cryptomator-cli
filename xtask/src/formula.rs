@@ -309,18 +309,57 @@ mod tests {
         );
     }
 
-    /// The committed formula is the placeholder rendering and nothing else: an edit by hand would
-    /// be overwritten by the next `--write` without anyone noticing which of the two was right.
+    /// The four `sha256` values of a formula, in the order the template writes them: macOS arm64,
+    /// macOS x86_64, Linux arm64, Linux x86_64.
+    fn checksums_of(formula: &str) -> Vec<String> {
+        formula
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(r#"sha256 ""#))
+            .filter_map(|rest| rest.strip_suffix('"'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The committed formula is a rendering and nothing else: an edit by hand would be overwritten
+    /// by the next `--write` without anyone noticing which of the two was right.
+    ///
+    /// The four checksums are read back out of the file instead of being fixed here, because the
+    /// committed formula has two legitimate states: placeholders before a release exists, and the
+    /// release's real hashes after the back-port of `docs/release.md` step 3. Everything else --
+    /// the version, the four urls, the install block, the caveats -- still has to be exactly what
+    /// the renderer produces for the version in `Cargo.toml`.
     #[test]
     fn the_committed_formula_is_what_the_renderer_produces() {
         let path = repo_root().join("packaging/homebrew/crypto.rb");
         let committed =
             std::fs::read_to_string(&path).expect("packaging/homebrew/crypto.rb exists");
+        let sums = checksums_of(&committed);
+        assert_eq!(sums.len(), 4, "the formula does not carry four checksums");
+        for sum in &sums {
+            assert!(
+                sum.len() == 64
+                    && sum
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{sum} is not a lowercase 64-digit sha256"
+            );
+        }
         let version = crate::dist::VERSION;
         assert_eq!(
             committed,
-            render_formula(version, &default_url_base(version), &placeholders()),
-            "packaging/homebrew/crypto.rb is stale; re-run `cargo xtask formula --write`"
+            render_formula(
+                version,
+                &default_url_base(version),
+                &Checksums {
+                    macos_arm64: &sums[0],
+                    macos_x86_64: &sums[1],
+                    linux_arm64: &sums[2],
+                    linux_x86_64: &sums[3],
+                },
+            ),
+            "packaging/homebrew/crypto.rb is stale; re-render it -- with the release's four \
+             checksums if it already carries them, because a bare `cargo xtask formula --write` \
+             puts the placeholders back"
         );
     }
 }
