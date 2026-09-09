@@ -855,7 +855,9 @@ is in 0.1.0.
 
 - **`xtask`**, run as `cargo xtask`, a sixth workspace member that is never published:
   `man` (43 roff pages, one per visible command, recursing into nested subcommands so that every
-  cross-reference a page prints actually exists, named git's way — `crypto-vault-create.1`),
+  cross-reference a page prints actually exists, named git's way — `crypto-vault-create.1`, and
+  each one carrying the four global options `--settings`, `--state-dir`, `--json` and
+  `--no-keychain`, which clap propagates into the subcommands only once the command is built),
   `completions` (the five scripts as files), `dist` (build `--release --locked --target …`, stage
   the binary with `README.md`, `CHANGELOG.md`, `LICENSE`, `man/` and `completions/`, pack, append
   the checksum to `target/dist/SHA256SUMS`), `lipo` (the two macOS binaries into a Universal
@@ -872,16 +874,19 @@ is in 0.1.0.
   `.deb`s (each installed and run on its own runner before it is uploaded), one `SHA256SUMS` and a
   **draft** GitHub release whose notes are this file's first *versioned* section — the permanent,
   empty `## Unreleased` on top is skipped, so nothing has to be edited out of the changelog before
-  a tag. Only the `release` job has
+  a tag; a tag with no such section stops the job instead of producing a release nobody wrote notes
+  for. Only the `release` job has
   `contents: write`; the rendered formula is attached and printed into the job summary, not
   committed back. A failed run can be repeated against the same tag with `workflow_dispatch`.
   [`docs/release.md`](docs/release.md) is the runbook, including the `codesign`/`notarytool`
   commands that stay manual.
-- **CI**: the `test` matrix is complete — `ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-15`,
-  `macos-13`, so both architectures on both systems — plus a `supply-chain` job (`cargo deny check`
-  over advisories, bans, licences and sources, with an explicit licence allow list measured over
-  the lock file rather than guessed, and yanked crates denied) and an `msrv` job pinned to the
-  declared 1.89, with a test that fails if the two ever disagree.
+- **CI**: the `test` matrix is `ubuntu-22.04`, `ubuntu-22.04-arm` and `macos-15` — both Linux
+  architectures and arm64 macOS. x86_64 macOS is not in it: `macos-13` was the last such image and
+  GitHub has retired it, so the `x86_64-apple-darwin` binary the release ships is cross-compiled on
+  `macos-15` (`rustup target add` plus `--target`) and never test-run. Next to it a `supply-chain`
+  job (`cargo deny check` over advisories, bans, licences and sources, with an explicit licence
+  allow list measured over the lock file rather than guessed, and yanked crates denied) and an
+  `msrv` job pinned to the declared 1.89, with a test that fails if the two ever disagree.
 
 #### Hardening
 
@@ -1005,8 +1010,14 @@ the first person to hit one knows it was expected.
   development Mac proves the metadata and the asset paths, not the package; the `deb` job installs
   and runs it for the first time, and `cargo install cargo-deb` on `ubuntu-22.04-arm` is itself an
   untried step.
-- **`macos-13` and `ubuntu-22.04-arm` have never run the test suite.** They join the matrix with
-  this milestone; the first run is the first pull request after it.
+- **`ubuntu-22.04-arm` has never run the test suite.** It joins the matrix with this milestone;
+  the first run is the first pull request after it.
+- **Nothing runs the test suite on x86_64 macOS.** `macos-13` was the last x86_64 macOS runner
+  image and it has been retired, so that row was dropped from the matrix. The release still ships
+  an `x86_64-apple-darwin` binary — cross-compiled on the arm64 runner, with
+  `MACOSX_DEPLOYMENT_TARGET=12.0` — but nothing executes it before a user does, and an
+  architecture-specific failure there has nowhere to show up. Rosetta on the arm64 runner would be
+  a way back to running them; it was not taken here.
 - **The Homebrew formula cannot install anything yet.** Its checksums are zeroes and its URLs point
   at a release that does not exist; it becomes usable when the rendered formula is back-ported after
   the first release.

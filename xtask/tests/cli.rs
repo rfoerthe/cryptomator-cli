@@ -69,6 +69,52 @@ fn the_binary_writes_manpages_for_the_public_grammar_only() {
     );
 }
 
+/// The four global options have to appear on *every* page, not only on the overview.
+///
+/// clap propagates `global = true` arguments into the subcommands inside `Command::build()`, and
+/// `xtask man` renders each page from a clone of the subcommand -- detached, with no parent to
+/// inherit from. Without a `build()` first, all 42 subcommand pages documented a `crypto` that
+/// cannot be given `--settings`, while `crypto fs put --help` and the completion scripts (which
+/// clap builds itself) listed all four. This is the page a `.deb` installs, so the difference
+/// reached users.
+#[test]
+fn every_page_documents_the_global_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("man");
+    let run = xtask().args(["man", "--out"]).arg(&out).output().unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // `build()` also materialises clap's own `help` subcommand at every level; those get no page,
+    // so the count is the one the tarball, the `.deb` and the docs all name.
+    assert_eq!(file_names(&out).len(), 43, "the page count changed");
+
+    const GLOBALS: [&str; 4] = ["--settings", "--state-dir", "--json", "--no-keychain"];
+    for (path, body) in read_all(&out) {
+        // roff escapes every hyphen in the body as `\-`.
+        let plain = body.replace("\\-", "-");
+        for option in GLOBALS {
+            assert!(
+                plain.contains(option),
+                "{path:?} does not document {option}"
+            );
+        }
+    }
+    // Named explicitly, because a page nested two levels deep is the one that had no parent at
+    // all when it was rendered.
+    let put = std::fs::read_to_string(out.join("crypto-fs-put.1")).unwrap();
+    let put = put.replace("\\-", "-");
+    assert!(put.contains("--settings"), "{put}");
+    assert!(put.contains("--json"), "{put}");
+    // The description travels with the option, not just the flag name in the synopsis.
+    assert!(
+        put.contains("Path to settings.json"),
+        "only the synopsis carries it: {put}"
+    );
+}
+
 #[test]
 fn the_binary_writes_completion_scripts_for_the_public_grammar_only() {
     let dir = tempfile::tempdir().unwrap();

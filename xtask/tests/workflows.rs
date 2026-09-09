@@ -125,12 +125,85 @@ fn the_build_matrix_covers_all_four_targets() {
     let Some(out) = ruby_over("release.yml", script) else {
         return;
     };
+    // Four targets on three runner labels: `x86_64-apple-darwin` is cross-compiled on the arm64
+    // macOS runner since `macos-13`, the last x86_64 macOS image, was retired.
     assert_eq!(
         out.trim(),
-        "macos-13=x86_64-apple-darwin \
-         macos-15=aarch64-apple-darwin \
+        "macos-15=aarch64-apple-darwin \
+         macos-15=x86_64-apple-darwin \
          ubuntu-22.04-arm=aarch64-unknown-linux-gnu \
          ubuntu-22.04=x86_64-unknown-linux-gnu"
+    );
+}
+
+/// The cross-compiled row needs two things the native one did not: the target installed
+/// (`dtolnay/rust-toolchain`'s `targets:` input is `rustup target add`) and `--target` on the
+/// build. Both come from `matrix.target`, so what is pinned here is that the two really are
+/// wired to it -- a build step without `--target` on `macos-15` would silently produce an arm64
+/// binary and ship it as the x86_64 one.
+#[test]
+fn every_build_row_installs_and_builds_its_own_target() {
+    let script = r##"
+        j = YAML.load_file(ARGV[0])['jobs']['build']
+        t = j['steps'].find { |s| s['uses'].to_s.start_with?('dtolnay/rust-toolchain') }
+        puts t['with']['targets'].to_s
+        b = j['steps'].find { |s| s['run'].to_s.include?('cargo build') }
+        puts b['run'].strip
+        puts b['env']['MACOSX_DEPLOYMENT_TARGET'].to_s
+        puts j['strategy']['matrix']['include']
+               .map { |e| e['macos_deployment_target'].to_s }.join(',')
+    "##;
+    let Some(out) = ruby_over("release.yml", script) else {
+        return;
+    };
+    let mut lines = out.lines();
+    assert_eq!(
+        lines.next().map(str::trim),
+        Some("${{ matrix.target }}"),
+        "the toolchain step does not install the row's target"
+    );
+    let build = lines.next().unwrap_or("");
+    assert!(
+        build.contains("--target ${{ matrix.target }}"),
+        "the build does not name the row's target: {build:?}"
+    );
+    assert_eq!(
+        lines.next().map(str::trim),
+        Some("${{ matrix.macos_deployment_target }}"),
+        "the deployment target is not taken from the row"
+    );
+    // The two Apple rows carry it, the two Linux rows leave it empty (nothing reads it there).
+    assert_eq!(
+        lines.next().map(str::trim),
+        Some("12.0,12.0,,"),
+        "both macOS rows must build against the same oldest system"
+    );
+}
+
+/// A `workflow_dispatch` re-run for a tag and the tag push it repeats must land in *one*
+/// concurrency group, or the two write assets into the same draft at the same time. On a dispatch
+/// `github.ref` is the ref the run was started from (`refs/heads/main`), so the group has to
+/// prefer `inputs.tag` -- exactly the expression `docs/release.md` promises ("The two runs do not
+/// race -- `concurrency` groups them").
+#[test]
+fn a_dispatched_re_run_shares_the_concurrency_group_of_the_tag_push() {
+    let script = r##"
+        c = YAML.load_file(ARGV[0])['concurrency']
+        puts c['group'].to_s
+        puts c['cancel-in-progress'].inspect
+    "##;
+    let Some(out) = ruby_over("release.yml", script) else {
+        return;
+    };
+    let mut lines = out.lines();
+    assert_eq!(
+        lines.next().map(str::trim),
+        Some("release-${{ inputs.tag || github.ref }}")
+    );
+    assert_eq!(
+        lines.next().map(str::trim),
+        Some("false"),
+        "a half-uploaded release must not be cancelled by the run that repeats it"
     );
 }
 
@@ -457,22 +530,67 @@ fn the_release_notes_are_the_first_versioned_section_of_the_changelog() {
     );
 }
 
+/// A changelog with no `## <version>` section at all -- the shape a release cut before the
+/// section was written would have. The extraction has to stop the release rather than invent a
+/// body for it: the alternative it replaced ("See CHANGELOG.md." into `notes.md`) created the
+/// draft anyway, with notes nobody wrote, and the mistake was only visible afterwards.
+#[test]
+fn a_changelog_without_a_versioned_section_fails_the_release_job() {
+    let ruby = r##"
+        y = YAML.load_file(ARGV[0])
+        s = y['jobs']['release']['steps'].find { |x| x['name'].to_s.include?('release notes') }
+        abort 'no release step takes the release notes from CHANGELOG.md' if s.nil?
+        print s['run']
+    "##;
+    let Some(script) = ruby_over("release.yml", ruby) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    // The permanent empty heading and nothing else: no version has been written up yet.
+    std::fs::write(
+        dir.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## Unreleased\n\n",
+    )
+    .expect("the changelog is written");
+    let script_path = dir.path().join("release-notes.sh");
+    std::fs::write(&script_path, &script).expect("the script is written");
+
+    let Some(out) = run_notes_script(dir.path(), &script_path) else {
+        return;
+    };
+    assert!(
+        !out.status.success(),
+        "an empty extraction created a release anyway; notes.md was {:?}",
+        std::fs::read_to_string(dir.path().join("notes.md")).unwrap_or_default()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("CHANGELOG.md"),
+        "the failure does not say what is wrong: {stderr}"
+    );
+}
+
 /// Runs the extracted script in `dir` and returns the `notes.md` it writes -- the file
 /// `action-gh-release` is handed as `body_path`. `None` means bash is missing, like `ruby_with`.
 fn extract_notes(dir: &Path, script: &Path) -> Option<String> {
-    let out = match Command::new("bash").arg(script).current_dir(dir).output() {
-        Ok(out) => out,
-        Err(err) => {
-            println!("skipped: cannot run bash ({err}); the release notes are not extracted here");
-            return None;
-        }
-    };
+    let out = run_notes_script(dir, script)?;
     assert!(
         out.status.success(),
         "the release-notes script failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     Some(std::fs::read_to_string(dir.join("notes.md")).expect("the script writes notes.md"))
+}
+
+/// The bare run, so the test above can assert on a *failing* one. `None` means bash is missing.
+fn run_notes_script(dir: &Path, script: &Path) -> Option<std::process::Output> {
+    match Command::new("bash").arg(script).current_dir(dir).output() {
+        Ok(out) => Some(out),
+        Err(err) => {
+            println!("skipped: cannot run bash ({err}); the release notes are not extracted here");
+            None
+        }
+    }
 }
 
 /// `[workspace.package] version` from the root manifest: what a `v<version>` tag will carry.
@@ -492,12 +610,15 @@ fn workspace_version() -> String {
 
 // -- The CI matrix, the supply chain and the MSRV floor ------------------------------------------
 
-/// The spec's CI matrix, complete: two macOS architectures and two Linux ones. Until M8 only
-/// macos-15 and ubuntu-22.04 ran, so an x86_64-only or an arm-only failure had nowhere to show up.
+/// The CI matrix: both Linux architectures and arm64 macOS. Until M8 only macos-15 and
+/// ubuntu-22.04 ran, so an arm-only Linux failure had nowhere to show up. x86_64 macOS is *not*
+/// here -- `macos-13` was the last such image and it has been retired; the release still ships
+/// that target, cross-compiled (`release.yml`), and the CHANGELOG records the untested
+/// architecture as a known limitation.
 /// `fail-fast: false` belongs to the same statement -- with it on, the first red row cancels the
-/// other three and the matrix stops answering the question it exists for.
+/// other two and the matrix stops answering the question it exists for.
 #[test]
-fn the_ci_test_job_runs_on_all_four_runners() {
+fn the_ci_test_job_runs_on_the_three_runners() {
     let script = r##"
         s = YAML.load_file(ARGV[0])['jobs']['test']['strategy']
         puts s['matrix']['os'].sort.join(' ')
@@ -509,12 +630,12 @@ fn the_ci_test_job_runs_on_all_four_runners() {
     let mut lines = out.lines();
     assert_eq!(
         lines.next().map(str::trim),
-        Some("macos-13 macos-15 ubuntu-22.04 ubuntu-22.04-arm")
+        Some("macos-15 ubuntu-22.04 ubuntu-22.04-arm")
     );
     assert_eq!(
         lines.next().map(str::trim),
         Some("false"),
-        "fail-fast would cancel the other three runners on the first red one"
+        "fail-fast would cancel the other two runners on the first red one"
     );
 }
 

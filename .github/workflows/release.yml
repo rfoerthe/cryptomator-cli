@@ -30,7 +30,8 @@
 #
 # What a human still does
 #
-#   1. Create and push the tag (`git tag -s v0.1.0 && git push origin v0.1.0`); CI never tags.
+#   1. Create and push the tag (`git tag -a v0.1.0 -m "crypto 0.1.0" && git push origin v0.1.0`);
+#      CI never tags. `docs/release.md` spells the same two commands out.
 #   2. Read the draft release, then publish it.
 #   3. Back-port the four sha256 values from the attached `crypto.rb` into
 #      `packaging/homebrew/crypto.rb`, which is committed with placeholders until a release exists.
@@ -54,8 +55,13 @@ permissions:
 
 # Two runs for the same tag would race for the same draft. They are not cancelled, though: a
 # half-uploaded release is worse than a slow one.
+#
+# `inputs.tag` first, because on a `workflow_dispatch` `github.ref` is the ref the run was
+# dispatched *from* (`refs/heads/main`) and not the tag being built: grouping on it alone would put
+# a re-run for `v0.1.0` in a different group from the tag push it repeats, and the two would upload
+# to the same draft at the same time.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -71,7 +77,12 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             macos_deployment_target: "12.0"
-          - os: macos-13
+          # Cross-compiled from the arm64 runner rather than built on an x86_64 one: the `macos-13`
+          # image, the last x86_64 macOS runner, was retired. `dtolnay/rust-toolchain`'s `targets:`
+          # input runs `rustup target add`, and the Apple linker on macos-15 links for either
+          # architecture, so this is a plain `--target`. Nothing here runs the binary; the tests
+          # that would have run on x86_64 macOS are gone with the image (`ci.yml`).
+          - os: macos-15
             target: x86_64-apple-darwin
             macos_deployment_target: "12.0"
           - os: ubuntu-22.04
@@ -287,7 +298,10 @@ jobs:
       # `## Unreleased` sits permanently on top and is skipped: matching the first `## ` of any
       # kind would make the release notes of every release that empty section.
       # `generate_release_notes` is off: a list of commit subjects is not release notes.
-      # `xtask/tests/workflows.rs` runs this same script over the real CHANGELOG.md.
+      # An empty extraction is a failure, not a placeholder: a release whose notes say only "see
+      # the changelog" is a release nobody wrote notes for, and the draft would already exist by
+      # the time anyone noticed. `xtask/tests/workflows.rs` runs this same script over the real
+      # CHANGELOG.md and over one without a versioned section.
       - name: take the release notes from CHANGELOG.md
         run: |
           set -euo pipefail
@@ -295,7 +309,9 @@ jobs:
                /^## [0-9]+\.[0-9]+\.[0-9]+/ { found = 1 }
                found { print }' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then
-            echo "See CHANGELOG.md." > notes.md
+            echo "no '## <version>' section in CHANGELOG.md: the release notes would be empty" >&2
+            echo "write the section for this version, then re-run this workflow for the tag" >&2
+            exit 1
           fi
           cat notes.md
       - uses: softprops/action-gh-release@v2

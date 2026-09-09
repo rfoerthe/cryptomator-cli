@@ -234,7 +234,10 @@ fn gvfs_dir() -> PathBuf {
 /// the desktop app -- created is never overwritten.
 pub(crate) fn add_internet_password_command(host: &IpAddr, port: u16) -> Command {
     let host = host.to_string();
-    let mut command = Command::new("security");
+    // The absolute path, like `/usr/bin/osascript` above and `/usr/bin/lipo` in `xtask`: a
+    // `security` earlier in `PATH` (a shim, a Homebrew tool of the same name) would be run with
+    // the user's keychain in reach, and this is a mount path a user does not watch.
+    let mut command = Command::new("/usr/bin/security");
     command
         .arg("add-internet-password")
         .args(["-a", "anonymous"])
@@ -939,7 +942,9 @@ mod tests {
     #[test]
     fn the_internet_password_argv_matches_java_except_for_the_host() {
         let command = add_internet_password_command(&IpAddr::V4(Ipv4Addr::LOCALHOST), 42427);
-        assert_eq!(command.get_program(), OsStr::new("security"));
+        // The absolute path, not a `PATH` lookup: nothing shadowing the name may be handed the
+        // keychain.
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/security"));
         assert_eq!(
             args_of(&command),
             vec![

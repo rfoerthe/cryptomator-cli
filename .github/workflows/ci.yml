@@ -10,9 +10,13 @@ jobs:
       # find the architecture-specific failures a two-runner matrix could not.
       fail-fast: false
       matrix:
-        # Both architectures on both systems: macos-15 is arm64 and macos-13 is x86_64,
-        # ubuntu-22.04 is x86_64 and ubuntu-22.04-arm is arm64.
-        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-13]
+        # Both Linux architectures and arm64 macOS: ubuntu-22.04 is x86_64, ubuntu-22.04-arm is
+        # arm64, macos-15 is arm64. There is no x86_64 macOS row any more -- `macos-13` was the
+        # last such image and it has been retired. The release still ships an
+        # `x86_64-apple-darwin` binary, cross-compiled on `macos-15` (`release.yml`); what is gone
+        # is running the test suite on that architecture, which the CHANGELOG records as a known
+        # limitation.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
     env:
       # The daemon tests (crates/crypto/tests/cli_daemon.rs) mount through the null mounter, which
@@ -25,9 +29,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # `cargo fmt` and `cargo clippy` produce the same answer on every runner; running them four
+      # `cargo fmt` and `cargo clippy` produce the same answer on every runner; running them three
       # times costs a minute each and buys nothing. They stay on the matrix all the same, because
-      # splitting them into a fifth job would mean a fifth checkout and a fifth cold cache.
+      # splitting them into a fourth job would mean a fourth checkout and a fourth cold cache.
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # This covers the M7 command tests too -- `cli_health.rs`, `cli_migrate.rs` and

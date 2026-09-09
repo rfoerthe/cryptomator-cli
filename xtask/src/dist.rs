@@ -233,8 +233,10 @@ pub(crate) fn tar_flavour(version_banner: &str) -> TarFlavour {
 /// the timestamps.
 ///
 /// bsdtar has no `--mtime` and no `--sort`, so a macOS archive is normalised for ownership only
-/// and still carries the staging files' mtimes. That is the whole difference between the two sets;
-/// the release archives are built by the Linux runners for every target but the Apple ones.
+/// and still carries the staging files' mtimes. That is the whole difference between the two sets
+/// -- and it applies to every published archive: `release.yml`'s `package` job packs all five
+/// tarballs on `macos-15`, because `lipo` runs nowhere else. The GNU branch is what a Linux
+/// developer building by hand gets.
 pub(crate) fn reproducibility_args(flavour: TarFlavour, mtime_epoch: Option<&str>) -> Vec<String> {
     let owned = |args: &[&str]| {
         args.iter()

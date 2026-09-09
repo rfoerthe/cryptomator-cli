@@ -7,12 +7,17 @@ signing and writing the Homebrew formula back into the repository.
 ## Before the tag
 
 1. **`main` is clean and green.** Every job of `ci.yml` has passed on the commit that is about to
-   be tagged: `test` on all four runners (`ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-15`,
-   `macos-13`), `interop-java`, the mount, WebDAV and keychain end-to-end jobs, and — the two that
-   are easy to forget because nothing else depends on them — **`supply-chain`** (`cargo deny check`
-   over advisories, bans, licences and sources) and **`msrv`** (`cargo check --workspace
-   --all-targets --locked` on 1.89). A red `supply-chain` is usually a new RustSec advisory rather
-   than a code change; fix it or record the decision in `deny.toml`, do not tag around it.
+   be tagged: `test` on all three runners (`ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-15`),
+   `interop-java`, the mount, WebDAV and keychain end-to-end jobs, and — the two that are easy to
+   forget because nothing else depends on them — **`supply-chain`** (`cargo deny check` over
+   advisories, bans, licences and sources) and **`msrv`** (`cargo check --workspace --all-targets
+   --locked` on 1.89). A red `supply-chain` is usually a new RustSec advisory rather than a code
+   change; fix it or record the decision in `deny.toml`, do not tag around it.
+
+   There is no x86_64 macOS runner in the matrix: `macos-13` was the last such image and it has
+   been retired. The `x86_64-apple-darwin` binary is still built and shipped — cross-compiled on
+   `macos-15` — but no test suite runs on that architecture any more. The CHANGELOG lists it under
+   known limitations.
 
 2. **Bump the version — three files, in this order.**
 
@@ -24,9 +29,11 @@ signing and writing the Homebrew formula back into the repository.
        #    with "cannot update the lock file ... because --locked was passed".
        cargo update --workspace --offline        # touches exactly the five workspace members
 
-       # 3. the committed Homebrew formula names the version four times, and
-       #    `the_committed_formula_is_what_the_renderer_produces` in xtask/src/formula.rs
-       #    compares it against the renderer's output for the *current* version.
+       # 3. the committed Homebrew formula names the version on six lines (`version`, the four
+       #    `url`s and the `test` assertion), and regenerating the whole file is the only way it
+       #    is edited: `the_committed_formula_is_what_the_renderer_produces` in
+       #    xtask/src/formula.rs compares it against the renderer's output for the *current*
+       #    version.
        cargo xtask formula --write
 
    All four crates and `xtask` inherit `workspace.package.version`; nothing else in the tree
@@ -40,7 +47,9 @@ signing and writing the Homebrew formula back into the repository.
 
    `the_release_notes_are_the_first_versioned_section_of_the_changelog` in
    `xtask/tests/workflows.rs` runs the job's own extraction script over this file, so an empty or
-   misplaced section fails `cargo test` rather than the release.
+   misplaced section fails `cargo test` rather than the release. Should it reach the release
+   anyway, the job stops there: an extraction that finds no versioned section exits 1 with the
+   reason, rather than creating a draft whose notes nobody wrote.
 
 4. **The local gate**, on the commit that will be tagged:
 
@@ -70,8 +79,10 @@ The tag is created by a person, never by CI:
     git tag -a v0.1.0 -m "crypto 0.1.0"
     git push origin v0.1.0
 
-`v<version>` — the workflow strips the `v` and fails early if no `crypto-<version>-*.tar.gz` came
-out of the build, which is what catches a tag that disagrees with `Cargo.toml`.
+`v<version>` — the workflow strips the `v` and, in the `package` job's "render the Homebrew
+formula" step, checks that `target/dist/crypto-<version>-aarch64-apple-darwin.tar.gz` is one of the
+tarballs it just packed. A tag that disagrees with `Cargo.toml` fails there, with the archive
+names printed — after the builds, but before a release exists.
 
 ## What the workflow produces
 

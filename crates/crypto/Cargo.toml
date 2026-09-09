@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 build = "build.rs"
+# Not a crates.io crate: `crypto` became a library on top of the binary so `xtask` can render the
+# manpages and completion scripts from the living grammar, not so anyone can depend on it. The
+# name is also one of the most generic on the registry.
+publish = false
 
 [lib]
 name = "crypto"

@@ -38,7 +38,7 @@ commands for anyone who wants to sign their own build.
 
 ### Debian and Ubuntu
 
-    sudo apt install ./crypto_<version>_<arch>.deb     # amd64 and arm64
+    sudo apt install ./crypto_<version>-1_<arch>.deb   # amd64 and arm64
 
 The package depends on `fuse3` (for `fusermount3`, which the Linux mount back end calls at run
 time) and recommends `gnome-keyring` and `libsecret-tools` — the keychain is optional, and

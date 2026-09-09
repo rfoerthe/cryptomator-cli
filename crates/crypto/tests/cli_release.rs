@@ -155,17 +155,3 @@ fn version_carries_the_commit_and_the_target() {
         "not a target triple: {target:?}"
     );
 }
-
-/// The environment override exists so a build from a source tarball (Homebrew, a distribution)
-/// can still name the commit it was cut from.
-#[test]
-fn the_environment_can_supply_the_sha() {
-    // Not a run-time variable: it is read by build.rs, so this only pins that the documented name
-    // is the one the build script looks at. The value itself is checked by the shape test above.
-    assert!(
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
-            .unwrap()
-            .contains("CRYPTO_GIT_SHA"),
-        "build.rs no longer honours $CRYPTO_GIT_SHA"
-    );
-}

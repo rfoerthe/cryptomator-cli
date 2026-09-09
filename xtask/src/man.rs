@@ -34,8 +34,17 @@ fn man_file_name(path: &[&str]) -> String {
 pub(crate) fn render_all(cmd: &clap::Command, out: &Path) -> io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(out)
         .map_err(|e| context(e, &format!("cannot create {}", out.display())))?;
-    let mut written = vec![render_one(cmd, &[], out)?];
-    render_subcommands(cmd, &mut Vec::new(), out, &mut written)?;
+    // `build()` before anything is rendered, because clap copies `global = true` arguments into
+    // the subcommands only there (`_build_recursive` -> `_propagate_global_args`). Every page
+    // below is rendered from a *clone* of a subcommand, detached from this tree, so a subcommand
+    // that has not inherited `--settings`, `--state-dir`, `--json` and `--no-keychain` by then
+    // never will -- which is how 42 of the 43 shipped pages came to document a `crypto` that has
+    // no global options. `build()` also materialises clap's own `help` subcommand, which
+    // `render_subcommands` skips by name, so the page count is unchanged.
+    let mut built = cmd.clone();
+    built.build();
+    let mut written = vec![render_one(&built, &[], out)?];
+    render_subcommands(&built, &mut Vec::new(), out, &mut written)?;
     Ok(written)
 }
 

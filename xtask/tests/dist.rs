@@ -6,16 +6,31 @@
 //!
 //! The target triple is deliberately not a real one: `dist` writes into the repository's own
 //! `target/dist`, and a test must not overwrite the archive a developer just built for the host.
+//! It also carries this process's pid, because `target/dist` is shared with every *other* `cargo
+//! test` running in the same checkout: with a fixed name, a second run's `dist` would
+//! `remove_dir_all` the staging directory this one is in the middle of packing, and `tar` failed
+//! with "Couldn't visit directory". The mutex below only orders the two tests inside one binary.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-const TARGET: &str = "xtask-test";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The triple these tests pack for: unique per process, see the module comment.
+fn target() -> String {
+    format!("xtask-test-{}", std::process::id())
+}
 
 /// `target/dist/SHA256SUMS` is one file both tests rewrite; cargo runs them in threads.
 static DIST: Mutex<()> = Mutex::new(());
+
+/// Removes what a run left in the shared `target/dist`: the staging directory and the archive.
+/// The `SHA256SUMS` line stays -- rewriting the file others append to is the race this avoids.
+fn clean_up(dist_dir: &Path, target: &str) {
+    let _ = std::fs::remove_dir_all(dist_dir.join(format!("crypto-{VERSION}-{target}")));
+    let _ = std::fs::remove_file(dist_dir.join(format!("crypto-{VERSION}-{target}.tar.gz")));
+}
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -37,9 +52,9 @@ fn payload() -> PathBuf {
 }
 
 /// Runs `xtask dist` for the test triple and returns its stdout.
-fn run_dist() -> String {
+fn run_dist(target: &str) -> String {
     let run = Command::new(env!("CARGO_BIN_EXE_xtask"))
-        .args(["dist", "--target", TARGET, "--no-build", "--bin"])
+        .args(["dist", "--target", target, "--no-build", "--bin"])
         .arg(payload())
         .output()
         .unwrap();
@@ -91,23 +106,24 @@ fn members(archive: &Path) -> BTreeSet<String> {
 #[test]
 fn the_archive_holds_the_binary_the_docs_the_pages_and_the_scripts() {
     let _guard = DIST.lock().unwrap_or_else(|e| e.into_inner());
-    let stdout = run_dist();
+    let target = target();
+    let stdout = run_dist(&target);
     let archive = PathBuf::from(stdout.lines().next().unwrap());
     assert_eq!(
         archive.file_name().unwrap().to_string_lossy(),
-        format!("crypto-{VERSION}-{TARGET}.tar.gz")
+        format!("crypto-{VERSION}-{target}.tar.gz")
     );
     assert!(archive.is_file(), "{archive:?} was not written");
 
     let dist_dir = archive.parent().unwrap().to_path_buf();
-    let stage = dist_dir.join(format!("crypto-{VERSION}-{TARGET}"));
+    let stage = dist_dir.join(format!("crypto-{VERSION}-{target}"));
     let mut staged = BTreeSet::new();
     walk(&stage, &dist_dir, &mut staged);
     // The exact member set: what was staged, nothing else. In particular no `._`-prefixed
     // AppleDouble members, which Apple's `tar` adds for extended attributes unless told not to.
     assert_eq!(members(&archive), staged);
 
-    let prefix = format!("crypto-{VERSION}-{TARGET}");
+    let prefix = format!("crypto-{VERSION}-{target}");
     for expected in [
         "crypto",
         "README.md",
@@ -154,21 +170,24 @@ fn the_archive_holds_the_binary_the_docs_the_pages_and_the_scripts() {
         "--version does not name the version: {}",
         String::from_utf8_lossy(&version.stdout)
     );
+    clean_up(&dist_dir, &target);
 }
 
 #[test]
 fn the_checksum_file_lists_each_archive_exactly_once() {
     let _guard = DIST.lock().unwrap_or_else(|e| e.into_inner());
-    run_dist();
+    let target = target();
+    run_dist(&target);
     // A second run for the same target must replace its line, not add another one: two lines for
     // one file make `sha256sum --check` verify it twice and hide which hash is current.
-    let stdout = run_dist();
+    let stdout = run_dist(&target);
     let mut lines = stdout.lines();
     let archive = PathBuf::from(lines.next().unwrap());
     let printed = lines.next().unwrap();
     let name = archive.file_name().unwrap().to_string_lossy().into_owned();
 
-    let sums = archive.parent().unwrap().join("SHA256SUMS");
+    let dist_dir = archive.parent().unwrap().to_path_buf();
+    let sums = dist_dir.join("SHA256SUMS");
     let body = std::fs::read_to_string(&sums).unwrap();
     let ours: Vec<&str> = body
         .lines()
@@ -186,4 +205,5 @@ fn the_checksum_file_lists_each_archive_exactly_once() {
     );
     assert_eq!(rest, format!("  {name}"));
     assert!(body.ends_with('\n'), "the last line has no newline");
+    clean_up(&dist_dir, &target);
 }
