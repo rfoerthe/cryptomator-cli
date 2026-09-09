@@ -137,8 +137,13 @@ finish or cancel it by hand.
        mv crypto.rb packaging/homebrew/crypto.rb
        cargo test -p xtask                       # the_committed_formula_is_what_the_renderer_produces
 
+   That test reads the four `sha256` values back out of the committed file and re-renders
+   everything around them, so it passes both before the back-port (placeholders) and after it (the
+   release's hashes). A bare `cargo xtask formula --write` puts the placeholders back, though: once
+   real checksums are committed, re-render with the four `--sha256-…` flags or not at all.
+
    Until that pull request is merged, `packaging/homebrew/crypto.rb` carries checksums of nothing
-   but zeroes and `brew install --formula` against it cannot succeed. If the formula also lives in
+   but zeroes and no `brew install` of it can succeed. If the formula also lives in
    a tap, push it there in the same round. The changelog needs nothing: `## Unreleased` never left.
 
 ## Verifying on a clean VM
@@ -166,11 +171,15 @@ point is to catch a missing runtime dependency, not to test the code.
     man crypto && man crypto-vault-create
     dpkg -L crypto                                # binary, 43 manpages, three completion scripts
 
-**The Homebrew formula**, once the back-port of step 3 is merged:
+**The Homebrew formula**, once the back-port of step 3 is merged. Homebrew installs a formula only
+from a tap, so it goes through a throwaway one:
 
-    brew install --formula packaging/homebrew/crypto.rb
+    brew tap-new "$USER/crypto"
+    cp packaging/homebrew/crypto.rb "$(brew --repository)/Library/Taps/$USER/homebrew-crypto/Formula/"
+    brew install "$USER/crypto/crypto"
     crypto --version
-    brew test crypto
+    brew test "$USER/crypto/crypto"
+    brew uninstall crypto && brew untap "$USER/crypto"
 
 Finally, one real vault: `crypto vault create`, `crypto unlock`, write a file through the mount,
 `crypto lock`. A packaging mistake that survives everything above shows up there.

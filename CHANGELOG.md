@@ -10,6 +10,16 @@
 - CI: Dependabot watches `.github/workflows` weekly and opens one grouped pull request for new
   action majors, so the next runtime deprecation arrives as a pull request rather than as an
   annotation on every job.
+- Packaging: `packaging/homebrew/crypto.rb` carries the four real sha256 values of the 0.1.0
+  archives instead of the sixty-four-zero placeholders, so the formula installs. Back-ported from
+  the release asset as `docs/release.md` step 3 describes.
+- Packaging: `the_committed_formula_is_what_the_renderer_produces` reads the four checksums back
+  out of the committed formula and re-renders everything around them. It compared against the
+  placeholders before, which made the back-port of the previous entry fail the very test
+  `docs/release.md` tells you to run after it.
+- Docs: the install instructions no longer say `brew install --formula <path>`. Homebrew installs a
+  formula only from a tap and rejects a file path outright, so README.md and `docs/release.md` show
+  the `brew tap-new` / copy / `brew install <tap>/crypto` route instead.
 
 ## 0.1.0 – 2026-09-09
 
