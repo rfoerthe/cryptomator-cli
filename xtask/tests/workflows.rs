@@ -76,17 +76,17 @@ const TARGETS: [&str; 4] = [
 /// action runs with the job's token -- so it is made here and not in a pull request diff nobody
 /// reads to the end.
 const ALLOWED_ACTIONS: [&str; 10] = [
-    "actions/checkout@v4",
-    "actions/download-artifact@v4",
-    "actions/setup-java@v4",
-    "actions/upload-artifact@v4",
+    "actions/checkout@v7",
+    "actions/download-artifact@v8",
+    "actions/setup-java@v6",
+    "actions/upload-artifact@v7",
     "dtolnay/rust-toolchain@master",
     "dtolnay/rust-toolchain@stable",
     // The MSRV job: `dtolnay/rust-toolchain` keeps a branch per released Rust, and this one has
     // to stay equal to the workspace's `rust-version` (asserted below).
     "dtolnay/rust-toolchain@1.89",
     "Swatinem/rust-cache@v2",
-    "softprops/action-gh-release@v2",
+    "softprops/action-gh-release@v3",
     "EmbarkStudios/cargo-deny-action@v2",
 ];
 
@@ -405,7 +405,7 @@ fn every_artefact_downloaded_was_uploaded_by_an_earlier_job() {
 }
 
 /// The package job packs every target the build matrix produced, from the artefact layout
-/// `upload-artifact@v4` actually creates.
+/// `upload-artifact@v7` actually creates.
 #[test]
 fn the_package_job_packs_every_target_the_build_matrix_produces() {
     let script = r##"
@@ -421,7 +421,7 @@ fn the_package_job_packs_every_target_the_build_matrix_produces() {
             "the package job never mentions {target}"
         );
     }
-    // The layout `upload-artifact@v4` produces for a single-file upload: the artefact's own
+    // The layout `upload-artifact@v7` produces for a single-file upload: the artefact's own
     // directory, the bare file name, no `target/<triple>/release` in between.
     assert!(
         out.contains("artifacts/crypto-$t/crypto"),

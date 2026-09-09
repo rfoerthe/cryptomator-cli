@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- CI: every JavaScript action moves to a major that runs on Node 24, which is what the
+  per-job deprecation annotation on every run was asking for -- `actions/checkout` v4 to v7,
+  `actions/setup-java` v4 to v6, `actions/upload-artifact` v4 to v7, `actions/download-artifact`
+  v4 to v8 and `softprops/action-gh-release` v2 to v3. `Swatinem/rust-cache` already ran on
+  Node 24, `cargo-deny-action` is a Docker action and `dtolnay/rust-toolchain` a composite one.
+
 ## 0.1.0 – 2026-09-09
 
 The first release. The sections below are the eight milestones it was built in; everything in them
