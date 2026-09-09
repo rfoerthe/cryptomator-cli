@@ -586,17 +586,21 @@ mod tests {
             None
         );
         let hint = url_hint("http://127.0.0.1:42427/AAAAAAAAAAAA");
-        assert!(
-            hint.contains("http://127.0.0.1:42427/AAAAAAAAAAAA"),
-            "{hint}"
-        );
         assert!(hint.contains("Connect to Server"), "{hint}");
-        if !cfg!(target_os = "macos") {
-            // `gio` takes the WebDAV scheme, not the HTTP one.
+        if cfg!(target_os = "macos") {
+            // Finder is handed the URL exactly as the server serves it.
+            assert!(
+                hint.contains("http://127.0.0.1:42427/AAAAAAAAAAAA"),
+                "{hint}"
+            );
+        } else {
+            // `gio` takes the WebDAV scheme, not the HTTP one -- and `url_hint` rewrites rather
+            // than adds, so the http:// form must not survive into the hint at all.
             assert!(
                 hint.contains("dav://127.0.0.1:42427/AAAAAAAAAAAA"),
                 "{hint}"
             );
+            assert!(!hint.contains("http://"), "{hint}");
         }
     }
 

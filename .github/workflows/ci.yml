@@ -51,7 +51,9 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          # 25, not 21: cryptofs 2.10.0 ships class file version 69, which only a JDK 25 or newer
+          # can read. `tools/fixture-gen/pom.xml` compiles against it and says the same.
+          java-version: "25"
           cache: maven
       # The tests shell out to `mvn ... exec:exec` per vault. Compiling the harness once up front
       # downloads cryptofs 2.10.0 into the (cached) `~/.m2` and turns a network failure into a
@@ -204,8 +206,15 @@ jobs:
 
           # `secret-tool search` prints `secret = ...` too, so only the label and the attributes
           # ever reach the log. These are the raw names the desktop app has to agree with.
+          #
+          # `2>&1`, not `2>/dev/null`: libsecret prints `[path]`, `label`, `secret` and `schema`
+          # on stdout but every `attribute.<name> = <value>` line on *stderr*
+          # (tool/secret-tool.c), so discarding stderr threw away exactly what is asserted
+          # below -- the item was found by its `Vault` attribute and the assertion on that same
+          # attribute then failed. Merging is safe because the `grep` is what keeps the secret
+          # out of this public log, and it drops every line that is not a label or an attribute.
           attributes() {
-            secret-tool search Vault "$ID" 2>/dev/null | grep -E '^(label|attribute\.)' || true
+            secret-tool search Vault "$ID" 2>&1 | grep -E '^(label|attribute\.)' || true
           }
 
           # The default provider on Linux is GnomeKeyringKeychainAccess: `Vault`, no `Name`.
@@ -237,14 +246,26 @@ jobs:
           SCRIPT
           chmod +x "$RUNNER_TEMP/keychain-e2e.sh"
       - name: round-trip a passphrase through gnome-keyring
-        # `dbus-run-session` gives the daemon a private session bus; `--unlock` with an empty
-        # password on stdin creates and unlocks the default keyring, so nothing prompts. The
-        # daemon prints the environment it wants exported, hence the `eval`.
+        # `dbus-run-session` gives the daemon a private session bus; `--unlock` reads a password
+        # from stdin and creates the login keyring with it when, as here, there is none yet. The
+        # password must be a real line: with `echo -n ""` the daemon starts and answers on the bus
+        # but creates no keyring at all, so `default` and `login` both resolve to nothing and every
+        # store fails with "the secret service has no default collection and none aliased 'login'".
+        # The value itself is throwaway -- this keyring lives and dies with the job. The daemon
+        # prints the environment it wants exported, hence the `eval`.
+        #
+        # Storing and clearing one throwaway item through `secret-tool` first proves there is a
+        # writable default collection at all. It is the same thing `crypto password store` needs,
+        # but it fails here, with libsecret's own message, rather than fifty lines into the script
+        # -- and it tells a broken keyring setup apart from a broken keychain backend.
         run: |
           set -euo pipefail
           dbus-run-session -- bash -c '
-            eval "$(echo -n "" | gnome-keyring-daemon --unlock --components=secrets)"
+            set -euo pipefail
+            eval "$(printf "ci-keyring\n" | gnome-keyring-daemon --unlock --components=secrets --daemonize)"
             export GNOME_KEYRING_CONTROL
+            printf probe | secret-tool store --label=ci-probe ci-probe yes
+            secret-tool clear ci-probe yes
             bash "$RUNNER_TEMP/keychain-e2e.sh"
           '
 

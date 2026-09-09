@@ -59,7 +59,7 @@ signing and writing the Homebrew formula back into the repository.
        cargo clippy -p cryptomator-mount --no-default-features --all-targets --locked -- -D warnings
        cargo +1.89 check --workspace --all-targets --locked
        cargo deny check
-       cargo test -p crypto --test java_interop --locked -- --ignored     # needs a JDK 21+ and Maven
+       cargo test -p crypto --test java_interop --locked -- --ignored     # needs a JDK 25+ and Maven
 
 5. **One dry run of the packaging**, so the first tarball a human sees is not the one users
    download:

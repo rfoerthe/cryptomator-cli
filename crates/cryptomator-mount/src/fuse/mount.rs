@@ -228,11 +228,14 @@ fn retry_while_busy(
     }
 }
 
-#[cfg(test)]
+// Every test below exercises the macOS half of this module (`push_flag`, `macos_ops_config`,
+// `macos_mount_options`, `retry_while_busy`), all of which is `#[cfg(target_os = "macos")]`. The
+// module is gated as a whole rather than test by test: on Linux the per-test gates left `use
+// super::*` importing nothing, which `-D warnings` rejects.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn push_flag_keeps_one_flag_per_key() {
         let mut flags = vec!["-orwsize=262144".to_owned(), "-ononamedattr".to_owned()];
@@ -250,7 +253,6 @@ mod tests {
     /// The AppleDouble sweep is on for both macOS back ends, whatever the flags say: it follows
     /// the platform, like Cryptomator's `deleteAppleDoubleFiles`. `-onoappledouble` is still
     /// parsed, it just does not gate the sweep.
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_apple_double_sweep_is_on_for_every_macos_back_end() {
         use crate::flags::parse_mount_flags;
@@ -283,7 +285,6 @@ mod tests {
 
     /// What reaches `fuse_mount_compat25`: the passthrough options, the volume name and `ro`.
     /// The adapter options must not be among them, the inert ones included.
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_macos_mount_options_carry_ro_and_the_volume_name_but_no_adapter_options() {
         use crate::flags::parse_mount_flags;
@@ -319,7 +320,6 @@ mod tests {
     /// A volume that is only settling becomes free within the retry window; one that is really in
     /// use is reported as busy once the window is over, and every other outcome is passed straight
     /// through.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_busy_unmount_is_retried_until_the_volume_is_free() {
         let attempts = std::cell::Cell::new(0);
@@ -363,7 +363,6 @@ mod tests {
         assert_eq!(calls.get(), 1, "a real failure is not retried");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn unmounting_a_directory_that_is_not_mounted_is_success() {
         let dir = tempfile::tempdir().expect("temp dir");

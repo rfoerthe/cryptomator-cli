@@ -110,7 +110,12 @@ impl Mounted {
         let mut builder = service.for_file_system(fs);
         builder.set_mountpoint(&mountpoint)?;
         builder.set_mount_flags(&service.default_mount_flags())?;
-        builder.set_volume_name(volume_name)?;
+        // Only where the service advertises it, exactly as the app's own mounter does: the Linux
+        // libfuse3 provider has no VOLUME_NAME capability (a volume there is a directory, not a
+        // named disk), and its setter answers "not supported by this mount service".
+        if service.has_capability(MountCapability::VolumeName) {
+            builder.set_volume_name(volume_name)?;
+        }
         if read_only {
             builder.set_read_only(true)?;
         }
