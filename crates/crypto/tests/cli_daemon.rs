@@ -1846,3 +1846,49 @@ fn unlock_store_password_warns_when_the_keychain_refuses() {
         !fx.state_file(".sock").exists() && !fx.state_file(".json").exists()
     });
 }
+
+/// `crypto vault info` and `crypto vault list` used to answer from the vault directory alone --
+/// where ciphertext looks the same locked or unlocked -- and therefore called an unlocked vault
+/// `LOCKED`, contradicting `crypto status` on the very same vault.
+#[test]
+fn vault_info_and_list_report_the_runtime_state_like_status_does() {
+    let fx = Fixture::new("v");
+    let locked = json_out(&fx, &["--json", "vault", "info", "v"]);
+    assert_eq!(locked["state"], "LOCKED");
+    assert!(locked["mountedAt"].is_null(), "{locked}");
+
+    unlock(&fx);
+
+    let status = json_out(&fx, &["--json", "status", "v"]);
+    assert_eq!(status["state"], "UNLOCKED");
+    let info = json_out(&fx, &["--json", "vault", "info", "v"]);
+    assert_eq!(info["state"], "UNLOCKED");
+    assert_eq!(
+        json_out(&fx, &["--json", "vault", "list"])[0]["state"],
+        "UNLOCKED"
+    );
+    fx.crypto_daemon(&["vault", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("UNLOCKED"));
+
+    // The runtime mount point, the one `status` reports -- next to the *configured* `mountPoint`,
+    // which this vault does not have: it is mounted under the default `mountPointsDir`.
+    assert_eq!(info["mountedAt"], status["mountpoint"]);
+    assert!(info["mountPoint"].is_null(), "{info}");
+    fx.crypto_daemon(&["vault", "info", "v"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "mountedAt: {}",
+            status["mountpoint"].as_str().expect("a mount point")
+        )));
+
+    fx.crypto_daemon(&["lock", "v"]).assert().success();
+    let relocked = json_out(&fx, &["--json", "vault", "info", "v"]);
+    assert_eq!(relocked["state"], "LOCKED");
+    assert!(
+        relocked["mountedAt"].is_null(),
+        "a locked vault is mounted nowhere: {relocked}"
+    );
+}

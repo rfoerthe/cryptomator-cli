@@ -198,6 +198,16 @@ impl VaultRegistry {
         })
     }
 
+    /// [`VaultRegistry::runtime_state`] for a settings entry the caller has already loaded, so a
+    /// command that is holding `settings.json` open does not read it a second time just to learn
+    /// whether a daemon is serving the vault.
+    ///
+    /// # Errors
+    /// Anything [`runtime_state_of`](Self::runtime_state_of) reports.
+    pub fn state_of(&self, vault: &VaultSettingsJson) -> Result<(RuntimeState, Option<RunInfo>)> {
+        self.runtime_state_of(&vault.id, vault.path_buf().as_deref())
+    }
+
     /// Every vault in `settings.json`, in the order the file lists them.
     ///
     /// # Errors
