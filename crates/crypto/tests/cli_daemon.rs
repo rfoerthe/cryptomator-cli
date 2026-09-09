@@ -1853,19 +1853,16 @@ fn unlock_store_password_warns_when_the_keychain_refuses() {
 #[test]
 fn vault_info_and_list_report_the_runtime_state_like_status_does() {
     let fx = Fixture::new("v");
-    assert_eq!(
-        json_out(&fx, &["--json", "vault", "info", "v"])["state"],
-        "LOCKED"
-    );
+    let locked = json_out(&fx, &["--json", "vault", "info", "v"]);
+    assert_eq!(locked["state"], "LOCKED");
+    assert!(locked["mountedAt"].is_null(), "{locked}");
 
     unlock(&fx);
 
     let status = json_out(&fx, &["--json", "status", "v"]);
     assert_eq!(status["state"], "UNLOCKED");
-    assert_eq!(
-        json_out(&fx, &["--json", "vault", "info", "v"])["state"],
-        "UNLOCKED"
-    );
+    let info = json_out(&fx, &["--json", "vault", "info", "v"]);
+    assert_eq!(info["state"], "UNLOCKED");
     assert_eq!(
         json_out(&fx, &["--json", "vault", "list"])[0]["state"],
         "UNLOCKED"
@@ -1875,9 +1872,23 @@ fn vault_info_and_list_report_the_runtime_state_like_status_does() {
         .success()
         .stdout(predicates::str::contains("UNLOCKED"));
 
+    // The runtime mount point, the one `status` reports -- next to the *configured* `mountPoint`,
+    // which this vault does not have: it is mounted under the default `mountPointsDir`.
+    assert_eq!(info["mountedAt"], status["mountpoint"]);
+    assert!(info["mountPoint"].is_null(), "{info}");
+    fx.crypto_daemon(&["vault", "info", "v"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "mountedAt: {}",
+            status["mountpoint"].as_str().expect("a mount point")
+        )));
+
     fx.crypto_daemon(&["lock", "v"]).assert().success();
-    assert_eq!(
-        json_out(&fx, &["--json", "vault", "info", "v"])["state"],
-        "LOCKED"
+    let relocked = json_out(&fx, &["--json", "vault", "info", "v"]);
+    assert_eq!(relocked["state"], "LOCKED");
+    assert!(
+        relocked["mountedAt"].is_null(),
+        "a locked vault is mounted nowhere: {relocked}"
     );
 }

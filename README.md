@@ -124,7 +124,7 @@ itself: `fs cat` and `fs get -` always write the raw bytes to standard output, w
 | `vault create` | Creates a vault directory, writes `masterkey.cryptomator`, `vault.cryptomator`, the root dir and the readme files, and registers it | `crypto vault create ~/Vaults/Secret --name Secret` |
 | `vault add` | Registers an existing vault directory | `crypto vault add ~/Vaults/Secret` |
 | `vault list` | Lists registered vaults with id, name, path and state | `crypto vault list --json` |
-| `vault info` | Shows the settings and the vault configuration of one vault | `crypto vault info Secret` |
+| `vault info` | Shows the settings, the vault configuration and the state of one vault | `crypto vault info Secret` |
 | `vault set` | Changes per-vault settings (mount point, mounter, flags, auto-lock, …) | `crypto vault set Secret --mount-point ~/mnt/secret --read-only true` |
 | `vault remove` | Unregisters a vault; its files stay on disk | `crypto vault remove Secret` |
 | `config get` | Prints one or all settings, from `settings.json` and `cli.json` together | `crypto config get port` |
@@ -611,6 +611,13 @@ The states are `LOCKED`, `UNLOCKED`, `STALE_MOUNT`, `MISSING`, `VAULT_CONFIG_MIS
 same registry and report the same state for the same vault, so no two commands disagree about
 whether a vault is unlocked. Naming a vault that is not registered is exit `3`; without an argument
 the output is an array, with one it is that vault's object.
+
+`crypto vault info` shows the mount point under `mountedAt` — where the volume *is* mounted, `-`
+unless a daemon is serving the vault. Do not confuse it with `mountPoint` further down, which is
+the mount point `crypto vault set --mount-point` configured and stays `-` for a vault that takes
+the default under `mountPointsDir`. The other runtime values of an unlocked vault — `mounter`,
+`pid` and `readOnly` — are `crypto status --json`'s; `mountService`, `usesReadOnlyMode` and `port`
+in `vault info` are the configured ones.
 
 `crypto stats` and `crypto events` ask the daemon, so they need the vault to be **unlocked** (exit
 `5` otherwise, exit `10` if the daemon is gone):

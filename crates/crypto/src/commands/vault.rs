@@ -28,17 +28,30 @@ pub fn key_loader_scheme(vault_path: &Path) -> Option<String> {
     })
 }
 
-/// The state as `crypto status` reports it: what the vault directory says, corrected by what the
-/// state directory says about a running daemon. Going through the registry rather than
+/// The settings entry as JSON, plus what the state directory says about the vault right now.
+///
+/// `state` is the one `crypto status` reports: what the vault directory says, corrected by what
+/// the state directory says about a running daemon. Going through the registry rather than
 /// [`cryptomator_core::determine_vault_state`] alone is what keeps `vault info` from calling an
 /// unlocked vault `LOCKED` -- the ciphertext on disk looks the same either way.
+///
+/// `mountedAt` and `mountPoint` are two different things and both are here on purpose: the first
+/// is where the volume *is* mounted (`null` unless a daemon is serving it), the second the mount
+/// point `vault set --mount-point` configured, which is `null` for a vault that takes the default
+/// under `mountPointsDir`.
 pub fn vault_json(registry: &VaultRegistry, vault: &VaultSettingsJson) -> Result<Value> {
-    let (state, _) = registry.state_of(vault)?;
+    let (state, run_info) = registry.state_of(vault)?;
+    // `is_mounted`, the same guard `VaultRegistry::info_of` uses: a run info that outlived its
+    // daemon would otherwise report a mount point that is not there any more.
+    let mounted_at = run_info
+        .filter(|_| state.is_mounted())
+        .and_then(|i| i.mountpoint);
     let mut value = json!({
         "id": vault.id,
         "displayName": vault.display_name,
         "path": vault.path,
         "state": state.as_str(),
+        "mountedAt": mounted_at,
         "mountPoint": vault.mount_point,
         "usesReadOnlyMode": vault.uses_read_only_mode,
         "mountFlags": vault.mount_flags,
@@ -71,6 +84,7 @@ fn human_info(value: &Value) -> String {
         "displayName",
         "path",
         "state",
+        "mountedAt",
         "keyType",
         "keyId",
         "format",

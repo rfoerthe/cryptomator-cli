@@ -7,6 +7,10 @@
   alone, where ciphertext looks the same whether or not a daemon serves it, and `VaultState` has no
   unlocked variant at all to report. All three now take their state from the same `VaultRegistry`
   that `status` uses, so they also report `UNLOCKED` and `STALE_MOUNT`.
+- Added: `crypto vault info` shows `mountedAt`, the mount point of a vault a daemon is serving --
+  the value `crypto status` reports. The existing `mountPoint` is unchanged and keeps its meaning:
+  the mount point configured with `crypto vault set --mount-point`, empty for a vault that takes
+  the default under `mountPointsDir`.
 - CI: every JavaScript action moves to a major that runs on Node 24, which is what the
   per-job deprecation annotation on every run was asking for -- `actions/checkout` v4 to v7,
   `actions/setup-java` v4 to v6, `actions/upload-artifact` v4 to v7, `actions/download-artifact`
