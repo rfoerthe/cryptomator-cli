@@ -6,12 +6,19 @@ use predicates::prelude::*;
 
 #[test]
 fn version_flag_prints_name_and_version() {
+    // Derived, not spelled out: `docs/release.md` step 2 promises that `workspace.package.version`
+    // is the only place the version is named, and a literal here would make that false -- it would
+    // have to be bumped by hand with every release, and the gate in step 4 is where that would be
+    // noticed. `CARGO_PKG_VERSION` is `crypto`'s own version, the one the binary prints.
     Command::cargo_bin("crypto")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::starts_with("crypto 0.1.0"));
+        .stdout(predicate::str::starts_with(concat!(
+            "crypto ",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[test]
