@@ -75,7 +75,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `fusermount3` is what the Linux provider probes for and what fuser calls to mount.
-      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      # `-o Dir::Etc::sourceparts="-"` limits the update to /etc/apt/sources.list, the Ubuntu
+      # archive. The runner image also carries vendor repositories in /etc/apt/sources.list.d
+      # (Chrome, Microsoft) that this job needs nothing from, and an inconsistent index in any one
+      # of them fails `apt-get update` with exit 100 -- which is how both Linux e2e jobs died on
+      # 2026-09-09, on a Chrome `Packages.gz` that did not match its own `Release` file.
+      - run: sudo apt-get update -o Dir::Etc::sourceparts="-" && sudo apt-get install -y fuse3
       - run: CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored
       # The same proof one level up: `crypto unlock` must not answer before the volume is visible.
       - run: CRYPTO_E2E_MOUNT=1 cargo test -p crypto --test cli_daemon --locked -- --ignored
@@ -174,7 +179,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `libsecret-tools` is what provides `secret-tool`; `dbus-x11` provides `dbus-run-session`.
-      - run: sudo apt-get update && sudo apt-get install -y gnome-keyring libsecret-tools dbus-x11
+      # `-o Dir::Etc::sourceparts="-"`: the Ubuntu archive only, for the reason spelled out on the
+      # same flag in `mount-e2e-linux` above.
+      - run: sudo apt-get update -o Dir::Etc::sourceparts="-" && sudo apt-get install -y gnome-keyring libsecret-tools dbus-x11
       - run: cargo build --locked -p crypto
       # The script is written to a file rather than inlined into `bash -c '...'`: it contains both
       # quote characters, and one wrong nesting level would silently change what is asserted.

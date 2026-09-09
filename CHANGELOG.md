@@ -20,6 +20,11 @@
 - Docs: the install instructions no longer say `brew install --formula <path>`. Homebrew installs a
   formula only from a tap and rejects a file path outright, so README.md and `docs/release.md` show
   the `brew tap-new` / copy / `brew install <tap>/crypto` route instead.
+- CI: `mount-e2e-linux` and `keychain-e2e-linux` update the package lists of the Ubuntu archive
+  only (`apt-get update -o Dir::Etc::sourceparts="-"`). The runner image carries vendor
+  repositories these jobs need nothing from, and an inconsistent index in one of them fails
+  `apt-get update` with exit 100 before a single package is installed -- which is what took both
+  jobs down on 2026-09-09, on a Chrome `Packages.gz` that did not match its own `Release` file.
 
 ## 0.1.0 – 2026-09-09
 
