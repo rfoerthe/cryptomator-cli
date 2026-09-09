@@ -7,6 +7,9 @@
   `actions/setup-java` v4 to v6, `actions/upload-artifact` v4 to v7, `actions/download-artifact`
   v4 to v8 and `softprops/action-gh-release` v2 to v3. `Swatinem/rust-cache` already ran on
   Node 24, `cargo-deny-action` is a Docker action and `dtolnay/rust-toolchain` a composite one.
+- CI: Dependabot watches `.github/workflows` weekly and opens one grouped pull request for new
+  action majors, so the next runtime deprecation arrives as a pull request rather than as an
+  annotation on every job.
 
 ## 0.1.0 – 2026-09-09
 

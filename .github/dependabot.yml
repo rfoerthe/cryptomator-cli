@@ -1,0 +1,24 @@
+# Dependabot watches the two workflows for new action majors, so that a runtime deprecation --
+# the Node 20 one that put an annotation on every job of every run -- arrives as a pull request
+# instead of as noise nobody gets around to reading.
+#
+# A pull request from here is expected to be red at first. `every_action_is_pinned_to_a_tag_from_
+# the_allow_list` in `xtask/tests/workflows.rs` keeps an allow-list of every action either
+# workflow may use, and Dependabot does not know about it. That failure is the point: a new major
+# runs third-party code with the job's token, so it is reviewed and then written into the
+# allow-list by hand, in the same pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # `/` means the workflows in `.github/workflows`, not a directory called `/`.
+    directory: /
+    schedule:
+      interval: weekly
+    # One pull request for all of them. The allow-list above has to be edited by hand either way,
+    # and doing it once beats doing it per action.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
