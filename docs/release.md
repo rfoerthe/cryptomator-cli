@@ -139,8 +139,10 @@ finish or cancel it by hand.
 
    That test reads the four `sha256` values back out of the committed file and re-renders
    everything around them, so it passes both before the back-port (placeholders) and after it (the
-   release's hashes). A bare `cargo xtask formula --write` puts the placeholders back, though: once
-   real checksums are committed, re-render with the four `--sha256-…` flags or not at all.
+   release's hashes). Mind what a bare `cargo xtask formula --write` does, though: it puts the
+   placeholders back. That is what step 2.3 above wants -- a version whose release does not exist
+   yet has no checksums -- but for the version that was just released it undoes this back-port,
+   so re-render *that* one with the four `--sha256-…` flags or not at all.
 
    Until that pull request is merged, `packaging/homebrew/crypto.rb` carries checksums of nothing
    but zeroes and no `brew install` of it can succeed. If the formula also lives in
