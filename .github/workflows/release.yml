@@ -17,10 +17,10 @@
 #
 # The artefact layout, which the paths below depend on
 #
-#   `upload-artifact@v4` roots an artefact at the least common ancestor of the paths it is given.
+#   `upload-artifact@v7` roots an artefact at the least common ancestor of the paths it is given.
 #   `build` uploads the single file `target/<triple>/release/crypto`, so the artefact
 #   `crypto-<triple>` contains exactly `crypto` at its root -- *not* `target/<triple>/release/`.
-#   `download-artifact@v4` with `pattern:` then writes `artifacts/crypto-<triple>/crypto`, and with
+#   `download-artifact@v8` with `pattern:` then writes `artifacts/crypto-<triple>/crypto`, and with
 #   `name:` it writes the artefact's contents directly into `path`. The zip format carries no
 #   permissions, so every downloaded binary is `chmod +x`-ed before it is used.
 #
@@ -91,7 +91,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # A `workflow_dispatch` re-run must build the tag it is given, not the default branch.
           ref: ${{ inputs.tag || github.ref }}
@@ -112,7 +112,7 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
       # Only the binary travels. `package` and `deb` pack it without rebuilding, so what a user
       # downloads is bit-for-bit what this job compiled.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: crypto-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/crypto
@@ -125,13 +125,13 @@ jobs:
     needs: build
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: crypto-*
           path: artifacts
@@ -195,7 +195,7 @@ jobs:
             cat target/dist/crypto.rb
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages
           path: |
@@ -219,7 +219,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -234,7 +234,7 @@ jobs:
       # version the packaging metadata was written against.
       - name: install cargo-deb
         run: cargo install cargo-deb --locked --version 3.8.0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: crypto-${{ matrix.target }}
           path: prebuilt
@@ -259,7 +259,7 @@ jobs:
           crypto --version
           crypto completions zsh | head -1
           dpkg -L crypto | grep -E 'man1/crypto\.1|bash-completion'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.target }}
           path: target/dist/*.deb
@@ -273,14 +273,14 @@ jobs:
       contents: write
     steps:
       # For CHANGELOG.md, which is where the release notes come from.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: packages
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: deb-*
           path: deb
@@ -314,7 +314,7 @@ jobs:
             exit 1
           fi
           cat notes.md
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         env:
           # The job's own token, scoped by `permissions:` above to `contents: write`. No step in
           # this workflow enables shell tracing, so it cannot reach a log.

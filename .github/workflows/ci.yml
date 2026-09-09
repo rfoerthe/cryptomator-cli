@@ -24,7 +24,7 @@ jobs:
       # no-op today; it is here so that a test added without that helper still finds the mounter.
       CRYPTO_ENABLE_NULL_MOUNTER: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -45,10 +45,10 @@ jobs:
   interop-java:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           # 25, not 21: cryptofs 2.10.0 ships class file version 69, which only a JDK 25 or newer
@@ -71,7 +71,7 @@ jobs:
   mount-e2e-linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `fusermount3` is what the Linux provider probes for and what fuser calls to mount.
@@ -88,7 +88,7 @@ jobs:
     runs-on: macos-15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: brew install --cask macos-fuse-t/homebrew-cask/fuse-t
@@ -110,7 +110,7 @@ jobs:
     runs-on: macos-15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: CRYPTO_E2E_WEBDAV=1 cargo test -p cryptomator-mount --test webdav_e2e --locked -- --ignored --nocapture
@@ -124,7 +124,7 @@ jobs:
   webdav-e2e-linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p crypto
@@ -170,7 +170,7 @@ jobs:
     runs-on: ubuntu-22.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `libsecret-tools` is what provides `secret-tool`; `dbus-x11` provides `dbus-run-session`.
@@ -286,7 +286,7 @@ jobs:
     runs-on: macos-15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: CRYPTO_E2E_KEYCHAIN=1 cargo test -p cryptomator-app --test keychain_e2e --locked -- --ignored --nocapture
@@ -300,7 +300,7 @@ jobs:
   supply-chain:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -319,7 +319,7 @@ jobs:
   msrv:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
         with:
