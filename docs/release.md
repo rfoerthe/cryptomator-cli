@@ -118,7 +118,9 @@ need.
 **A run that failed halfway can be repeated without a new tag.** *Actions → Release → Run workflow*
 takes the tag name as its input, and every job checks out `${{ inputs.tag || github.ref }}`, so the
 re-run builds the tag and not the default branch. The two runs do not race — `concurrency` groups
-them — but a re-run replaces the draft's assets, so let the first one finish or cancel it by hand.
+them by `inputs.tag || github.ref_name`, so a tag push (`refs/tags/v0.1.0`) and a dispatched re-run
+(`v0.1.0`) land in the same group — but a re-run replaces the draft's assets, so let the first one
+finish or cancel it by hand.
 
 ## After the workflow
 

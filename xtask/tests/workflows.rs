@@ -182,9 +182,12 @@ fn every_build_row_installs_and_builds_its_own_target() {
 
 /// A `workflow_dispatch` re-run for a tag and the tag push it repeats must land in *one*
 /// concurrency group, or the two write assets into the same draft at the same time. On a dispatch
-/// `github.ref` is the ref the run was started from (`refs/heads/main`), so the group has to
-/// prefer `inputs.tag` -- exactly the expression `docs/release.md` promises ("The two runs do not
-/// race -- `concurrency` groups them").
+/// `github.ref` is the ref the run was started from (`refs/heads/main`) and `github.ref_name` is
+/// the plain tag name (`v0.1.0`) -- matching `inputs.tag`, which also carries no `refs/tags/`
+/// prefix -- so the group has to prefer `inputs.tag` and fall back to `github.ref_name`, not
+/// `github.ref`, or a tag push (`refs/tags/v0.1.0`) and a dispatched re-run (`v0.1.0`) would land
+/// in different groups. This is exactly the expression `docs/release.md` promises ("The two runs
+/// do not race -- `concurrency` groups them").
 #[test]
 fn a_dispatched_re_run_shares_the_concurrency_group_of_the_tag_push() {
     let script = r##"
@@ -196,9 +199,16 @@ fn a_dispatched_re_run_shares_the_concurrency_group_of_the_tag_push() {
         return;
     };
     let mut lines = out.lines();
-    assert_eq!(
-        lines.next().map(str::trim),
-        Some("release-${{ inputs.tag || github.ref }}")
+    let group = lines.next().map(str::trim).unwrap_or_default();
+    assert_eq!(group, "release-${{ inputs.tag || github.ref_name }}");
+    assert!(
+        group.contains("inputs.tag") && group.contains("github.ref_name"),
+        "the group must fall back to the plain tag name, not the full ref: {group:?}"
+    );
+    assert!(
+        !group.contains("github.ref}}"),
+        "the group must not fall back to `github.ref`, which differs from `inputs.tag` on a \
+         dispatched re-run: {group:?}"
     );
     assert_eq!(
         lines.next().map(str::trim),
