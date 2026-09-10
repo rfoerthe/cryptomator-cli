@@ -1,90 +1,90 @@
-# Spike B: Desktop-Keychain-Eintrag lesen (macOS)
+# Spike B: reading a desktop keychain entry (macOS)
 
-Frage: Kann `security-framework` (Generic Password, Service `Cryptomator`, Account = Vault-ID) die Einträge von Cryptomator.app lesen?
+Question: can `security-framework` (generic password, service `Cryptomator`, account = vault ID) read the entries written by Cryptomator.app?
 
-Durchführung: Geplant war ein Lauf `cargo run -p cryptomator-app --example spike_keychain -- <vault-id>`
-gegen einen Eintrag der installierten Desktop-App. Ein solcher Eintrag existierte nicht (siehe Beobachtung 1),
-daher lief der Spike gegen den im Brief vorgesehenen Wegwerf-Eintrag `spike-test-id`, den `/usr/bin/security`
-angelegt hat — zusätzlich einmal gegen die echte Vault-ID `OefwgtaX5vsy`, die erwartungsgemäß
-`errSecItemNotFound` lieferte. Die im Brief geforderte Gegenprobe (`security find-generic-password ... -w | wc -c`
-= N+1) konnte **nicht** abgeschlossen werden, weil das Rust-Programm nie ein N ausgegeben hat; der
-menschlich begleitete Wiederholungslauf muss dieses N nachliefern.
+Execution: the plan was a run of `cargo run -p cryptomator-app --example spike_keychain -- <vault-id>`
+against an entry of the installed desktop app. No such entry existed (see observation 1),
+so the spike ran against the throwaway entry `spike-test-id` foreseen in the brief, created by
+`/usr/bin/security` — plus one run against the real vault ID `OefwgtaX5vsy`, which returned
+`errSecItemNotFound` as expected. The cross-check the brief asked for (`security find-generic-password ... -w | wc -c`
+= N+1) could **not** be completed, because the Rust program never printed an N; the
+human-accompanied repeat run has to supply that N.
 
-Umgebung: macOS 26.6.2 (25G83), Apple Silicon, Cryptomator Desktop `writtenByVersion` = `1.19.3-dmg-6495`,
+Environment: macOS 26.6.2 (25G83), Apple Silicon, Cryptomator Desktop `writtenByVersion` = `1.19.3-dmg-6495`,
 `keychainProvider` = `org.cryptomator.macos.keychain.MacSystemKeychainAccess`, `useKeychain` = `true`,
-`security-framework` 3.7, Debug-Build (`target/debug/examples/spike_keychain`), nicht-interaktive Session.
+`security-framework` 3.7, debug build (`target/debug/examples/spike_keychain`), non-interactive session.
 
-## Ergebnis: BLOCKED
+## Result: BLOCKED
 
-Ein erfolgreicher Lesevorgang konnte **nicht** beobachtet werden — nicht wegen der API, sondern weil macOS
-für jeden Zugriff einen modalen Keychain-Bestätigungsdialog anzeigt, den in dieser Session niemand
-beantworten konnte. Das ist ausdrücklich **kein NO-GO**: Der Eintrag wurde gefunden und eine
-Entschlüsselungsanfrage hat securityd erreicht, das nun auf die ACL-Freigabe wartet. Die Entschlüsselung
-selbst ist damit angefordert, aber nicht abgeschlossen.
+A successful read could **not** be observed — not because of the API, but because for every access macOS
+shows a modal keychain confirmation dialog that nobody in this session could
+answer. This is explicitly **not a NO-GO**: the entry was found and a
+decryption request reached securityd, which is now waiting for the ACL approval. The decryption
+itself has therefore been requested, but not completed.
 
-## Beobachtungen
+## Observations
 
-1. **Kein echter Desktop-Eintrag vorhanden.** `settings.json` listet genau einen Vault
-   (`OefwgtaX5vsy`, „Tresor"). Weder für diese ID noch für den Service insgesamt existiert ein Eintrag:
-   `security find-generic-password -s Cryptomator [-a OefwgtaX5vsy]` → Exit 44 (`errSecItemNotFound`).
-   Die Desktop-App hat also nie eine Passphrase gespeichert. Der Spike konnte deshalb **nicht** gegen einen
-   von Cryptomator.app geschriebenen Eintrag laufen; getestet wurde mit dem im Brief vorgesehenen
-   Wegwerf-Eintrag `spike-test-id`.
-2. **Lookup-Pfad und Fehler-Mapping stimmen.** Gegen die echte Vault-ID meldet das Beispiel
+1. **No real desktop entry present.** `settings.json` lists exactly one vault
+   (`OefwgtaX5vsy`, "Tresor"). Neither for that ID nor for the service as a whole does an entry exist:
+   `security find-generic-password -s Cryptomator [-a OefwgtaX5vsy]` → exit 44 (`errSecItemNotFound`).
+   So the desktop app has never stored a passphrase. The spike could therefore **not** run against an
+   entry written by Cryptomator.app; what was tested is the throwaway entry
+   `spike-test-id` foreseen in the brief.
+2. **Lookup path and error mapping are correct.** Against the real vault ID the example reports
    `keychain lookup failed: The specified item could not be found in the keychain. (code -25300)`
-   — `errSecItemNotFound`, identisch zum `security`-CLI. Service/Account-Auflösung und `Error::code()`
-   funktionieren also wie erwartet.
-3. **Der Eintrag selbst ist lesbar.** Gegenprobe über das CLI:
+   — `errSecItemNotFound`, identical to the `security` CLI. Service/account resolution and `Error::code()`
+   therefore work as expected.
+3. **The entry itself is readable.** Cross-check via the CLI:
    `security find-generic-password -s Cryptomator -a spike-test-id -w | wc -c` → `15`
-   (14 Bytes Passwort + Newline). Das `security`-Tool steht in der ACL des von ihm angelegten Items und
-   fragt daher nicht nach.
-4. **Der Rust-Aufruf blockiert im ACL-Dialog.** `sample` auf den hängenden Prozess zeigt den Main-Thread in
+   (14 bytes of password + newline). The `security` tool is in the ACL of the item it created itself and
+   therefore does not ask.
+4. **The Rust call blocks in the ACL dialog.** `sample` on the hanging process shows the main thread in
    `security_framework::passwords::get_generic_password` → `SecItemCopyMatching` →
    `SecItemCopyMatching_osx` → `AddItemResults` → `SecKeychainItemCopyContent` → `ItemImpl::getContent` →
    `SSDbUniqueRecordImpl::get` → `SSGroupImpl::decodeDataBlob` → `CSSM_DecryptDataFinal` →
-   `ClientSession::decrypt` → `mach_msg`. Der Eintrag wurde also gefunden und eine Entschlüsselungsanfrage
-   hat securityd erreicht; securityd wartet auf die Benutzerbestätigung, die Entschlüsselung ist noch
-   **nicht** abgeschlossen. Parallel läuft ein `SecurityAgent`-Prozess.
-5. **Kein Timeout in der API.** Der Aufruf hängt unbegrenzt. Nach 180 s wurde er abgebrochen
-   (kein Retry-Loop). Auch die Varianten mit `-A` (alle Programme erlauben) und
-   `-T <pfad-zum-binary>` (Binary als vertrauenswürdige App eintragen) haben den Dialog **nicht**
-   unterdrückt; beide liefen in denselben Timeout. Für `-T` wäre eine unzureichende Signatur des
-   ad-hoc signierten Debug-Binarys eine plausible Erklärung — für `-A` (ACL „allow any", ganz ohne
-   Programmliste) erklärt sie **nichts**. Das `-A`-Ergebnis bleibt daher **ungeklärt**. Naheliegender
-   Störfaktor: Aus dem ersten hängenden Lauf stand noch ein unbeantworteter `SecurityAgent`-Dialog offen;
-   ob er vor den Zusatzvarianten geschlossen und der hängende Prozess beendet wurde, ist nicht
-   dokumentiert — ein blockierter Autorisierungs-Kontext könnte die Folgeläufe unabhängig von der ACL
-   aufgehalten haben. Die Varianten müssen im begleiteten Wiederholungslauf sauber getrennt (Dialog
-   jeweils beantwortet, hängender Prozess beendet) wiederholt werden.
-6. **Aufräumen erfolgt.** `spike-test-id` wurde gelöscht; die Login-Keychain enthält wieder keinen Eintrag
-   mit Service `Cryptomator` (Ausgangszustand). Bestehende Einträge wurden zu keinem Zeitpunkt verändert.
+   `ClientSession::decrypt` → `mach_msg`. The entry was therefore found and a decryption request
+   reached securityd; securityd is waiting for the user confirmation, the decryption is
+   **not** complete. A `SecurityAgent` process is running alongside.
+5. **No timeout in the API.** The call hangs indefinitely. After 180 s it was aborted
+   (no retry loop). The variants with `-A` (allow all programs) and
+   `-T <path-to-binary>` (register the binary as a trusted app) did **not** suppress the dialog
+   either; both ran into the same timeout. For `-T`, an insufficient signature of the
+   ad-hoc-signed debug binary would be a plausible explanation — for `-A` (ACL "allow any", with no
+   program list at all) it explains **nothing**. The `-A` result therefore remains **unexplained**. An obvious
+   confounder: from the first hanging run an unanswered `SecurityAgent` dialog was still open;
+   whether it was closed and the hanging process killed before the additional variants is not
+   documented — a blocked authorisation context could have held up the subsequent runs regardless of
+   the ACL. The variants have to be repeated in the accompanied repeat run, cleanly separated (dialog
+   answered each time, hanging process killed).
+6. **Cleanup done.** `spike-test-id` was deleted; the login keychain again contains no entry
+   with service `Cryptomator` (the initial state). Existing entries were never modified.
 
-## Konsequenz für M6
+## Consequence for M6
 
-`security-framework` **direkt verwenden** — der Pfad `SecItemCopyMatching` über Service `Cryptomator` +
-Account = Vault-ID ist der erwartete richtige Zugriffsweg (**erwartet, nicht gemessen**: ein erfolgreicher
-Lesevorgang wurde in diesem Spike nie beobachtet; belegt sind nur Lookup und Fehler-Mapping). Ein Wechsel
-auf eine andere Crate oder auf FFI würde am Kernproblem nichts ändern. Der ACL-Dialog ist mit hoher
-Wahrscheinlichkeit eine macOS-Eigenschaft des Items und kein API-Problem: Ein von Cryptomator.app
-geschriebener Eintrag gehört ACL-seitig Cryptomator.app, `crypto` ist ein anderes Programm und dürfte
-deshalb beim ersten Zugriff nachfragen. Das ist **plausibel, aber ungetestet** — der einzige im Spike
-verwendete Eintrag wurde von `/usr/bin/security` angelegt, nicht von Cryptomator.app.
+**Use `security-framework` directly** — the path `SecItemCopyMatching` via service `Cryptomator` +
+account = vault ID is the expected correct way in (**expected, not measured**: a successful
+read was never observed in this spike; only the lookup and the error mapping are proven). Switching
+to another crate or to FFI would change nothing about the core problem. The ACL dialog is with high
+probability a macOS property of the item and not an API problem: an entry written by
+Cryptomator.app belongs, ACL-wise, to Cryptomator.app, `crypto` is a different program and should
+therefore prompt on first access. That is **plausible, but untested** — the only entry used in the
+spike was created by `/usr/bin/security`, not by Cryptomator.app.
 
-Daraus folgt für die Implementierung:
+For the implementation this means:
 
-- Keychain-Zugriff ist **interaktiv und darf niemals unbegrenzt blockieren**: in einem Worker-Thread mit
-  Timeout ausführen und bei Ablauf sauber auf die übrigen Passwort-Quellen (`--password-stdin`,
-  `--password-file`, `--password-env`, `CRYPTO_PASSWORD`, TTY-Prompt) zurückfallen.
-- Headless/SSH ohne GUI-Session kann sich **nicht** auf die Keychain verlassen; das muss dokumentiert und
-  in der Fehlermeldung benannt werden („im Dialog ‚Immer erlauben' wählen").
-- Für „Immer erlauben" über Updates hinweg ist eine **stabile Code-Signing-Identität** des Release-Binarys
-  zu **empfehlen** (sonst dürfte der Dialog nach jedem neu signierten Build erneut erscheinen). Der Spike
-  hat das nicht belegt — wie stark die Signatur den Dialog überhaupt beeinflusst, ist offen (Beobachtung 5).
-- `errSecItemNotFound` (-25300) ist der Normalfall „keine Passphrase gespeichert" und muss als solcher
-  behandelt werden, nicht als Fehler.
+- Keychain access is **interactive and must never block indefinitely**: run it on a worker thread with a
+  timeout and, when it expires, fall back cleanly to the remaining password sources (`--password-stdin`,
+  `--password-file`, `--password-env`, `CRYPTO_PASSWORD`, TTY prompt).
+- Headless/SSH without a GUI session **cannot** rely on the keychain; that has to be documented and
+  named in the error message ("choose 'Always Allow' in the dialog").
+- For "Always Allow" to survive updates, a **stable code-signing identity** for the release binary is
+  to be **recommended** (otherwise the dialog should reappear after every newly signed build). The spike
+  did not prove this — how strongly the signature affects the dialog at all is open (observation 5).
+- `errSecItemNotFound` (-25300) is the normal case "no passphrase stored" and has to be
+  treated as such, not as an error.
 
-**Offen / vor M6 nachzuholen:** Der Spike muss einmal gegen einen echten, von Cryptomator.app
-geschriebenen Eintrag wiederholt werden, wobei ein Mensch den Dialog mit „Immer erlauben" bestätigt. Erst
-dann ist belegt, dass Länge und UTF-8-Kodierung der Desktop-Passphrase wie erwartet ankommen. Derselbe
-Lauf muss die im Brief geforderte Gegenprobe `wc -c` = N+1 nachholen und die ACL-Varianten (`-A`, `-T`)
-einzeln und mit jeweils zuvor geschlossenem Dialog erneut prüfen.
+**Open / to be made up before M6:** the spike has to be repeated once against a real entry written by
+Cryptomator.app, with a human confirming the dialog with "Always Allow". Only
+then is it proven that the length and UTF-8 encoding of the desktop passphrase arrive as expected. The same
+run has to make up the cross-check `wc -c` = N+1 required by the brief and re-check the ACL variants (`-A`, `-T`)
+individually, each with the dialog closed beforehand.

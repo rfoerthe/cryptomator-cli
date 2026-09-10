@@ -1,45 +1,45 @@
-# M0 + M1: Gerüst, Spikes und Core-Krypto – Implementation Plan
+# M0 + M1: Scaffold, Spikes and Core Crypto – Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Cargo-Workspace für `crypto` aufsetzen, die beiden Go/No-Go-Spikes (FUSE-T via dlopen, Desktop-Keychain lesen) durchführen und `cryptomator-core` mit dem vollständigen Vault-Format-8-Kryptokern (Masterkey-Datei, Vault-Config-JWT, Dateinamen, Header/Chunks beider Cipher-Combos, Streams, Backups, Recovery-Key) als 1:1-Port von cryptolib 2.2.2 / cryptofs 2.10.0 liefern, verifiziert gegen Known-Answer-Vektoren aus der echten Java-Bibliothek.
+**Goal:** Set up the Cargo workspace for `crypto`, run the two go/no-go spikes (FUSE-T via dlopen, reading the desktop keychain) and deliver `cryptomator-core` with the complete vault format 8 crypto core (masterkey file, vault config JWT, file names, header/chunks of both cipher combos, streams, backups, recovery key) as a 1:1 port of cryptolib 2.2.2 / cryptofs 2.10.0, verified against known-answer vectors from the real Java library.
 
-**Architecture:** Workspace mit vier Crates (`cryptomator-core` reine Logik, `cryptomator-mount`, `cryptomator-app`, Binary `crypto`). In M1 wird nur `cryptomator-core` gefüllt; alle Zufallswerte laufen über ein `Rng`-Trait, damit Tests mit einem deterministischen RNG byte-genau die Java-Ausgaben reproduzieren. Java-Tests existieren nicht in den Sources-JARs; alle KAT-Vektoren unten wurden am 2026-09-04 per jshell aus cryptolib 2.2.2 / cryptofs 2.10.0 erzeugt (Masterkey = Bytes 00..3f, deterministischer RNG `byte n = 0xA0 + (n & 0x3F)`).
+**Architecture:** Workspace with four crates (`cryptomator-core` pure logic, `cryptomator-mount`, `cryptomator-app`, binary `crypto`). M1 only fills `cryptomator-core`; all random values go through an `Rng` trait so that tests with a deterministic RNG reproduce the Java output byte for byte. The sources JARs contain no Java tests; all KAT vectors below were generated on 2026-09-04 via jshell from cryptolib 2.2.2 / cryptofs 2.10.0 (masterkey = bytes 00..3f, deterministic RNG `byte n = 0xA0 + (n & 0x3F)`).
 
-**Tech Stack:** Rust stable ≥ 1.85 (cargo 1.98 lokal), RustCrypto-Generation digest 0.11: aes-siv 0.8, aes-gcm 0.11, aes 0.9, ctr 0.10, hmac 0.13, sha1 0.11, sha2 0.11, scrypt 0.12, aes-kw 0.3; data-encoding 2.11, serde/serde_json (preserve_order), uuid 1 (v4), zeroize 1.9, getrandom 0.4, crc32fast 1.5, thiserror 2, clap 4.6, fuser 0.18 (ohne libfuse-Feature), libloading 0.9, security-framework 3.7, tempfile 3, assert_cmd 2. Java 21+ mit Maven für den Fixture-Generator.
+**Tech Stack:** Rust stable ≥ 1.85 (cargo 1.98 locally), RustCrypto-Generation digest 0.11: aes-siv 0.8, aes-gcm 0.11, aes 0.9, ctr 0.10, hmac 0.13, sha1 0.11, sha2 0.11, scrypt 0.12, aes-kw 0.3; data-encoding 2.11, serde/serde_json (preserve_order), uuid 1 (v4), zeroize 1.9, getrandom 0.4, crc32fast 1.5, thiserror 2, clap 4.6, fuser 0.18 (without the libfuse feature), libloading 0.9, security-framework 3.7, tempfile 3, assert_cmd 2. Java 21+ with Maven for the fixture generator.
 
 **Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`
 
 ## Global Constraints
 
-- Lizenz AGPL-3.0-only; jede Crate trägt `license = "AGPL-3.0-only"`.
-- Arbeitsverzeichnis für alle Befehle: `/Users/rfoerthe/work/cryptomator-cli` (eigenes Git-Repo, Branch `main`).
-- Java-Vorlagen: `~/.m2/repository/org/cryptomator/cryptolib/2.2.2/cryptolib-2.2.2-sources.jar`, `~/.m2/repository/org/cryptomator/cryptofs/2.10.0/cryptofs-2.10.0-sources.jar` (lesen mit `unzip -p <jar> <pfad>`).
-- AES-SIV-Schlüssel für RustCrypto = `macKey ‖ encKey` (cryptolib übergibt encKey als CTR-Key und macKey als S2V-Key).
-- Masterkey-Layout: `raw[0..32]` = encKey, `raw[32..64]` = macKey.
-- Passphrasen als `&str` (UTF-8); NFC-Normalisierung ist Aufgabe der App-Schicht (nicht M1).
-- Alle Fehler in `cryptomator-core` sind `CoreError` (thiserror); keine `unwrap()` auf Eingabedaten.
-- Commits: pro Task ein Commit, Nachricht endet mit `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
-- `cargo fmt` und `cargo clippy --workspace --all-targets -- -D warnings` müssen vor jedem Commit sauber sein.
-- Kein FUSE ist auf dem Mac installiert. Spike A (Task 3) ist nur ausführbar, nachdem der User `brew install --cask macos-fuse-t/homebrew-cask/fuse-t` (oder macFUSE) installiert hat; der Spike-Code wird trotzdem geschrieben und kompiliert.
+- License AGPL-3.0-only; every crate carries `license = "AGPL-3.0-only"`.
+- Working directory for all commands: `/Users/rfoerthe/work/cryptomator-cli` (its own git repo, branch `main`).
+- Java originals: `~/.m2/repository/org/cryptomator/cryptolib/2.2.2/cryptolib-2.2.2-sources.jar`, `~/.m2/repository/org/cryptomator/cryptofs/2.10.0/cryptofs-2.10.0-sources.jar` (read them with `unzip -p <jar> <pfad>`).
+- AES-SIV key for RustCrypto = `macKey ‖ encKey` (cryptolib passes encKey as the CTR key and macKey as the S2V key).
+- Masterkey layout: `raw[0..32]` = encKey, `raw[32..64]` = macKey.
+- Passphrases as `&str` (UTF-8); NFC normalization is the app layer's job (not M1).
+- All errors in `cryptomator-core` are `CoreError` (thiserror); no `unwrap()` on input data.
+- Commits: one commit per task, message ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- `cargo fmt` and `cargo clippy --workspace --all-targets -- -D warnings` must be clean before every commit.
+- No FUSE is installed on the Mac. Spike A (task 3) can only be run after the user has installed `brew install --cask macos-fuse-t/homebrew-cask/fuse-t` (or macFUSE); the spike code is written and compiled anyway.
 
 ---
 
-## Dateistruktur (M0 + M1)
+## File Structure (M0 + M1)
 
 ```
-Cargo.toml                                   Workspace, gemeinsame Dependency-Versionen, Release-Profil
+Cargo.toml                                   Workspace, shared dependency versions, release profile
 rust-toolchain.toml                          stable
 README.md, CHANGELOG.md
-.github/workflows/ci.yml                     fmt, clippy, test auf ubuntu-22.04 + macos-15
-crates/crypto/src/main.rs                    clap-Einstieg, Exit-Codes
-crates/crypto/src/cli.rs                     Kommandogrammatik (in M1: nur `recovery-key validate`)
-crates/crypto/tests/cli.rs                   assert_cmd-Tests
-crates/cryptomator-app/src/lib.rs            (leer in M1)
+.github/workflows/ci.yml                     fmt, clippy, test on ubuntu-22.04 + macos-15
+crates/crypto/src/main.rs                    clap entry point, exit codes
+crates/crypto/src/cli.rs                     command grammar (in M1: only `recovery-key validate`)
+crates/crypto/tests/cli.rs                   assert_cmd tests
+crates/cryptomator-app/src/lib.rs            (empty in M1)
 crates/cryptomator-app/examples/spike_keychain.rs      Spike B
-crates/cryptomator-mount/src/lib.rs          (leer in M1)
+crates/cryptomator-mount/src/lib.rs          (empty in M1)
 crates/cryptomator-mount/examples/spike_macos_dlopen.rs Spike A
-crates/cryptomator-core/src/lib.rs           Modulbaum + Re-Exports
+crates/cryptomator-core/src/lib.rs           module tree + re-exports
 crates/cryptomator-core/src/error.rs         CoreError
 crates/cryptomator-core/src/constants.rs     cryptofs Constants
 crates/cryptomator-core/src/crypto/mod.rs
@@ -51,7 +51,7 @@ crates/cryptomator-core/src/crypto/siv.rs    FileNameCryptor
 crates/cryptomator-core/src/crypto/header.rs FileHeader
 crates/cryptomator-core/src/crypto/gcm.rs    SIV_GCM Header/Content
 crates/cryptomator-core/src/crypto/ctrmac.rs SIV_CTRMAC Header/Content
-crates/cryptomator-core/src/crypto/cryptor.rs CipherCombo, HeaderCryptor, ContentCryptor, Cryptor, Größenmathematik
+crates/cryptomator-core/src/crypto/cryptor.rs CipherCombo, HeaderCryptor, ContentCryptor, Cryptor, size math
 crates/cryptomator-core/src/crypto/stream.rs EncryptingWriter, DecryptingReader
 crates/cryptomator-core/src/masterkey_file.rs
 crates/cryptomator-core/src/vault_config.rs
@@ -59,7 +59,7 @@ crates/cryptomator-core/src/backup.rs
 crates/cryptomator-core/src/recovery/mod.rs
 crates/cryptomator-core/src/recovery/words.rs + 4096words_en.txt
 crates/cryptomator-core/src/recovery/key.rs
-crates/cryptomator-core/tests/fixtures_masterkey.rs   liest alle Java-Fixtures
+crates/cryptomator-core/tests/fixtures_masterkey.rs   reads all Java fixtures
 tools/fixture-gen/pom.xml, src/main/java/org/cryptomator/cli/fixtures/Gen.java
 tests/fixtures/<name>/{vault.cryptomator,masterkey.cryptomator,d/…,fixture.json,expected.json}
 docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md, 2026-09-04-spike-b-keychain.md
@@ -67,7 +67,7 @@ docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md, 2026-09-04-spike-b-keychai
 
 ---
 
-### Task 1: Workspace-Gerüst mit vier Crates, CI und `crypto --version`
+### Task 1: Workspace scaffold with four crates, CI and `crypto --version`
 
 **Files:**
 - Create: `Cargo.toml`, `rust-toolchain.toml`, `README.md`, `CHANGELOG.md`, `.github/workflows/ci.yml`
@@ -77,9 +77,9 @@ docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md, 2026-09-04-spike-b-keychai
 - Create: `crates/crypto/Cargo.toml`, `crates/crypto/src/main.rs`, `crates/crypto/tests/cli.rs`
 
 **Interfaces:**
-- Produces: Workspace-Dependency-Tabelle (`[workspace.dependencies]`), von allen späteren Tasks per `{ workspace = true }` genutzt. Binary `crypto` mit `--version`.
+- Produces: workspace dependency table (`[workspace.dependencies]`), used by all later tasks via `{ workspace = true }`. Binary `crypto` with `--version`.
 
-- [ ] **Step 1: Workspace-Manifest schreiben**
+- [ ] **Step 1: Write the workspace manifest**
 
 ```toml
 # Cargo.toml
@@ -139,7 +139,7 @@ channel = "stable"
 components = ["rustfmt", "clippy"]
 ```
 
-- [ ] **Step 2: Crate-Manifeste und leere Libraries schreiben**
+- [ ] **Step 2: Write the crate manifests and empty libraries**
 
 ```toml
 # crates/cryptomator-core/Cargo.toml
@@ -258,7 +258,7 @@ assert_cmd.workspace = true
 predicates.workspace = true
 ```
 
-- [ ] **Step 3: Fehlschlagenden CLI-Test schreiben**
+- [ ] **Step 3: Write a failing CLI test**
 
 ```rust
 // crates/crypto/tests/cli.rs
@@ -285,12 +285,12 @@ fn no_arguments_prints_help_and_exits_with_usage_code() {
 }
 ```
 
-- [ ] **Step 4: Test laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 4: Run the test, confirm the failure**
 
 Run: `cargo test -p crypto`
-Expected: FAIL (Binary `crypto` existiert noch nicht / `main.rs` fehlt)
+Expected: FAIL (binary `crypto` does not exist yet / `main.rs` is missing)
 
-- [ ] **Step 5: Binary-Einstieg schreiben**
+- [ ] **Step 5: Write the binary entry point**
 
 ```rust
 // crates/crypto/src/main.rs
@@ -325,14 +325,14 @@ fn main() -> ExitCode {
 }
 ```
 
-Hinweis: `arg_required_else_help` erzeugt bei fehlenden Argumenten einen Fehler vom Kind `DisplayHelpOnMissingArgumentOrSubcommand`, der auf stderr gedruckt wird und hier Exit 2 liefert.
+Note: with missing arguments, `arg_required_else_help` produces an error of kind `DisplayHelpOnMissingArgumentOrSubcommand`, which is printed to stderr and yields exit 2 here.
 
-- [ ] **Step 6: Tests laufen lassen**
+- [ ] **Step 6: Run the tests**
 
 Run: `cargo test -p crypto`
-Expected: PASS (2 Tests)
+Expected: PASS (2 tests)
 
-- [ ] **Step 7: README, CHANGELOG und CI schreiben**
+- [ ] **Step 7: Write README, CHANGELOG and CI**
 
 ```markdown
 <!-- README.md -->
@@ -386,7 +386,7 @@ jobs:
       - run: cargo test --workspace
 ```
 
-- [ ] **Step 8: Gesamtes Workspace prüfen und committen**
+- [ ] **Step 8: Check the whole workspace and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: PASS
@@ -400,21 +400,21 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Spike B – Desktop-Keychain-Eintrag auf macOS lesen
+### Task 2: Spike B – Read a desktop keychain entry on macOS
 
 **Files:**
 - Create: `crates/cryptomator-app/examples/spike_keychain.rs`
 - Create: `docs/superpowers/spikes/2026-09-04-spike-b-keychain.md`
 
 **Interfaces:**
-- Produces: Nachweis, dass `security_framework::passwords::get_generic_password("Cryptomator", <vault-id>)` die von Cryptomator.app gespeicherten Passwörter liest. Ergebnis fließt in M6.
+- Produces: proof that `security_framework::passwords::get_generic_password("Cryptomator", <vault-id>)` reads the passwords stored by Cryptomator.app. The result feeds into M6.
 
-- [ ] **Step 1: Vault-IDs der Desktop-App ermitteln (nur lesen)**
+- [ ] **Step 1: Determine the desktop app's vault IDs (read only)**
 
 Run: `python3 -c 'import json,os; d=json.load(open(os.path.expanduser("~/Library/Application Support/Cryptomator/settings.json"))); [print(v["id"], v.get("displayName"), v.get("path")) for v in d.get("directories",[])]'`
-Expected: Liste von Vault-IDs (12 Zeichen base64url). Eine davon wird für Step 3 gewählt. Dann `security find-generic-password -s Cryptomator -a <id>` (ohne `-w`): Expected: Eintrag gefunden (Exit 0). Ist kein Eintrag vorhanden, in Step 3 zuerst `security add-generic-password -s Cryptomator -a spike-test-id -w spike-password` anlegen und `spike-test-id` nutzen.
+Expected: list of vault IDs (12 base64url characters). One of them is picked for step 3. Then `security find-generic-password -s Cryptomator -a <id>` (without `-w`): Expected: entry found (exit 0). If no entry exists, first create one in step 3 with `security add-generic-password -s Cryptomator -a spike-test-id -w spike-password` and use `spike-test-id`.
 
-- [ ] **Step 2: Beispielprogramm schreiben**
+- [ ] **Step 2: Write the example program**
 
 ```rust
 // crates/cryptomator-app/examples/spike_keychain.rs
@@ -447,24 +447,24 @@ fn main() {
 }
 ```
 
-- [ ] **Step 3: Spike ausführen**
+- [ ] **Step 3: Run the spike**
 
 Run: `cargo run -p cryptomator-app --example spike_keychain -- <vault-id>`
-Expected: `found entry for account <id>: N bytes, valid utf-8: true` (macOS zeigt ggf. einen Keychain-Zugriffsdialog; „Erlauben“ wählen). Zusätzlich Gegenprobe: `security find-generic-password -s Cryptomator -a <id> -w | wc -c` liefert N+1 (Newline).
+Expected: `found entry for account <id>: N bytes, valid utf-8: true` (macOS may show a keychain access dialog; choose "Allow"). Cross-check as well: `security find-generic-password -s Cryptomator -a <id> -w | wc -c` yields N+1 (newline).
 
-- [ ] **Step 4: Ergebnis dokumentieren**
+- [ ] **Step 4: Document the result**
 
 ```markdown
 <!-- docs/superpowers/spikes/2026-09-04-spike-b-keychain.md -->
-# Spike B: Desktop-Keychain-Eintrag lesen (macOS)
+# Spike B: Read a desktop keychain entry (macOS)
 
-Frage: Kann `security-framework` (Generic Password, Service `Cryptomator`, Account = Vault-ID) die Einträge von Cryptomator.app lesen?
+Question: Can `security-framework` (generic password, service `Cryptomator`, account = vault ID) read Cryptomator.app's entries?
 
-Durchführung: `cargo run -p cryptomator-app --example spike_keychain -- <vault-id>` gegen einen Eintrag der installierten Desktop-App (Version aus `writtenByVersion` in settings.json).
+Procedure: `cargo run -p cryptomator-app --example spike_keychain -- <vault-id>` against an entry of the installed desktop app (version from `writtenByVersion` in settings.json).
 
-Ergebnis: <GO | NO-GO>. Beobachtungen: <Dialog erschienen? Länge korrekt? Fehlercode?>
+Result: <GO | NO-GO>. Observations: <dialog appeared? length correct? error code?>
 
-Konsequenz für M6: <security-framework direkt verwenden | Alternative>.
+Consequence for M6: <use security-framework directly | alternative>.
 ```
 
 - [ ] **Step 5: Commit**
@@ -478,16 +478,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Spike A – FUSE-T/macFUSE per dlopen mit `fuser::Session::from_fd`
+### Task 3: Spike A – FUSE-T/macFUSE via dlopen with `fuser::Session::from_fd`
 
 **Files:**
 - Create: `crates/cryptomator-mount/examples/spike_macos_dlopen.rs`
 - Create: `docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md`
 
 **Interfaces:**
-- Produces: Go/No-Go für den macOS-FUSE-Pfad aus der Spec (dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `Session::from_fd`). Bei No-Go plant M4 ein `fuse_lowlevel_ops`-FFI-Backend für FUSE-T.
+- Produces: go/no-go for the macOS FUSE path from the spec (dlopen `libfuse-t.dylib`/`libfuse.2.dylib` → `fuse_mount_compat25` → `Session::from_fd`). On no-go, M4 plans a `fuse_lowlevel_ops` FFI backend for FUSE-T.
 
-- [ ] **Step 1: Beispielprogramm schreiben**
+- [ ] **Step 1: Write the example program**
 
 ```rust
 // crates/cryptomator-mount/examples/spike_macos_dlopen.rs
@@ -661,36 +661,36 @@ fn main() {
 }
 ```
 
-- [ ] **Step 2: Kompilieren (ohne FUSE-Installation möglich)**
+- [ ] **Step 2: Compile (possible without a FUSE installation)**
 
 Run: `cargo build -p cryptomator-mount --example spike_macos_dlopen`
-Expected: Build ok. Falls fuser 0.18 andere Signaturen meldet (z. B. `readdir`-Parameter), die Fehlermeldung mit `~/.cargo/registry/src/*/fuser-0.18.0/examples/hello.rs` abgleichen und anpassen.
+Expected: build ok. If fuser 0.18 reports different signatures (e.g. `readdir` parameters), compare the error message against `~/.cargo/registry/src/*/fuser-0.18.0/examples/hello.rs` and adjust.
 
-- [ ] **Step 3: Spike gegen FUSE-T ausführen (nur wenn installiert)**
+- [ ] **Step 3: Run the spike against FUSE-T (only if installed)**
 
-Run: `ls /usr/local/lib/libfuse-t.dylib` — falls fehlt: Ergebnis „blocked, FUSE-T nicht installiert“ dokumentieren und Task abschließen; M1 hängt nicht davon ab.
-Sonst: `mkdir -p /tmp/spike-mnt && cargo run -p cryptomator-mount --example spike_macos_dlopen -- fuse-t /tmp/spike-mnt` und in einer zweiten Shell `cat /tmp/spike-mnt/hello.txt; umount /tmp/spike-mnt`.
-Expected GO: `Hello from crypto spike A!` erscheint, Programm endet mit „session ended“. NO-GO: `fuse_mount_compat25` liefert fd < 0, oder `Session::from_fd` scheitert im Handshake (Fehler notieren).
-Danach dasselbe mit `macfuse`, falls installiert.
+Run: `ls /usr/local/lib/libfuse-t.dylib` — if missing: document the result "blocked, FUSE-T not installed" and finish the task; M1 does not depend on it.
+Otherwise: `mkdir -p /tmp/spike-mnt && cargo run -p cryptomator-mount --example spike_macos_dlopen -- fuse-t /tmp/spike-mnt` and in a second shell `cat /tmp/spike-mnt/hello.txt; umount /tmp/spike-mnt`.
+Expected GO: `Hello from crypto spike A!` appears, the program ends with "session ended". NO-GO: `fuse_mount_compat25` returns fd < 0, or `Session::from_fd` fails during the handshake (note the error).
+Then the same with `macfuse`, if installed.
 
-- [ ] **Step 4: Ergebnis dokumentieren**
+- [ ] **Step 4: Document the result**
 
 ```markdown
 <!-- docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md -->
-# Spike A: FUSE-T / macFUSE über dlopen + fuser::Session::from_fd
+# Spike A: FUSE-T / macFUSE via dlopen + fuser::Session::from_fd
 
-Frage: Liefert `fuse_mount_compat25` aus `libfuse-t.dylib` einen fd, über den fuser 0.18 das Kernel-FUSE-Protokoll sprechen kann?
+Question: Does `fuse_mount_compat25` from `libfuse-t.dylib` return an fd over which fuser 0.18 can speak the kernel FUSE protocol?
 
 Setup: `cargo run -p cryptomator-mount --example spike_macos_dlopen -- <fuse-t|macfuse> /tmp/spike-mnt`
 
-| Backend | Installiert (Version) | fuse_mount fd | Handshake | cat hello.txt | umount | Ergebnis |
+| Backend | Installed (version) | fuse_mount fd | Handshake | cat hello.txt | umount | Result |
 |---|---|---|---|---|---|---|
-| FUSE-T | <ja/nein> | <ok/fehler> | <ok/fehler> | <ok/fehler> | <ok/fehler> | <GO/NO-GO/BLOCKED> |
-| macFUSE | <ja/nein> | | | | | |
+| FUSE-T | <yes/no> | <ok/error> | <ok/error> | <ok/error> | <ok/error> | <GO/NO-GO/BLOCKED> |
+| macFUSE | <yes/no> | | | | | |
 
-Beobachtungen: <Fehlermeldungen, Protokolldetails>
+Observations: <error messages, protocol details>
 
-Konsequenz für M4: <dlopen-Pfad wie geplant | lowlevel-FFI-Backend für FUSE-T einplanen>.
+Consequence for M4: <dlopen path as planned | plan a lowlevel FFI backend for FUSE-T>.
 ```
 
 - [ ] **Step 5: Commit**
@@ -704,19 +704,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Core-Fundament – Fehler, Konstanten, RNG-Trait, `Masterkey`
+### Task 4: Core foundation – errors, constants, RNG trait, `Masterkey`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/error.rs`, `src/constants.rs`, `src/crypto/mod.rs`, `src/crypto/rng.rs`, `src/crypto/masterkey.rs`
 - Modify: `crates/cryptomator-core/src/lib.rs`
 
 **Interfaces:**
-- Produces: `CoreError`, `Result<T>`; `trait Rng { fn fill(&mut self, buf: &mut [u8]); }`, `OsRng`, `DetRng` (`DetRng::default()`, `DetRng::starting_at(u64)`); `Masterkey::{from_raw([u8;64]), from_slice(&[u8]), generate(&mut dyn Rng), enc_key() -> &[u8;32], mac_key() -> &[u8;32], raw() -> &[u8;64]}`; Konstanten aus cryptofs `Constants.java`.
+- Produces: `CoreError`, `Result<T>`; `trait Rng { fn fill(&mut self, buf: &mut [u8]); }`, `OsRng`, `DetRng` (`DetRng::default()`, `DetRng::starting_at(u64)`); `Masterkey::{from_raw([u8;64]), from_slice(&[u8]), generate(&mut dyn Rng), enc_key() -> &[u8;32], mac_key() -> &[u8;32], raw() -> &[u8;64]}`; constants from cryptofs `Constants.java`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/rng.rs
+// at the end of crates/cryptomator-core/src/crypto/rng.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,7 +752,7 @@ mod tests {
 ```
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/masterkey.rs
+// at the end of crates/cryptomator-core/src/crypto/masterkey.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,12 +797,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core`
-Expected: FAIL (Module existieren nicht)
+Expected: FAIL (modules do not exist)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/error.rs
@@ -992,10 +992,10 @@ pub use crypto::rng::{DetRng, OsRng, Rng};
 pub use error::{CoreError, Result};
 ```
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core`
-Expected: PASS (7 Tests)
+Expected: PASS (7 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1008,19 +1008,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: scrypt-KEK und RFC-3394-Key-Wrap
+### Task 5: scrypt KEK and RFC 3394 key wrap
 
 **Files:**
 - Create: `crates/cryptomator-core/src/crypto/kdf.rs`, `src/crypto/keywrap.rs`
 - Modify: `crates/cryptomator-core/src/crypto/mod.rs`
 
 **Interfaces:**
-- Produces: `kdf::scrypt_kek(passphrase: &str, salt: &[u8], pepper: &[u8], cost_param: u32, block_size: u32) -> Result<Zeroizing<[u8; 32]>>`; `keywrap::wrap_key(kek: &[u8;32], key: &[u8;32]) -> [u8; 40]`; `keywrap::unwrap_key(kek: &[u8;32], wrapped: &[u8]) -> Result<Zeroizing<[u8;32]>>` (Fehler: `CoreError::AuthenticationFailed`).
+- Produces: `kdf::scrypt_kek(passphrase: &str, salt: &[u8], pepper: &[u8], cost_param: u32, block_size: u32) -> Result<Zeroizing<[u8; 32]>>`; `keywrap::wrap_key(kek: &[u8;32], key: &[u8;32]) -> [u8; 40]`; `keywrap::unwrap_key(kek: &[u8;32], wrapped: &[u8]) -> Result<Zeroizing<[u8;32]>>` (error: `CoreError::AuthenticationFailed`).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/kdf.rs
+// at the end of crates/cryptomator-core/src/crypto/kdf.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,7 +1049,7 @@ mod tests {
 ```
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/keywrap.rs
+// at the end of crates/cryptomator-core/src/crypto/keywrap.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,12 +1092,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core kdf keywrap`
-Expected: FAIL (Module fehlen)
+Expected: FAIL (modules missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/crypto/kdf.rs
@@ -1161,12 +1161,12 @@ pub mod masterkey;
 pub mod rng;
 ```
 
-Falls `aes_kw::cipher::KeyInit` nicht existiert: `use aes_kw::KeyInit;` bzw. den Pfad mit `grep -rn "pub use" ~/.cargo/registry/src/*/aes-kw-0.3.1/src/lib.rs` nachschlagen (im Kompiliertest vom 2026-09-04 funktionierte `KwAes256::new_from_slice` mit `use aes_gcm::aead::KeyInit` im Scope; jeder Re-Export des `crypto_common::KeyInit`-Traits genügt).
+If `aes_kw::cipher::KeyInit` does not exist: use `use aes_kw::KeyInit;`, or look the path up with `grep -rn "pub use" ~/.cargo/registry/src/*/aes-kw-0.3.1/src/lib.rs` (in the compile test of 2026-09-04, `KwAes256::new_from_slice` worked with `use aes_gcm::aead::KeyInit` in scope; any re-export of the `crypto_common::KeyInit` trait is sufficient).
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core kdf keywrap`
-Expected: PASS (7 Tests)
+Expected: PASS (7 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1179,7 +1179,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 6: `masterkey.cryptomator` lesen, entsperren, schreiben, Passwort ändern
+### Task 6: Read, unlock and write `masterkey.cryptomator`, change the password
 
 **Files:**
 - Create: `crates/cryptomator-core/src/masterkey_file.rs`
@@ -1187,12 +1187,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `kdf::scrypt_kek`, `keywrap::{wrap_key, unwrap_key}`, `Masterkey`, `Rng`.
-- Produces: `MasterkeyFile` (serde, Felder wie Java), `MasterkeyFileAccess::new(pepper: Vec<u8>)`, `MasterkeyFileAccess::{load(&Path, &str) -> Result<Masterkey>, load_bytes(&[u8], &str), unlock(&MasterkeyFile, &str), lock(&Masterkey, &str, vault_version: u32, cost_param: u32, &mut dyn Rng) -> Result<MasterkeyFile>, persist(&Masterkey, &Path, &str, vault_version: u32, &mut dyn Rng) -> Result<()>, persist_bytes(...) -> Result<Vec<u8>>, change_passphrase(&[u8], old: &str, new: &str, &mut dyn Rng) -> Result<Vec<u8>>, read_alleged_vault_version(&[u8]) -> Result<u32>}`; Konstanten `DEFAULT_MASTERKEY_FILE_VERSION = 999`, `DEFAULT_SCRYPT_COST_PARAM = 32768`, `DEFAULT_SCRYPT_BLOCK_SIZE = 8`, `DEFAULT_SCRYPT_SALT_LENGTH = 8`.
+- Produces: `MasterkeyFile` (serde, fields as in Java), `MasterkeyFileAccess::new(pepper: Vec<u8>)`, `MasterkeyFileAccess::{load(&Path, &str) -> Result<Masterkey>, load_bytes(&[u8], &str), unlock(&MasterkeyFile, &str), lock(&Masterkey, &str, vault_version: u32, cost_param: u32, &mut dyn Rng) -> Result<MasterkeyFile>, persist(&Masterkey, &Path, &str, vault_version: u32, &mut dyn Rng) -> Result<()>, persist_bytes(...) -> Result<Vec<u8>>, change_passphrase(&[u8], old: &str, new: &str, &mut dyn Rng) -> Result<Vec<u8>>, read_alleged_vault_version(&[u8]) -> Result<u32>}`; constants `DEFAULT_MASTERKEY_FILE_VERSION = 999`, `DEFAULT_SCRYPT_COST_PARAM = 32768`, `DEFAULT_SCRYPT_BLOCK_SIZE = 8`, `DEFAULT_SCRYPT_SALT_LENGTH = 8`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/masterkey_file.rs
+// at the end of crates/cryptomator-core/src/masterkey_file.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,12 +1289,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core masterkey_file`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/masterkey_file.rs
@@ -1449,12 +1449,12 @@ impl MasterkeyFileAccess {
 }
 ```
 
-In `lib.rs` ergänzen: `pub mod masterkey_file;` und `pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};`.
+Add to `lib.rs`: `pub mod masterkey_file;` and `pub use masterkey_file::{MasterkeyFile, MasterkeyFileAccess};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core masterkey_file`
-Expected: PASS (9 Tests; `persist_with_default_cost_matches_java` braucht wegen N=32768 etwa 0,2 s)
+Expected: PASS (9 tests; `persist_with_default_cost_matches_java` takes about 0.2 s because of N=32768)
 
 - [ ] **Step 5: Commit**
 
@@ -1467,7 +1467,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Dateinamen-Verschlüsselung und Verzeichnis-ID-Hash (AES-SIV)
+### Task 7: Filename encryption and directory ID hash (AES-SIV)
 
 **Files:**
 - Create: `crates/cryptomator-core/src/crypto/siv.rs`
@@ -1475,12 +1475,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `Masterkey`.
-- Produces: `FileNameCryptor::new(&Masterkey)`, `hash_directory_id(&self, dir_id: &str) -> String` (BASE32, 32 Zeichen), `encrypt_filename(&self, cleartext: &str, associated_data: &[&[u8]]) -> String` (base64url mit Padding, ohne `.c9r`), `decrypt_filename(&self, ciphertext: &str, associated_data: &[&[u8]]) -> Result<String>` (Fehler `AuthenticationFailed`).
+- Produces: `FileNameCryptor::new(&Masterkey)`, `hash_directory_id(&self, dir_id: &str) -> String` (BASE32, 32 characters), `encrypt_filename(&self, cleartext: &str, associated_data: &[&[u8]]) -> String` (base64url with padding, without `.c9r`), `decrypt_filename(&self, ciphertext: &str, associated_data: &[&[u8]]) -> Result<String>` (error `AuthenticationFailed`).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/siv.rs
+// at the end of crates/cryptomator-core/src/crypto/siv.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,12 +1545,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core siv`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/crypto/siv.rs
@@ -1618,12 +1618,12 @@ impl FileNameCryptor {
 }
 ```
 
-In `crypto/mod.rs` ergänzen: `pub mod siv;`.
+Add to `crypto/mod.rs`: `pub mod siv;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core siv`
-Expected: PASS (8 Tests)
+Expected: PASS (8 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1636,7 +1636,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Datei-Header und Inhalts-Chunks für SIV_GCM
+### Task 8: File header and content chunks for SIV_GCM
 
 **Files:**
 - Create: `crates/cryptomator-core/src/crypto/header.rs`, `src/crypto/gcm.rs`
@@ -1644,12 +1644,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `Masterkey`, `Rng`.
-- Produces: `FileHeader::{new(nonce: Vec<u8>, reserved: i64, content_key: [u8;32]), nonce() -> &[u8], reserved() -> i64, content_key() -> &[u8;32], encode_payload() -> Zeroizing<[u8;40]>, decode_payload(nonce: Vec<u8>, payload: &[u8]) -> Result<FileHeader>}`; `gcm::{GCM_NONCE_SIZE=12, PAYLOAD_SIZE=32768, GCM_TAG_SIZE=16, CHUNK_SIZE=32796, HEADER_SIZE=68}`; `GcmHeaderCryptor::new(&Masterkey)` mit `create(&mut dyn Rng) -> FileHeader`, `header_size() -> usize`, `encrypt_header(&FileHeader) -> Vec<u8>`, `decrypt_header(&[u8]) -> Result<FileHeader>`; `GcmContentCryptor` (unit struct) mit `cleartext_chunk_size()`, `ciphertext_chunk_size()`, `encrypt_chunk(cleartext: &[u8], chunk_number: u64, header: &FileHeader, rng: &mut dyn Rng) -> Vec<u8>`, `decrypt_chunk(ciphertext: &[u8], chunk_number: u64, header: &FileHeader) -> Result<Vec<u8>>`.
+- Produces: `FileHeader::{new(nonce: Vec<u8>, reserved: i64, content_key: [u8;32]), nonce() -> &[u8], reserved() -> i64, content_key() -> &[u8;32], encode_payload() -> Zeroizing<[u8;40]>, decode_payload(nonce: Vec<u8>, payload: &[u8]) -> Result<FileHeader>}`; `gcm::{GCM_NONCE_SIZE=12, PAYLOAD_SIZE=32768, GCM_TAG_SIZE=16, CHUNK_SIZE=32796, HEADER_SIZE=68}`; `GcmHeaderCryptor::new(&Masterkey)` with `create(&mut dyn Rng) -> FileHeader`, `header_size() -> usize`, `encrypt_header(&FileHeader) -> Vec<u8>`, `decrypt_header(&[u8]) -> Result<FileHeader>`; `GcmContentCryptor` (unit struct) with `cleartext_chunk_size()`, `ciphertext_chunk_size()`, `encrypt_chunk(cleartext: &[u8], chunk_number: u64, header: &FileHeader, rng: &mut dyn Rng) -> Vec<u8>`, `decrypt_chunk(ciphertext: &[u8], chunk_number: u64, header: &FileHeader) -> Result<Vec<u8>>`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/gcm.rs
+// at the end of crates/cryptomator-core/src/crypto/gcm.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1762,12 +1762,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core gcm`
-Expected: FAIL (Module fehlen)
+Expected: FAIL (modules missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/crypto/header.rs
@@ -1955,12 +1955,12 @@ impl GcmContentCryptor {
 }
 ```
 
-In `crypto/mod.rs` ergänzen: `pub mod gcm;` und `pub mod header;`.
+Add to `crypto/mod.rs`: `pub mod gcm;` and `pub mod header;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core gcm`
-Expected: PASS (8 Tests)
+Expected: PASS (8 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1973,7 +1973,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: Datei-Header und Inhalts-Chunks für SIV_CTRMAC
+### Task 9: File header and content chunks for SIV_CTRMAC
 
 **Files:**
 - Create: `crates/cryptomator-core/src/crypto/ctrmac.rs`
@@ -1981,12 +1981,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `FileHeader`, `Masterkey`, `Rng`.
-- Produces: `ctrmac::{NONCE_SIZE=16, PAYLOAD_SIZE=32768, MAC_SIZE=32, CHUNK_SIZE=32816, HEADER_SIZE=88}`; `CtrMacHeaderCryptor::new(&Masterkey)` und `CtrMacContentCryptor::new(&Masterkey)` mit denselben Methodensignaturen wie die GCM-Typen aus Task 8 (`create`, `header_size`, `encrypt_header`, `decrypt_header`; `cleartext_chunk_size`, `ciphertext_chunk_size`, `encrypt_chunk`, `decrypt_chunk`).
+- Produces: `ctrmac::{NONCE_SIZE=16, PAYLOAD_SIZE=32768, MAC_SIZE=32, CHUNK_SIZE=32816, HEADER_SIZE=88}`; `CtrMacHeaderCryptor::new(&Masterkey)` and `CtrMacContentCryptor::new(&Masterkey)` with the same method signatures as the GCM types from task 8 (`create`, `header_size`, `encrypt_header`, `decrypt_header`; `cleartext_chunk_size`, `ciphertext_chunk_size`, `encrypt_chunk`, `decrypt_chunk`).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/ctrmac.rs
+// at the end of crates/cryptomator-core/src/crypto/ctrmac.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2091,12 +2091,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core ctrmac`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/crypto/ctrmac.rs
@@ -2255,12 +2255,12 @@ impl CtrMacContentCryptor {
 }
 ```
 
-In `crypto/mod.rs` ergänzen: `pub mod ctrmac;`.
+Add to `crypto/mod.rs`: `pub mod ctrmac;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core ctrmac`
-Expected: PASS (7 Tests)
+Expected: PASS (7 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2273,7 +2273,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 10: `CipherCombo`, `Cryptor`-Fassade und Größenmathematik
+### Task 10: `CipherCombo`, the `Cryptor` facade and size math
 
 **Files:**
 - Create: `crates/cryptomator-core/src/crypto/cryptor.rs`
@@ -2281,12 +2281,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 7–9.
-- Produces: `CipherCombo { SivCtrMac, SivGcm }` (serde-Namen `SIV_CTRMAC`/`SIV_GCM`, `as_str()`, `FromStr`, `Display`); `HeaderCryptor` (enum über Gcm/CtrMac) mit `create`, `header_size`, `encrypt_header`, `decrypt_header`; `ContentCryptor` (enum) mit `cleartext_chunk_size`, `ciphertext_chunk_size`, `encrypt_chunk`, `decrypt_chunk`, `cleartext_size(ciphertext_size: u64) -> Result<u64>`, `ciphertext_size(cleartext_size: u64) -> u64`; `Cryptor::new(CipherCombo, &Masterkey)` mit `cipher_combo()`, `file_name_cryptor()`, `file_header_cryptor()`, `file_content_cryptor()`.
+- Produces: `CipherCombo { SivCtrMac, SivGcm }` (serde names `SIV_CTRMAC`/`SIV_GCM`, `as_str()`, `FromStr`, `Display`); `HeaderCryptor` (enum over Gcm/CtrMac) with `create`, `header_size`, `encrypt_header`, `decrypt_header`; `ContentCryptor` (enum) with `cleartext_chunk_size`, `ciphertext_chunk_size`, `encrypt_chunk`, `decrypt_chunk`, `cleartext_size(ciphertext_size: u64) -> Result<u64>`, `ciphertext_size(cleartext_size: u64) -> u64`; `Cryptor::new(CipherCombo, &Masterkey)` with `cipher_combo()`, `file_name_cryptor()`, `file_header_cryptor()`, `file_content_cryptor()`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/cryptor.rs
+// at the end of crates/cryptomator-core/src/crypto/cryptor.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2360,12 +2360,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core cryptor`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/crypto/cryptor.rs
@@ -2554,12 +2554,12 @@ impl Cryptor {
 }
 ```
 
-In `crypto/mod.rs` ergänzen: `pub mod cryptor;`. In `lib.rs` ergänzen: `pub use crypto::cryptor::{CipherCombo, ContentCryptor, Cryptor, HeaderCryptor};` und `pub use crypto::header::FileHeader;`.
+Add to `crypto/mod.rs`: `pub mod cryptor;`. Add to `lib.rs`: `pub use crypto::cryptor::{CipherCombo, ContentCryptor, Cryptor, HeaderCryptor};` and `pub use crypto::header::FileHeader;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core cryptor`
-Expected: PASS (4 Tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2572,7 +2572,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: Streams – `EncryptingWriter` und `DecryptingReader`
+### Task 11: Streams – `EncryptingWriter` and `DecryptingReader`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/crypto/stream.rs`
@@ -2580,12 +2580,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `Cryptor`, `Rng`.
-- Produces: `EncryptingWriter<'a, W: Write>::new(dest: W, cryptor: &'a Cryptor, rng: &'a mut dyn Rng)`, `impl Write`, `finish(self) -> io::Result<W>` (schreibt immer Header + letzten, ggf. leeren Chunk – wie `EncryptingWritableByteChannel.close()`); `DecryptingReader<'a, R: Read>::new(src: R, cryptor: &'a Cryptor)`, `impl Read` (Authentifizierungsfehler → `io::ErrorKind::InvalidData`, fehlender Header → `UnexpectedEof`); Helfer `encrypt_all(cryptor, rng, cleartext) -> io::Result<Vec<u8>>`, `decrypt_all(cryptor, ciphertext) -> io::Result<Vec<u8>>`.
+- Produces: `EncryptingWriter<'a, W: Write>::new(dest: W, cryptor: &'a Cryptor, rng: &'a mut dyn Rng)`, `impl Write`, `finish(self) -> io::Result<W>` (always writes the header + the final, possibly empty chunk – like `EncryptingWritableByteChannel.close()`); `DecryptingReader<'a, R: Read>::new(src: R, cryptor: &'a Cryptor)`, `impl Read` (authentication error → `io::ErrorKind::InvalidData`, missing header → `UnexpectedEof`); helpers `encrypt_all(cryptor, rng, cleartext) -> io::Result<Vec<u8>>`, `decrypt_all(cryptor, ciphertext) -> io::Result<Vec<u8>>`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/crypto/stream.rs
+// at the end of crates/cryptomator-core/src/crypto/stream.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2694,12 +2694,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core stream`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/crypto/stream.rs
@@ -2884,12 +2884,12 @@ pub fn decrypt_all(cryptor: &Cryptor, ciphertext: &[u8]) -> io::Result<Vec<u8>> 
 }
 ```
 
-In `crypto/mod.rs` ergänzen: `pub mod stream;`. In `lib.rs`: `pub use crypto::stream::{decrypt_all, encrypt_all, DecryptingReader, EncryptingWriter};`.
+Add to `crypto/mod.rs`: `pub mod stream;`. In `lib.rs`: `pub use crypto::stream::{decrypt_all, encrypt_all, DecryptingReader, EncryptingWriter};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core stream`
-Expected: PASS (6 Tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2902,7 +2902,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 12: `vault.cryptomator` – JWT dekodieren, verifizieren, erzeugen
+### Task 12: `vault.cryptomator` – decode, verify and create the JWT
 
 **Files:**
 - Create: `crates/cryptomator-core/src/vault_config.rs`
@@ -2910,12 +2910,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `CipherCombo`, `constants::VAULT_VERSION`.
-- Produces: `KeyId::{MasterkeyFile { file_name: String }, Hub { uri: String }, Other(String)}` mit `KeyId::parse(&str)` und `Display` (Original-String); `JwtAlgorithm::{Hs256, Hs384, Hs512}`; `UnverifiedVaultConfig::decode(token: &str) -> Result<Self>` mit `key_id() -> Result<KeyId>`, `algorithm() -> Result<JwtAlgorithm>`, `alleged_vault_version() -> Option<u32>`, `alleged_shortening_threshold() -> Option<u32>`, `header_value(key: &str) -> Option<&serde_json::Value>`, `token() -> &str`, `verify(&self, raw_key: &[u8; 64], expected_vault_version: u32) -> Result<VaultConfig>` (Fehler: `VaultKeyInvalid`, `VaultVersionMismatch`, `VaultConfigLoad`); `VaultConfig { id: String, vault_version: u32, cipher_combo: CipherCombo, shortening_threshold: u32 }` mit `VaultConfig::create_new(cipher_combo, shortening_threshold)` (jti = UUIDv4, Version 8) und `to_token(&self, key_id: &str, raw_key: &[u8; 64]) -> String` (HS256, Header-Reihenfolge `kid, alg, typ`, Claims `jti, format, cipherCombo, shorteningThreshold`).
+- Produces: `KeyId::{MasterkeyFile { file_name: String }, Hub { uri: String }, Other(String)}` with `KeyId::parse(&str)` and `Display` (original string); `JwtAlgorithm::{Hs256, Hs384, Hs512}`; `UnverifiedVaultConfig::decode(token: &str) -> Result<Self>` with `key_id() -> Result<KeyId>`, `algorithm() -> Result<JwtAlgorithm>`, `alleged_vault_version() -> Option<u32>`, `alleged_shortening_threshold() -> Option<u32>`, `header_value(key: &str) -> Option<&serde_json::Value>`, `token() -> &str`, `verify(&self, raw_key: &[u8; 64], expected_vault_version: u32) -> Result<VaultConfig>` (errors: `VaultKeyInvalid`, `VaultVersionMismatch`, `VaultConfigLoad`); `VaultConfig { id: String, vault_version: u32, cipher_combo: CipherCombo, shortening_threshold: u32 }` with `VaultConfig::create_new(cipher_combo, shortening_threshold)` (jti = UUIDv4, version 8) and `to_token(&self, key_id: &str, raw_key: &[u8; 64]) -> String` (HS256, header order `kid, alg, typ`, claims `jti, format, cipherCombo, shorteningThreshold`).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/vault_config.rs
+// at the end of crates/cryptomator-core/src/vault_config.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3011,12 +3011,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core vault_config`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/vault_config.rs
@@ -3262,12 +3262,12 @@ impl VaultConfig {
 }
 ```
 
-`serde_json` mit Feature `preserve_order` hält die Einfügereihenfolge von `json!` bei; ohne dieses Feature würden die Claims alphabetisch sortiert und `to_token_is_byte_identical_to_java` fehlschlagen. In `lib.rs` ergänzen: `pub mod vault_config;` und `pub use vault_config::{JwtAlgorithm, KeyId, UnverifiedVaultConfig, VaultConfig};`.
+`serde_json` with the `preserve_order` feature keeps the insertion order of `json!`; without that feature the claims would be sorted alphabetically and `to_token_is_byte_identical_to_java` would fail. Add to `lib.rs`: `pub mod vault_config;` and `pub use vault_config::{JwtAlgorithm, KeyId, UnverifiedVaultConfig, VaultConfig};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core vault_config`
-Expected: PASS (9 Tests)
+Expected: PASS (9 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -3280,19 +3280,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 13: Backup-Dateien (`<name>.<HEX8>.bkup`)
+### Task 13: Backup files (`<name>.<HEX8>.bkup`)
 
 **Files:**
 - Create: `crates/cryptomator-core/src/backup.rs`
 - Modify: `crates/cryptomator-core/src/lib.rs`
 
 **Interfaces:**
-- Produces: `generate_file_id_suffix(bytes: &[u8]) -> String` (`"." + HEXUPPER(SHA-256[0..4])`), `backup_file_name(original_file_name: &str, bytes: &[u8]) -> String`, `attempt_backup(path: &Path) -> Result<BackupOutcome>` mit `BackupOutcome { path: PathBuf, status: BackupStatus }`, `BackupStatus::{Created, VerifiedExisting, MismatchExisting, Failed(String)}`.
+- Produces: `generate_file_id_suffix(bytes: &[u8]) -> String` (`"." + HEXUPPER(SHA-256[0..4])`), `backup_file_name(original_file_name: &str, bytes: &[u8]) -> String`, `attempt_backup(path: &Path) -> Result<BackupOutcome>` with `BackupOutcome { path: PathBuf, status: BackupStatus }`, `BackupStatus::{Created, VerifiedExisting, MismatchExisting, Failed(String)}`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/backup.rs
+// at the end of crates/cryptomator-core/src/backup.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3341,12 +3341,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core backup`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/backup.rs
@@ -3408,12 +3408,12 @@ pub fn attempt_backup(path: &Path) -> Result<BackupOutcome> {
 }
 ```
 
-In `lib.rs` ergänzen: `pub mod backup;`.
+Add to `lib.rs`: `pub mod backup;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core backup`
-Expected: PASS (5 Tests)
+Expected: PASS (5 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -3426,25 +3426,25 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 14: Recovery-Key – Wortkodierung, Erzeugung, Validierung, Passwort-Reset
+### Task 14: Recovery key – word encoding, creation, validation, password reset
 
 **Files:**
-- Create: `crates/cryptomator-core/src/recovery/mod.rs`, `src/recovery/words.rs`, `src/recovery/key.rs`, `src/recovery/4096words_en.txt` (Kopie)
+- Create: `crates/cryptomator-core/src/recovery/mod.rs`, `src/recovery/words.rs`, `src/recovery/key.rs`, `src/recovery/4096words_en.txt` (copy)
 - Modify: `crates/cryptomator-core/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `MasterkeyFileAccess`, `backup::backup_file_name`, `Masterkey`, `Rng`.
-- Produces: `WordEncoder::new()`, `words() -> &[&'static str]`, `encode_padded(&[u8]) -> Result<String>`, `decode(&str) -> Result<Vec<u8>>`; `create_recovery_key(&WordEncoder, raw: &[u8; 64]) -> String` (44 Wörter), `decode_recovery_key(&WordEncoder, &str) -> Result<Zeroizing<[u8; 64]>>`, `validate_recovery_key(&WordEncoder, &str) -> bool`, `reset_password(vault_path: &Path, recovery_key: &str, new_passphrase: &str, rng: &mut dyn Rng) -> Result<()>` (verschiebt vorhandene Masterkey-Datei nach `masterkey.cryptomator.<HEX8>.bkup`, schreibt neue Datei mit Version 999).
+- Produces: `WordEncoder::new()`, `words() -> &[&'static str]`, `encode_padded(&[u8]) -> Result<String>`, `decode(&str) -> Result<Vec<u8>>`; `create_recovery_key(&WordEncoder, raw: &[u8; 64]) -> String` (44 words), `decode_recovery_key(&WordEncoder, &str) -> Result<Zeroizing<[u8; 64]>>`, `validate_recovery_key(&WordEncoder, &str) -> bool`, `reset_password(vault_path: &Path, recovery_key: &str, new_passphrase: &str, rng: &mut dyn Rng) -> Result<()>` (moves an existing masterkey file to `masterkey.cryptomator.<HEX8>.bkup`, writes a new file with version 999).
 
-- [ ] **Step 1: Wortliste kopieren**
+- [ ] **Step 1: Copy the word list**
 
 Run: `cp /Users/rfoerthe/work/pro/cryptomator/.claude/worktrees/cryptomator-cli-rust-be5387/src/main/resources/i18n/4096words_en.txt crates/cryptomator-core/src/recovery/4096words_en.txt && awk 'END{print NR}' crates/cryptomator-core/src/recovery/4096words_en.txt && head -1 crates/cryptomator-core/src/recovery/4096words_en.txt && tail -1 crates/cryptomator-core/src/recovery/4096words_en.txt`
-Expected: `4096` (die Datei hat kein abschließendes Newline, `wc -l` zeigt 4095), erstes Wort `ad`, letztes Wort `residence`.
+Expected: `4096` (the file has no trailing newline, `wc -l` shows 4095), first word `ad`, last word `residence`.
 
-- [ ] **Step 2: Fehlschlagende Tests schreiben**
+- [ ] **Step 2: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/recovery/words.rs
+// at the end of crates/cryptomator-core/src/recovery/words.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3495,7 +3495,7 @@ mod tests {
 ```
 
 ```rust
-// am Ende von crates/cryptomator-core/src/recovery/key.rs
+// at the end of crates/cryptomator-core/src/recovery/key.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3563,12 +3563,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 3: Run the tests, confirm the failure**
 
 Run: `cargo test -p cryptomator-core recovery`
-Expected: FAIL (Module fehlen)
+Expected: FAIL (modules missing)
 
-- [ ] **Step 4: Implementieren**
+- [ ] **Step 4: Implement**
 
 ```rust
 // crates/cryptomator-core/src/recovery/mod.rs
@@ -3708,12 +3708,12 @@ pub fn reset_password(encoder: &WordEncoder, vault_path: &Path, recovery_key: &s
 }
 ```
 
-In `lib.rs` ergänzen: `pub mod recovery;`.
+Add to `lib.rs`: `pub mod recovery;`.
 
-- [ ] **Step 5: Tests laufen lassen**
+- [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p cryptomator-core recovery`
-Expected: PASS (10 Tests)
+Expected: PASS (10 tests)
 
 - [ ] **Step 6: Commit**
 
@@ -3726,7 +3726,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 15: CLI-Kommando `crypto recovery-key validate`
+### Task 15: CLI command `crypto recovery-key validate`
 
 **Files:**
 - Create: `crates/crypto/src/cli.rs`
@@ -3734,12 +3734,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `cryptomator_core::recovery::{WordEncoder, validate_recovery_key}`.
-- Produces: `crypto recovery-key validate --recovery-key-stdin` (liest stdin, trimmt, druckt `valid` / `invalid`; Exit 0 bzw. 4). Exit-Code-Konstanten in `main.rs` (`exit::INVALID_PASSPHRASE = 4`) werden von späteren Kommandos wiederverwendet.
+- Produces: `crypto recovery-key validate --recovery-key-stdin` (reads stdin, trims, prints `valid` / `invalid`; exit 0 or 4 respectively). Exit code constants in `main.rs` (`exit::INVALID_PASSPHRASE = 4`) are reused by later commands.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// an crates/crypto/tests/cli.rs anhängen
+// append to crates/crypto/tests/cli.rs
 const VALID_KEY: &str = "pathway lift abuse plenty export texture gentleman landscape beyond ceiling around leaf cafe charity border breakdown victory surely computer cat linger restrict infer crowd live computer true written amazed investor boot depth left theory snow whereby terminal weekly reject happiness circuit partial cup ad";
 
 #[test]
@@ -3774,12 +3774,12 @@ fn recovery_key_validate_requires_a_source() {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run the tests, confirm the failure**
 
 Run: `cargo test -p crypto`
-Expected: FAIL (Subcommand unbekannt)
+Expected: FAIL (subcommand unknown)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/crypto/src/cli.rs
@@ -3875,10 +3875,10 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
 }
 ```
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p crypto`
-Expected: PASS (5 Tests; der Test `no_arguments_prints_help_and_exits_with_usage_code` aus Task 1 bleibt gültig)
+Expected: PASS (5 tests; the test `no_arguments_prints_help_and_exits_with_usage_code` from task 1 remains valid)
 
 - [ ] **Step 5: Commit**
 
@@ -3891,18 +3891,18 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 16: Java-Fixture-Generator und Fixture-Lesetest
+### Task 16: Java fixture generator and fixture read test
 
 **Files:**
 - Create: `tools/fixture-gen/pom.xml`, `tools/fixture-gen/src/main/java/org/cryptomator/cli/fixtures/Gen.java`, `tools/fixture-gen/README.md`
-- Create: `tests/fixtures/<name>/…` (generiert, eingecheckt)
+- Create: `tests/fixtures/<name>/…` (generated, checked in)
 - Create: `crates/cryptomator-core/tests/fixtures_masterkey.rs`
 - Modify: `.gitignore`
 
 **Interfaces:**
-- Produces: Referenz-Vaults, je mit `fixture.json` (`{"name","cipherCombo","shorteningThreshold","passphrase":"test-password-123","masterkeyHex"}`) und `expected.json` (Liste `{"path","type":"file|dir|symlink","size","sha256","target"}`); Rust-Test, der für jedes Fixture Masterkey lädt, Vault-Config verifiziert und `masterkeyHex` sowie Cipher-Combo vergleicht (Meilenstein M1).
+- Produces: reference vaults, each with `fixture.json` (`{"name","cipherCombo","shorteningThreshold","passphrase":"test-password-123","masterkeyHex"}`) and `expected.json` (list of `{"path","type":"file|dir|symlink","size","sha256","target"}`); Rust test that loads the masterkey for every fixture, verifies the vault config and compares `masterkeyHex` and the cipher combo (milestone M1).
 
-- [ ] **Step 1: Maven-Projekt schreiben**
+- [ ] **Step 1: Write the Maven project**
 
 ```xml
 <!-- tools/fixture-gen/pom.xml -->
@@ -4152,14 +4152,14 @@ Regeneration changes nonces and salts but keeps each vault's masterkey (SHA-512 
 `test-password-123`. Commit the result; Rust tests read the fixtures without Java.
 ```
 
-`.gitignore` ergänzen: `/tools/fixture-gen/target`.
+Add to `.gitignore`: `/tools/fixture-gen/target`.
 
-- [ ] **Step 2: Fixtures erzeugen**
+- [ ] **Step 2: Generate the fixtures**
 
 Run: `mvn -q -f tools/fixture-gen/pom.xml compile exec:java -Dexec.args="gen $(pwd)/tests/fixtures" && ls tests/fixtures && cat tests/fixtures/siv_gcm_basic/fixture.json && du -sh tests/fixtures`
-Expected: acht Fixture-Verzeichnisse (`siv_gcm_basic`, `siv_ctrmac_basic`, `long_names`, `threshold_36`, `symlinks`, `nested`, `sizes`, `unicode`), je mit `vault.cryptomator`, `masterkey.cryptomator`, `d/`, `fixture.json`, `expected.json`; Gesamtgröße unter 1 MB. Falls `Files.createSymbolicLink` in cryptofs eine `UnsupportedOperationException` wirft, die Symlink-Zeilen im Populator auf `fs.provider().createSymbolicLink(...)` umstellen; falls der Fehler bleibt, Symlink-Fixture auskommentieren und im README notieren.
+Expected: eight fixture directories (`siv_gcm_basic`, `siv_ctrmac_basic`, `long_names`, `threshold_36`, `symlinks`, `nested`, `sizes`, `unicode`), each with `vault.cryptomator`, `masterkey.cryptomator`, `d/`, `fixture.json`, `expected.json`; total size under 1 MB. If `Files.createSymbolicLink` throws an `UnsupportedOperationException` in cryptofs, switch the symlink lines in the populator to `fs.provider().createSymbolicLink(...)`; if the error persists, comment out the symlink fixture and note it in the README.
 
-- [ ] **Step 3: Fehlschlagenden Rust-Test schreiben**
+- [ ] **Step 3: Write a failing Rust test**
 
 ```rust
 // crates/cryptomator-core/tests/fixtures_masterkey.rs
@@ -4225,19 +4225,19 @@ fn root_directory_of_every_fixture_exists_under_hashed_name() {
 }
 ```
 
-`crates/cryptomator-core/Cargo.toml` unter `[dev-dependencies]` ergänzen: `serde.workspace = true`, `serde_json.workspace = true`, `data-encoding.workspace = true` (serde/serde_json/data-encoding sind bereits normale Dependencies; Integrationstests sehen sie nur, wenn sie explizit auch als dev-dependency oder über die Crate re-exportiert sind – am einfachsten die drei Zeilen zusätzlich unter `[dev-dependencies]` eintragen).
+Add to `crates/cryptomator-core/Cargo.toml` under `[dev-dependencies]`: `serde.workspace = true`, `serde_json.workspace = true`, `data-encoding.workspace = true` (serde/serde_json/data-encoding are already regular dependencies; integration tests only see them if they are explicitly dev-dependencies as well or re-exported through the crate – simplest is to add the three lines under `[dev-dependencies]` too).
 
-- [ ] **Step 4: Test laufen lassen, Fehlschlag bestätigen**
-
-Run: `cargo test -p cryptomator-core --test fixtures_masterkey`
-Expected: FAIL, falls Fixtures fehlen oder ein Modul nicht exportiert ist; sonst PASS (dann ist Step 5 der Nachweis).
-
-- [ ] **Step 5: Test laufen lassen (alle Fixtures verifizieren)**
+- [ ] **Step 4: Run the test, confirm the failure**
 
 Run: `cargo test -p cryptomator-core --test fixtures_masterkey`
-Expected: PASS (2 Tests, 8 Fixtures). Ein Fehlschlag hier bedeutet eine Abweichung vom Java-Format und muss im betroffenen Modul (Task 6, 7 oder 12) behoben werden, nicht im Test.
+Expected: FAIL if fixtures are missing or a module is not exported; otherwise PASS (step 5 is then the proof).
 
-- [ ] **Step 6: Gesamtlauf und Commit**
+- [ ] **Step 5: Run the test (verify all fixtures)**
+
+Run: `cargo test -p cryptomator-core --test fixtures_masterkey`
+Expected: PASS (2 tests, 8 fixtures). A failure here means a deviation from the Java format and must be fixed in the affected module (task 6, 7 or 12), not in the test.
+
+- [ ] **Step 6: Full run and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: PASS
@@ -4251,13 +4251,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Selbstprüfung (durchgeführt beim Schreiben)
+## Self-check (performed while writing)
 
-- **Spec-Abdeckung M0:** Workspace/Lizenz/CI (Task 1), Spike B (Task 2), Spike A (Task 3), `cargo tree -d` wurde am 2026-09-04 bereits mit exakt der Dependency-Menge aus Task 1 geprüft: keine doppelten Crate-Generationen. Spec ins Repo: erledigt (Commit e988c7c).
-- **Spec-Abdeckung M1:** masterkey (4), scrypt/keywrap (5), Masterkey-Datei (6), SIV-Namen (7), Header/Content beider Schemata (8, 9), Cryptor + Größenmathematik (10), Streams (11), Vault-Config-JWT (12), Backups (13), Recovery-Wörter/Key (14), `recovery-key validate` (15), Fixture-Generator + Masterkey-Load aller Fixtures (16). `vectors.json` aus der Spec ist durch die eingebetteten Konstanten in den Modultests ersetzt; die Rohdaten liegen in diesem Plan.
-- **Typkonsistenz:** `Masterkey::{raw, enc_key, mac_key}` (Task 4) werden in 6, 7, 8, 9, 12, 14, 16 identisch verwendet; `FileHeader::{nonce, content_key, reserved, encode_payload, decode_payload}` (8) in 9–11; `Rng`/`DetRng::{default, starting_at}` (4) überall; `CipherCombo::{as_str, FromStr}` (10) in 12 und 16; `backup_file_name`/`generate_file_id_suffix` (13) in 14; `MasterkeyFileAccess::{load, persist}` (6) in 14 und 16; `KeyId::MasterkeyFile { file_name }` (12) in 16.
-- **Platzhalter:** keine; die Spike-Dokumente enthalten bewusst auszufüllende Ergebnisfelder in spitzen Klammern, die beim Durchführen ersetzt werden.
+- **Spec coverage M0:** workspace/license/CI (task 1), spike B (task 2), spike A (task 3), `cargo tree -d` was already checked on 2026-09-04 with exactly the dependency set from task 1: no duplicate crate generations. Spec into the repo: done (commit e988c7c).
+- **Spec coverage M1:** masterkey (4), scrypt/keywrap (5), masterkey file (6), SIV names (7), header/content of both schemes (8, 9), Cryptor + size math (10), streams (11), vault config JWT (12), backups (13), recovery words/key (14), `recovery-key validate` (15), fixture generator + masterkey load of all fixtures (16). `vectors.json` from the spec is replaced by the embedded constants in the module tests; the raw data lives in this plan.
+- **Type consistency:** `Masterkey::{raw, enc_key, mac_key}` (task 4) are used identically in 6, 7, 8, 9, 12, 14, 16; `FileHeader::{nonce, content_key, reserved, encode_payload, decode_payload}` (8) in 9–11; `Rng`/`DetRng::{default, starting_at}` (4) everywhere; `CipherCombo::{as_str, FromStr}` (10) in 12 and 16; `backup_file_name`/`generate_file_id_suffix` (13) in 14; `MasterkeyFileAccess::{load, persist}` (6) in 14 and 16; `KeyId::MasterkeyFile { file_name }` (12) in 16.
+- **Placeholders:** none; the spike documents deliberately contain result fields in angle brackets that are filled in when the spikes are run.
 
-## Ausführung
+## Execution
 
-Empfohlen: `superpowers:subagent-driven-development` – ein frischer Subagent pro Task, Review zwischen den Tasks. Alternative: `superpowers:executing-plans` in dieser Session. Task 3 (Spike A) kann erst nach Installation von FUSE-T oder macFUSE vollständig ausgeführt werden; die übrigen Tasks sind davon unabhängig.
+Recommended: `superpowers:subagent-driven-development` – a fresh subagent per task, review between tasks. Alternative: `superpowers:executing-plans` in this session. Task 3 (spike A) can only be run in full once FUSE-T or macFUSE has been installed; the remaining tasks are independent of it.

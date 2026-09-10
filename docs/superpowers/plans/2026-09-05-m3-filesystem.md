@@ -1,65 +1,65 @@
-# M3: Dateisystem + mountlose Operationen – Implementation Plan
+# M3: File system + mount-less operations – Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `cryptomator-core` erhält die Klartext-Dateisystemschicht von cryptofs 2.10.0 (Pfad-Mapping, Verzeichnislisting mit Konfliktauflösung, lange Namen, offene Dateien mit Chunk-Cache, Symlinks, Attribute, Events, Statistik), und `crypto` kann damit ohne Mount Vault-Inhalte lesen und schreiben (`fs ls|tree|cat|get|put|rm|mkdir|mv`) sowie Namen übersetzen (`name decrypt|locate`). Beide Richtungen sind gegen die echte Java-Bibliothek verifiziert.
+**Goal:** `cryptomator-core` gains the cleartext file system layer of cryptofs 2.10.0 (path mapping, directory listing with conflict resolution, long names, open files with chunk cache, symlinks, attributes, events, statistics), and `crypto` can use it to read and write vault contents without a mount (`fs ls|tree|cat|get|put|rm|mkdir|mv`) as well as translate names (`name decrypt|locate`). Both directions are verified against the real Java library.
 
-**Architecture:** Neues Modul `cryptomator_core::fs` mit einer Fassade `CryptoFs` (`&self`-API, `Send + Sync`, interior mutability über `Mutex`), damit M4 sie direkt hinter `fuser::Filesystem` legen kann. Alle Fehler der fs-Schicht sind `std::io::Error` mit sprechenden `ErrorKind`s (Errno-Mapping in M4). Klartextpfade sind ein eigener Typ `CleartextPath` (absolut, NFC-normalisiert). Das Binary `crypto` öffnet den Vault pro Kommando mit Passwort, führt die Operation aus und beendet sich; die CLI-Kommandos sind dünne Wrapper um `CryptoFs`.
+**Architecture:** New module `cryptomator_core::fs` with a facade `CryptoFs` (`&self` API, `Send + Sync`, interior mutability via `Mutex`) so that M4 can place it directly behind `fuser::Filesystem`. All errors of the fs layer are `std::io::Error` with meaningful `ErrorKind`s (errno mapping in M4). Cleartext paths are their own type `CleartextPath` (absolute, NFC-normalized). The `crypto` binary opens the vault with a password per command, performs the operation and exits; the CLI commands are thin wrappers around `CryptoFs`.
 
-**Tech Stack:** Rust stable ≥ 1.85; bestehende Crates; neu in `cryptomator-core`: `regex` 1 (BASE64_PATTERN), `unicode-normalization` 0.1 (Klartextnamen NFC), `proptest` 1 (dev). Java 21+/Maven für Interop.
+**Tech Stack:** Rust stable ≥ 1.85; existing crates; new in `cryptomator-core`: `regex` 1 (BASE64_PATTERN), `unicode-normalization` 0.1 (cleartext names NFC), `proptest` 1 (dev). Java 21+/Maven for interop.
 
-**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (Tabelle `cryptomator-core` → `fs/*`, Kommandogrammatur `fs`/`name`, Exit-Codes, Meilenstein M3)
+**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (table `cryptomator-core` → `fs/*`, command grammar `fs`/`name`, exit codes, milestone M3)
 
 ## Global Constraints
 
-- Arbeitsverzeichnis `/Users/rfoerthe/work/cryptomator-cli`, Branch `feature/m3-filesystem` (von `main@2bf7eb3`).
-- Lizenz AGPL-3.0-only; `#![forbid(unsafe_code)]`; kein `unwrap()`/`expect()` auf Eingabedaten in Library- und Binary-Code (Tests dürfen). MSRV 1.85: keine `io::ErrorKind`-Varianten benutzen, die erst später stabil wurden (`FilesystemLoop`, `InvalidFilename` → stattdessen `Other`/`InvalidInput` mit Text; erlaubt: `NotFound`, `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`, `ReadOnlyFilesystem`, `InvalidInput`, `InvalidData`, `PermissionDenied`, `Unsupported`, `UnexpectedEof`, `Other`). Falls clippy `incompatible_msrv` meldet, auf `Other` ausweichen.
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` vor jedem Commit sauber; Commit-Nachricht endet mit `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
-- `tests/fixtures/` ist read-only: Tests kopieren Fixtures in ein Tempdir. Nichts unter `~/.m2` oder im Desktop-Checkout ändern.
-- Java-Parität (cryptofs 2.10.0) ist der Maßstab: Verzeichnisformat `d/XX/YYYY…/<base64url>.c9r`, `.c9s`-Verzeichnisse mit `name.c9s` (+ `contents.c9r`/`dir.c9r`/`symlink.c9r`), `dirid.c9r` pro Content-Dir, `dir.c9r` = Klartext-UUID (fehlend → zufällige UUID), Shortening ab `ciphertextName.len() > shorteningThreshold`, `.c9u` nie listen und nie erzeugen, versteckte Konfliktdateien (`.`-Präfix) ignorieren, Konfliktauflösung wie `C9rConflictResolver` (Umbenennung mit Original-Suffix bzw. ` (1)`…` (9)`), `BASE64_PATTERN` = `[A-Za-z0-9_-]{20}(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{4}|[A-Za-z0-9_-]{3}=|[A-Za-z0-9_-]{2}==)`, Chunk-Cache 5 Chunks, Header wird bei beschreibbaren Dateien beim Flush geschrieben (leere Datei = nur Header), `cleartextSize`-Fehler ⇒ Größe 0, `maxCleartextFileNameLength = (threshold - 4) / 4 * 3 - 16` für Konfliktnamen, Standard-Namenslimit 10240 Zeichen (`CryptoFileSystemProperties.DEFAULT_MAX_CLEARTEXT_NAME_LENGTH`).
-- Bewusste Abweichungen von Java (im Code kommentieren, in Task 14 dokumentieren): (1) relative Symlink-Ziele werden gegen das Elternverzeichnis des Links aufgelöst (POSIX), nicht gegen die Wurzel; (2) im Read-only-Modus werden Konflikte nicht umbenannt, sondern übersprungen (Event `ConflictResolutionFailed`); (3) der Verzeichnis-Cache hat keine 20-s-Verfallszeit (Prozess ist kurzlebig; M4 ergänzt Expiry); (4) `fs mv` verschiebt nie „in“ ein Zielverzeichnis hinein (Java `Files.move`-Semantik); (5) `.c9s`-Verzeichnisse werden nur bei Schreibzugriff angelegt, nicht bei Lesezugriff.
-- Klartextnamen werden beim Parsen NFC-normalisiert (`CryptoPathFactory`); Listing liefert Namen so, wie sie entschlüsselt werden.
-- Passwörter, Recovery-Keys, Masterkeys, Content-Keys und Klartext-Chunks erscheinen nie in Fehlermeldungen/Logs; Klartext-Chunks liegen in `Zeroizing<Vec<u8>>`.
-- Exit-Codes wie M2: 0 ok, 1 allgemein (auch Klartextpfad-Fehler wie „nicht gefunden“), 2 Usage, 3 Vault nicht gefunden, 4 Passwort ungültig, 5 falscher Zustand (auch `usesReadOnlyMode=true` bei Schreibkommandos), 9 Hub, 12 kein Vault-Verzeichnis. `fs`/`name`-Kommandos verlangen Zustand `LOCKED` und lesen das Passwort wie in M2 (`PasswordArgs`); Hub-Check vor dem Passwort.
-- Alle `fs`-Schreibkommandos respektieren `usesReadOnlyMode` der Vault-Einstellung; `maxCleartextFilenameLength > 0` aus den Einstellungen begrenzt neue Namen, `-1` ⇒ 10240.
+- Working directory `/Users/rfoerthe/work/cryptomator-cli`, branch `feature/m3-filesystem` (from `main@2bf7eb3`).
+- License AGPL-3.0-only; `#![forbid(unsafe_code)]`; no `unwrap()`/`expect()` on input data in library and binary code (tests may). MSRV 1.85: do not use `io::ErrorKind` variants that were stabilized only later (`FilesystemLoop`, `InvalidFilename` → use `Other`/`InvalidInput` with text instead; allowed: `NotFound`, `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`, `ReadOnlyFilesystem`, `InvalidInput`, `InvalidData`, `PermissionDenied`, `Unsupported`, `UnexpectedEof`, `Other`). If clippy reports `incompatible_msrv`, fall back to `Other`.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` clean before every commit; commit message ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- `tests/fixtures/` is read-only: tests copy fixtures into a tempdir. Change nothing under `~/.m2` or in the desktop checkout.
+- Java parity (cryptofs 2.10.0) is the benchmark: directory format `d/XX/YYYY…/<base64url>.c9r`, `.c9s` directories with `name.c9s` (+ `contents.c9r`/`dir.c9r`/`symlink.c9r`), `dirid.c9r` per content dir, `dir.c9r` = cleartext UUID (missing → random UUID), shortening from `ciphertextName.len() > shorteningThreshold`, never list and never create `.c9u`, ignore hidden conflict files (`.` prefix), conflict resolution like `C9rConflictResolver` (rename with original suffix or ` (1)`…` (9)`), `BASE64_PATTERN` = `[A-Za-z0-9_-]{20}(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{4}|[A-Za-z0-9_-]{3}=|[A-Za-z0-9_-]{2}==)`, chunk cache 5 chunks, the header is written on flush for writable files (empty file = header only), `cleartextSize` error ⇒ size 0, `maxCleartextFileNameLength = (threshold - 4) / 4 * 3 - 16` for conflict names, default name limit 10240 characters (`CryptoFileSystemProperties.DEFAULT_MAX_CLEARTEXT_NAME_LENGTH`).
+- Deliberate deviations from Java (comment them in the code, document them in Task 14): (1) relative symlink targets are resolved against the parent directory of the link (POSIX), not against the root; (2) in read-only mode conflicts are not renamed but skipped (event `ConflictResolutionFailed`); (3) the directory cache has no 20 s expiry (the process is short-lived; M4 adds expiry); (4) `fs mv` never moves "into" a destination directory (Java `Files.move` semantics); (5) `.c9s` directories are only created on write access, not on read access.
+- Cleartext names are NFC-normalized when parsed (`CryptoPathFactory`); listing returns names exactly as they are decrypted.
+- Passwords, recovery keys, masterkeys, content keys and cleartext chunks never appear in error messages/logs; cleartext chunks live in `Zeroizing<Vec<u8>>`.
+- Exit codes as in M2: 0 ok, 1 general (including cleartext path errors such as "not found"), 2 usage, 3 vault not found, 4 password invalid, 5 wrong state (including `usesReadOnlyMode=true` for write commands), 9 Hub, 12 no vault directory. `fs`/`name` commands require state `LOCKED` and read the password as in M2 (`PasswordArgs`); Hub check before the password.
+- All `fs` write commands respect `usesReadOnlyMode` of the vault settings; `maxCleartextFilenameLength > 0` from the settings limits new names, `-1` ⇒ 10240.
 
 ---
 
-## Dateistruktur
+## File structure
 
 ```
 crates/cryptomator-core/Cargo.toml                    + regex, unicode-normalization; dev: proptest
-crates/cryptomator-core/src/lib.rs                     + pub mod fs; Re-Exporte
-crates/cryptomator-core/src/fs/mod.rs                  Modulbaum, io-Fehlerhelfer, lock(), testutil
-crates/cryptomator-core/src/fs/path.rs                 CleartextPath (absolut, NFC, normalisiert)
+crates/cryptomator-core/src/lib.rs                     + pub mod fs; re-exports
+crates/cryptomator-core/src/fs/mod.rs                  module tree, io error helpers, lock(), testutil
+crates/cryptomator-core/src/fs/path.rs                 CleartextPath (absolute, NFC, normalized)
 crates/cryptomator-core/src/fs/events.rs               FilesystemEvent, EventSink, EventCollector
 crates/cryptomator-core/src/fs/stats.rs                CryptoFsStats, StatsSnapshot
 crates/cryptomator-core/src/fs/long_names.rs           deflate/inflate/DeflatedFileName (LongFileNameProvider)
 crates/cryptomator-core/src/fs/ciphertext_path.rs      CiphertextFileType, CiphertextDirectory, CiphertextFilePath
-crates/cryptomator-core/src/fs/dir_id.rs               DirIdLoader (+Cache), dirid.c9r read/write (DirectoryIdLoader/-Backup)
+crates/cryptomator-core/src/fs/dir_id.rs               DirIdLoader (+cache), dirid.c9r read/write (DirectoryIdLoader/-Backup)
 crates/cryptomator-core/src/fs/path_mapper.rs          CryptoPathMapper (+CiphertextDirCache)
 crates/cryptomator-core/src/fs/dir_stream.rs           DirectoryLister: C9rDecryptor, C9rConflictResolver, C9sInflator, BrokenDirectoryFilter
 crates/cryptomator-core/src/fs/open_file.rs            OpenOptions, OpenCryptoFile, ChunkCache (fh/*, ch/CleartextFileChannel)
 crates/cryptomator-core/src/fs/open_files.rs           OpenCryptoFiles, FileHandle, TwoPhaseMove
 crates/cryptomator-core/src/fs/symlinks.rs             Symlinks
 crates/cryptomator-core/src/fs/attrs.rs                FileAttributes (attr/*)
-crates/cryptomator-core/src/fs/crypto_fs.rs            CryptoFs-Fassade (CryptoFileSystemImpl)
+crates/cryptomator-core/src/fs/crypto_fs.rs            CryptoFs facade (CryptoFileSystemImpl)
 crates/cryptomator-core/src/fs/name_decryptor.rs       decrypt_filename (FileNameDecryptor)
 crates/cryptomator-core/src/fs/capabilities.rs         determine_supported_cleartext_file_name_length
-crates/cryptomator-core/tests/common/mod.rs            Fixture-Helfer (Kopie, Masterkey aus fixture.json, expected.json)
-crates/cryptomator-core/tests/crypto_fs_fixtures.rs    alle 8 Fixtures via CryptoFs == expected.json
-crates/crypto/src/cli.rs                               + Fs/Name-Grammatik
-crates/crypto/src/commands/{mod,fs,name}.rs            open_fs, fs-/name-Kommandos
+crates/cryptomator-core/tests/common/mod.rs            fixture helpers (copy, masterkey from fixture.json, expected.json)
+crates/cryptomator-core/tests/crypto_fs_fixtures.rs    all 8 fixtures via CryptoFs == expected.json
+crates/crypto/src/cli.rs                               + Fs/Name grammar
+crates/crypto/src/commands/{mod,fs,name}.rs            open_fs, fs/name commands
 crates/crypto/src/output.rs                            + format_timestamp
-crates/crypto/tests/common/mod.rs                      Sandbox (aus cli.rs verschoben) + Fixture-Kopie
-crates/crypto/tests/cli_fs.rs, cli_name.rs             assert_cmd-Tests
-crates/crypto/tests/java_interop.rs                    + Rust-geschriebener Baum → Java verify; Fixtures → fs tree
-README.md, CHANGELOG.md, Spec                          aktualisiert
+crates/crypto/tests/common/mod.rs                      Sandbox (moved out of cli.rs) + fixture copy
+crates/crypto/tests/cli_fs.rs, cli_name.rs             assert_cmd tests
+crates/crypto/tests/java_interop.rs                    + Rust-written tree → Java verify; fixtures → fs tree
+README.md, CHANGELOG.md, Spec                          updated
 ```
 
-Gemeinsame Typen (alle in `cryptomator_core::fs`, Re-Export in `lib.rs`):
+Shared types (all in `cryptomator_core::fs`, re-exported in `lib.rs`):
 
-- `CleartextPath` (Task 1) – Schlüssel aller Klartext-APIs.
+- `CleartextPath` (Task 1) – the key to all cleartext APIs.
 - `EventSink = Arc<dyn Fn(FilesystemEvent) + Send + Sync>` (Task 1).
 - `CiphertextFileType { File, Directory, Symlink }`, `CiphertextDirectory { dir_id, path }`, `CiphertextFilePath` (Task 2).
 - `DirEntry { cleartext_name, ciphertext_path, extracted_ciphertext }` (Task 5).
@@ -68,29 +68,29 @@ Gemeinsame Typen (alle in `cryptomator_core::fs`, Re-Export in `lib.rs`):
 
 ---
 
-### Task 1: Grundlagen – `fs`-Modul, `CleartextPath`, Events, Statistik
+### Task 1: Foundations – `fs` module, `CleartextPath`, events, statistics
 
 **Files:**
 - Modify: `crates/cryptomator-core/Cargo.toml`, `Cargo.toml` (workspace deps), `crates/cryptomator-core/src/lib.rs`
 - Create: `crates/cryptomator-core/src/fs/mod.rs`, `fs/path.rs`, `fs/events.rs`, `fs/stats.rs`
 
 **Interfaces:**
-- Produces: `CleartextPath::{root, parse, elements, is_root, depth, parent, file_name, join, join_path, starts_with, rebase}`, `Display` (`/a/b`, Wurzel `/`); `fs::child_display(dir, name) -> String`; `FilesystemEvent` + `kind()` + `Display`; `EventSink`, `discard_events()`, `EventCollector::{new, sink, take, kinds}`; `CryptoFsStats` + `StatsSnapshot`; `fs::lock(&Mutex<T>)`; io-Helfer `fs::{not_found, already_exists, not_a_directory, is_a_directory, directory_not_empty, invalid_input, invalid_data, read_only_fs, name_too_long, not_a_link, fs_loop}`; `fs::testutil::new_vault(threshold) -> (TempDir, Arc<Cryptor>, VaultConfig)` (cfg(test)).
+- Produces: `CleartextPath::{root, parse, elements, is_root, depth, parent, file_name, join, join_path, starts_with, rebase}`, `Display` (`/a/b`, root `/`); `fs::child_display(dir, name) -> String`; `FilesystemEvent` + `kind()` + `Display`; `EventSink`, `discard_events()`, `EventCollector::{new, sink, take, kinds}`; `CryptoFsStats` + `StatsSnapshot`; `fs::lock(&Mutex<T>)`; io helpers `fs::{not_found, already_exists, not_a_directory, is_a_directory, directory_not_empty, invalid_input, invalid_data, read_only_fs, name_too_long, not_a_link, fs_loop}`; `fs::testutil::new_vault(threshold) -> (TempDir, Arc<Cryptor>, VaultConfig)` (cfg(test)).
 
-- [ ] **Step 1: Abhängigkeiten**
+- [ ] **Step 1: Dependencies**
 
-`Cargo.toml` (Workspace) unter `[workspace.dependencies]` ergänzen:
+`Cargo.toml` (workspace), add under `[workspace.dependencies]`:
 
 ```toml
 regex = "1"
 proptest = "1"
 ```
 
-`crates/cryptomator-core/Cargo.toml`: unter `[dependencies]` `regex.workspace = true` und `unicode-normalization.workspace = true`; unter `[dev-dependencies]` `proptest.workspace = true`.
+`crates/cryptomator-core/Cargo.toml`: under `[dependencies]` `regex.workspace = true` and `unicode-normalization.workspace = true`; under `[dev-dependencies]` `proptest.workspace = true`.
 
-- [ ] **Step 2: Failing tests für `CleartextPath`**
+- [ ] **Step 2: Failing tests for `CleartextPath`**
 
-`crates/cryptomator-core/src/fs/path.rs` (Tests am Dateiende):
+`crates/cryptomator-core/src/fs/path.rs` (tests at the end of the file):
 
 ```rust
 #[cfg(test)]
@@ -156,7 +156,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Implementierung `fs/mod.rs`, `fs/path.rs`, `fs/events.rs`, `fs/stats.rs`**
+- [ ] **Step 3: Implementation `fs/mod.rs`, `fs/path.rs`, `fs/events.rs`, `fs/stats.rs`**
 
 `crates/cryptomator-core/src/fs/mod.rs`:
 
@@ -270,7 +270,7 @@ pub(crate) mod testutil {
 }
 ```
 
-Die Untermodule, die erst in späteren Tasks entstehen, werden in diesem Task als **leere Dateien mit nur einem Doc-Kommentar** angelegt (`//! Task N`), damit `mod.rs` kompiliert; die `pub use`-Zeilen für noch nicht existierende Typen werden in diesem Task **auskommentiert** und in den jeweiligen Tasks aktiviert.
+The submodules that only come into existence in later tasks are created in this task as **empty files with just a doc comment** (`//! Task N`) so that `mod.rs` compiles; the `pub use` lines for types that do not exist yet are **commented out** in this task and activated in the respective tasks.
 
 `crates/cryptomator-core/src/fs/path.rs`:
 
@@ -584,12 +584,12 @@ mod tests {
 }
 ```
 
-`crates/cryptomator-core/src/lib.rs`: `pub mod fs;` ergänzen und `pub use fs::CleartextPath;` (weitere Re-Exporte kommen mit den Tasks).
+`crates/cryptomator-core/src/lib.rs`: add `pub mod fs;` and `pub use fs::CleartextPath;` (further re-exports arrive with the tasks).
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p cryptomator-core fs::`
-Expected: PASS (5 path-Tests, 1 stats-Test)
+Expected: PASS (5 path tests, 1 stats test)
 
 - [ ] **Step 5: Gate + Commit**
 
@@ -603,19 +603,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Lange Namen und Ciphertext-Pfade
+### Task 2: Long names and ciphertext paths
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/long_names.rs`, `crates/cryptomator-core/src/fs/ciphertext_path.rs`
-- Modify: `crates/cryptomator-core/src/fs/mod.rs` (Re-Exporte aktivieren)
+- Modify: `crates/cryptomator-core/src/fs/mod.rs` (activate re-exports)
 
 **Interfaces:**
 - Consumes: `constants::{CRYPTOMATOR_FILE_SUFFIX, DEFLATED_FILE_SUFFIX, INFLATED_FILE_NAME, CONTENTS_FILE_NAME, DIR_FILE_NAME, SYMLINK_FILE_NAME}`, `FileNameCryptor::encrypt_filename`.
 - Produces: `long_names::{MAX_FILENAME_BUFFER_SIZE, DeflatedFileName{c9s_path, long_name}::persist, is_deflated, deflate(&Path) -> DeflatedFileName, inflate(&Path) -> io::Result<String>}`; `CiphertextFileType::{File, Directory, Symlink}::as_str` (`"file"|"dir"|"symlink"`); `CiphertextDirectory { dir_id: String, path: PathBuf }`; `CiphertextFilePath::{new(PathBuf, Option<DeflatedFileName>), raw_path, is_shortened, file_path, dir_file_path, symlink_file_path, inflated_name_path, persist_long_file_name}`.
 
-- [ ] **Step 1: Failing test gegen das `long_names`-Fixture**
+- [ ] **Step 1: Failing test against the `long_names` fixture**
 
-Am Ende von `fs/long_names.rs`:
+At the end of `fs/long_names.rs`:
 
 ```rust
 #[cfg(test)]
@@ -673,7 +673,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung**
+- [ ] **Step 2: Implementation**
 
 `fs/long_names.rs`:
 
@@ -824,13 +824,13 @@ mod tests {
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::long_names fs::ciphertext_path`
-Expected: PASS (3 Tests)
+Expected: PASS (3 tests)
 
-- [ ] **Step 4: Gate + Commit** (`git add crates/cryptomator-core`; Nachricht „Add long file name handling and ciphertext path types“ mit Trailer)
+- [ ] **Step 4: Gate + Commit** (`git add crates/cryptomator-core`; message "Add long file name handling and ciphertext path types" with trailer)
 
 ---
 
-### Task 3: Directory-IDs – Loader mit Cache und `dirid.c9r`-Backup
+### Task 3: Directory IDs – loader with cache and `dirid.c9r` backup
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/dir_id.rs`
@@ -926,7 +926,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung**
+- [ ] **Step 2: Implementation**
 
 ```rust
 //! `DirectoryIdLoader`/`DirectoryIdProvider` (dir.c9r → directory id, cached) and `DirectoryIdBackup`
@@ -956,7 +956,7 @@ pub struct DirIdLoader {
 impl std::fmt::Debug for EventSinkDebug<'_> { /* not needed */ }
 ```
 
-(Den `EventSinkDebug`-Platzhalter oben **nicht** übernehmen – `DirIdLoader` bekommt ein manuelles `Debug`, das nur die Cache-Größe zeigt:)
+(Do **not** adopt the `EventSinkDebug` placeholder above – `DirIdLoader` gets a manual `Debug` that only shows the cache size:)
 
 ```rust
 pub struct DirIdLoader {
@@ -1060,24 +1060,24 @@ pub fn read_dir_id_backup(cryptor: &Cryptor, content_dir: &Path) -> Result<Strin
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::dir_id`
-Expected: PASS (4 Tests)
+Expected: PASS (4 tests)
 
-- [ ] **Step 4: Gate + Commit** („Add directory id loader and dirid.c9r backup“)
+- [ ] **Step 4: Gate + Commit** ("Add directory id loader and dirid.c9r backup")
 
 ---
 
-### Task 4: `CryptoPathMapper` und Test-Helfer für Fixtures
+### Task 4: `CryptoPathMapper` and test helpers for fixtures
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/path_mapper.rs`, `crates/cryptomator-core/tests/common/mod.rs`
 - Modify: `crates/cryptomator-core/src/fs/mod.rs`, `crates/cryptomator-core/src/lib.rs`
 
 **Interfaces:**
-- Consumes: Task 1–3.
+- Consumes: Tasks 1–3.
 - Produces: `CryptoPathMapper::{new(vault_path: &Path, cryptor: Arc<Cryptor>, dir_ids: Arc<DirIdLoader>, shortening_threshold: u32, events: EventSink), root() -> &CiphertextDirectory, shortening_threshold() -> usize, ciphertext_file_name(dir_id, cleartext_name) -> String, assert_non_existing(&CleartextPath) -> io::Result<()>, ciphertext_file_type(&CleartextPath) -> io::Result<CiphertextFileType>, ciphertext_file_path(&CleartextPath) -> io::Result<CiphertextFilePath>, ciphertext_file_path_in(parent_dir: &Path, parent_dir_id: &str, name: &str) -> CiphertextFilePath, ciphertext_dir(&CleartextPath) -> io::Result<CiphertextDirectory>, resolve_directory(dir_file: &Path) -> io::Result<CiphertextDirectory>, resolve_directory_id(&str) -> CiphertextDirectory, invalidate_path_mapping(&CleartextPath), move_path_mapping(src, dst)}`.
-- Test-Helfer `tests/common/mod.rs`: `PASSPHRASE`, `fixtures_root()`, `copy_recursively(src, dst)`, `copy_fixture(name) -> TempDir`, `FixtureMeta { cipher_combo, shortening_threshold, passphrase, masterkey_hex }`, `fixture_meta(vault)`, `open_fixture(name) -> (TempDir, OpenedVault)` (Masterkey aus `masterkeyHex`, kein scrypt), `ExpectedEntry { path, kind, size, sha256, target }` (Ord), `expected_entries(vault) -> Vec<ExpectedEntry>`.
+- Test helpers `tests/common/mod.rs`: `PASSPHRASE`, `fixtures_root()`, `copy_recursively(src, dst)`, `copy_fixture(name) -> TempDir`, `FixtureMeta { cipher_combo, shortening_threshold, passphrase, masterkey_hex }`, `fixture_meta(vault)`, `open_fixture(name) -> (TempDir, OpenedVault)` (masterkey from `masterkeyHex`, no scrypt), `ExpectedEntry { path, kind, size, sha256, target }` (Ord), `expected_entries(vault) -> Vec<ExpectedEntry>`.
 
-- [ ] **Step 1: Test-Helfer**
+- [ ] **Step 1: Test helpers**
 
 `crates/cryptomator-core/tests/common/mod.rs`:
 
@@ -1165,7 +1165,7 @@ pub const FIXTURE_NAMES: [&str; 8] = [
 ];
 ```
 
-- [ ] **Step 2: Failing tests** (Unit-Tests in `path_mapper.rs` mit `testutil::new_vault`)
+- [ ] **Step 2: Failing tests** (unit tests in `path_mapper.rs` with `testutil::new_vault`)
 
 ```rust
 #[cfg(test)]
@@ -1257,9 +1257,9 @@ mod tests {
 }
 ```
 
-(`node.join_dir_file()` im Test ist ein Tippfehler-Schutz: **`node.dir_file_path()`** verwenden.)
+(`node.join_dir_file()` in the test is a typo guard: use **`node.dir_file_path()`**.)
 
-- [ ] **Step 3: Implementierung `fs/path_mapper.rs`**
+- [ ] **Step 3: Implementation `fs/path_mapper.rs`**
 
 ```rust
 //! `CryptoPathMapper` + `CiphertextDirCache`: cleartext path ↔ ciphertext node / content directory.
@@ -1438,13 +1438,13 @@ impl CryptoPathMapper {
 - [ ] **Step 4: Tests**
 
 Run: `cargo test -p cryptomator-core fs::path_mapper`
-Expected: PASS (4 Tests)
+Expected: PASS (4 tests)
 
-- [ ] **Step 5: Gate + Commit** („Add CryptoPathMapper with directory cache“)
+- [ ] **Step 5: Gate + Commit** ("Add CryptoPathMapper with directory cache")
 
 ---
 
-### Task 5: Verzeichnislisting mit Konfliktauflösung
+### Task 5: Directory listing with conflict resolution
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/dir_stream.rs`
@@ -1452,7 +1452,7 @@ Expected: PASS (4 Tests)
 
 **Interfaces:**
 - Consumes: `CryptoPathMapper`, `long_names::inflate`, `EventSink`, `constants`.
-- Produces: `DirEntry { cleartext_name: String, ciphertext_path: PathBuf, extracted_ciphertext: String }`; `dir_stream::matches_encrypted_content_pattern(name) -> bool`; `DirectoryLister<'a> { mapper: &'a CryptoPathMapper, cryptor: &'a Cryptor, events: &'a EventSink, read_only: bool }` mit `list(&CleartextPath) -> io::Result<Vec<DirEntry>>` (sortiert nach `cleartext_name`) und `list_ciphertext_dir(&CleartextPath, &CiphertextDirectory)`.
+- Produces: `DirEntry { cleartext_name: String, ciphertext_path: PathBuf, extracted_ciphertext: String }`; `dir_stream::matches_encrypted_content_pattern(name) -> bool`; `DirectoryLister<'a> { mapper: &'a CryptoPathMapper, cryptor: &'a Cryptor, events: &'a EventSink, read_only: bool }` with `list(&CleartextPath) -> io::Result<Vec<DirEntry>>` (sorted by `cleartext_name`) and `list_ciphertext_dir(&CleartextPath, &CiphertextDirectory)`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1619,9 +1619,9 @@ mod tests {
 }
 ```
 
-(`fx.lister`/`events_sink` können entfallen, wenn `names()` genügt – der Implementierer räumt Unbenutztes auf.)
+(`fx.lister`/`events_sink` can be dropped if `names()` is enough – the implementer cleans up whatever is unused.)
 
-- [ ] **Step 2: Implementierung `fs/dir_stream.rs`**
+- [ ] **Step 2: Implementation `fs/dir_stream.rs`**
 
 ```rust
 //! Directory listing pipeline (`dir/*`): filter → `C9rDecryptor` → `C9rConflictResolver` /
@@ -1903,24 +1903,24 @@ fn has_same_file_content(conflicting: &Path, canonical: &Path) -> io::Result<boo
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::dir_stream`
-Expected: PASS (8 Tests)
+Expected: PASS (8 tests)
 
-- [ ] **Step 4: Gate + Commit** („Add directory listing with conflict resolution“)
+- [ ] **Step 4: Gate + Commit** ("Add directory listing with conflict resolution")
 
 
 ---
 
-### Task 6: `OpenCryptoFile` mit Chunk-Cache
+### Task 6: `OpenCryptoFile` with chunk cache
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/open_file.rs`
-- Modify: `crates/cryptomator-core/src/fs/mod.rs`, `crates/cryptomator-core/src/crypto/stream.rs` (falls `read_fully_at` geteilt wird – optional)
+- Modify: `crates/cryptomator-core/src/fs/mod.rs`, `crates/cryptomator-core/src/crypto/stream.rs` (if `read_fully_at` is shared – optional)
 
 **Interfaces:**
 - Consumes: `Cryptor`, `FileHeader`, `Rng`, `CryptoFsStats`, `EventSink`.
-- Produces: `OpenOptions { read, write, create, create_new, truncate }` mit `::read_only()`, `::write_new()`, `::write_truncate()`, `::read_write()`, `normalized()`; `open_file::MAX_CACHED_CLEARTEXT_CHUNKS = 5`; `OpenCryptoFile::{open(cryptor: Arc<Cryptor>, rng: Box<dyn Rng + Send>, stats: Arc<CryptoFsStats>, events: EventSink, path: &Path, options: OpenOptions) -> io::Result<Self>, path() -> Option<&Path>, set_path(Option<PathBuf>), is_writable(), reopen_writable() -> io::Result<()>, size() -> u64, read_at(&mut self, &mut [u8], u64) -> io::Result<usize>, write_at(&mut self, &[u8], u64) -> io::Result<usize>, truncate(&mut self, u64) -> io::Result<()>, flush(&mut self) -> io::Result<()>, sync(&mut self, metadata: bool) -> io::Result<()>, last_modified() -> Option<SystemTime>, set_last_modified(SystemTime), persist_last_modified() -> io::Result<()>, handles() -> usize, retain(), release() -> usize}`.
+- Produces: `OpenOptions { read, write, create, create_new, truncate }` with `::read_only()`, `::write_new()`, `::write_truncate()`, `::read_write()`, `normalized()`; `open_file::MAX_CACHED_CLEARTEXT_CHUNKS = 5`; `OpenCryptoFile::{open(cryptor: Arc<Cryptor>, rng: Box<dyn Rng + Send>, stats: Arc<CryptoFsStats>, events: EventSink, path: &Path, options: OpenOptions) -> io::Result<Self>, path() -> Option<&Path>, set_path(Option<PathBuf>), is_writable(), reopen_writable() -> io::Result<()>, size() -> u64, read_at(&mut self, &mut [u8], u64) -> io::Result<usize>, write_at(&mut self, &[u8], u64) -> io::Result<usize>, truncate(&mut self, u64) -> io::Result<()>, flush(&mut self) -> io::Result<()>, sync(&mut self, metadata: bool) -> io::Result<()>, last_modified() -> Option<SystemTime>, set_last_modified(SystemTime), persist_last_modified() -> io::Result<()>, handles() -> usize, retain(), release() -> usize}`.
 
-- [ ] **Step 1: Failing tests** (Ende von `open_file.rs`)
+- [ ] **Step 1: Failing tests** (end of `open_file.rs`)
 
 ```rust
 #[cfg(test)]
@@ -2118,7 +2118,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung `fs/open_file.rs`**
+- [ ] **Step 2: Implementation `fs/open_file.rs`**
 
 ```rust
 //! One open ciphertext file (`fh/OpenCryptoFile`, `fh/ChunkCache`, `fh/ChunkLoader`, `fh/ChunkSaver`,
@@ -2581,18 +2581,18 @@ fn encrypt_and_write(cryptor: &Cryptor, rng: &mut dyn Rng, file: &File, header: 
 }
 ```
 
-Hinweis: `Rng` muss `Send`-fähig als Trait-Objekt sein – `OsRng` und `DetRng` sind es bereits; falls der Compiler `dyn Rng + Send` ablehnt, `Rng: Send` **nicht** als Supertrait einführen, sondern die Box-Typen so belassen (beide Implementierungen sind `Send`).
+Note: `Rng` must be `Send`-capable as a trait object – `OsRng` and `DetRng` already are; if the compiler rejects `dyn Rng + Send`, do **not** introduce `Rng: Send` as a supertrait, but leave the box types as they are (both implementations are `Send`).
 
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::open_file`
 Expected: PASS (5 Tests + 1 proptest)
 
-- [ ] **Step 4: Gate + Commit** („Add OpenCryptoFile with LRU chunk cache“)
+- [ ] **Step 4: Gate + Commit** ("Add OpenCryptoFile with LRU chunk cache")
 
 ---
 
-### Task 7: Registry offener Dateien und Handles
+### Task 7: Registry of open files and handles
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/open_files.rs`
@@ -2600,7 +2600,7 @@ Expected: PASS (5 Tests + 1 proptest)
 
 **Interfaces:**
 - Consumes: Task 6.
-- Produces: `RngFactory = Arc<dyn Fn() -> Box<dyn Rng + Send> + Send + Sync>`; `OpenCryptoFiles::{new(cryptor: Arc<Cryptor>, stats: Arc<CryptoFsStats>, events: EventSink, rng_factory: RngFactory), get(&Path) -> Option<Arc<Mutex<OpenCryptoFile>>>, open(&Path, OpenOptions) -> io::Result<FileHandle>, delete(&Path), prepare_move(src: &Path, dst: &Path) -> io::Result<TwoPhaseMove>, close_all() -> io::Result<()>, len()}`; `FileHandle::{read_at, read_exact_at, write_at, write_all_at, truncate, size, flush, sync(bool), set_last_modified, close(self) -> io::Result<()>}` (Drop schließt still); `TwoPhaseMove::commit(self)` (Drop = rollback).
+- Produces: `RngFactory = Arc<dyn Fn() -> Box<dyn Rng + Send> + Send + Sync>`; `OpenCryptoFiles::{new(cryptor: Arc<Cryptor>, stats: Arc<CryptoFsStats>, events: EventSink, rng_factory: RngFactory), get(&Path) -> Option<Arc<Mutex<OpenCryptoFile>>>, open(&Path, OpenOptions) -> io::Result<FileHandle>, delete(&Path), prepare_move(src: &Path, dst: &Path) -> io::Result<TwoPhaseMove>, close_all() -> io::Result<()>, len()}`; `FileHandle::{read_at, read_exact_at, write_at, write_all_at, truncate, size, flush, sync(bool), set_last_modified, close(self) -> io::Result<()>}` (Drop closes silently); `TwoPhaseMove::commit(self)` (Drop = rollback).
 
 - [ ] **Step 1: Failing tests**
 
@@ -2685,7 +2685,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung `fs/open_files.rs`**
+- [ ] **Step 2: Implementation `fs/open_files.rs`**
 
 ```rust
 //! `fh/OpenCryptoFiles`: one `OpenCryptoFile` per (normalised) ciphertext path, shared by all
@@ -2940,18 +2940,18 @@ impl Drop for TwoPhaseMove {
 }
 ```
 
-Für den Test-Zugriff auf `FileHandle.file` (`Arc::ptr_eq`) das Feld `pub(crate)` machen.
+For test access to `FileHandle.file` (`Arc::ptr_eq`), make the field `pub(crate)`.
 
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::open_files`
-Expected: PASS (3 Tests)
+Expected: PASS (3 tests)
 
-- [ ] **Step 4: Gate + Commit** („Add open file registry with shared handles and two-phase move“)
+- [ ] **Step 4: Gate + Commit** ("Add open file registry with shared handles and two-phase move")
 
 ---
 
-### Task 8: Symlinks und Attribute
+### Task 8: Symlinks and attributes
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/symlinks.rs`, `crates/cryptomator-core/src/fs/attrs.rs`
@@ -2961,7 +2961,7 @@ Expected: PASS (3 Tests)
 - Consumes: Task 4, 7.
 - Produces: `Symlinks::{new(mapper: Arc<CryptoPathMapper>, open_files: Arc<OpenCryptoFiles>, read_only: bool), create_symbolic_link(&CleartextPath, target: &str) -> io::Result<()>, read_symbolic_link(&CleartextPath) -> io::Result<String>, resolve_recursively(&CleartextPath) -> io::Result<CleartextPath>}`; `FileAttributes { file_type: CiphertextFileType, size: u64, modified: Option<SystemTime>, accessed: Option<SystemTime>, created: Option<SystemTime>, mode: u32, uid: u32, gid: u32, nlink: u64 }` + `is_dir/is_file/is_symlink`; `attrs::attributes_of(ciphertext_path: &Path, file_type, cryptor: &Cryptor, open_file: Option<Arc<Mutex<OpenCryptoFile>>>, read_only: bool) -> io::Result<FileAttributes>`.
 
-- [ ] **Step 1: Failing tests** (in `symlinks.rs`; `attrs.rs` wird über Task 9 gegen Fixtures getestet, hier nur ein Unit-Test)
+- [ ] **Step 1: Failing tests** (in `symlinks.rs`; `attrs.rs` is tested against fixtures via Task 9, here only one unit test)
 
 ```rust
 #[cfg(test)]
@@ -3020,7 +3020,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung `fs/symlinks.rs`**
+- [ ] **Step 2: Implementation `fs/symlinks.rs`**
 
 ```rust
 //! `Symlinks`: a symlink is a node directory holding `symlink.c9r`, an encrypted file whose
@@ -3218,13 +3218,13 @@ mod tests {
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::symlinks fs::attrs`
-Expected: PASS (4 Tests)
+Expected: PASS (4 tests)
 
-- [ ] **Step 4: Gate + Commit** („Add symlink handling and file attributes“)
+- [ ] **Step 4: Gate + Commit** ("Add symlink handling and file attributes")
 
 ---
 
-### Task 9: `CryptoFs`-Fassade (lesen, Verzeichnisse und Dateien anlegen) + Fixture-Integrationstest
+### Task 9: `CryptoFs` facade (reading, creating directories and files) + fixture integration test
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/crypto_fs.rs`, `crates/cryptomator-core/tests/crypto_fs_fixtures.rs`
@@ -3232,7 +3232,7 @@ Expected: PASS (4 Tests)
 
 **Interfaces:**
 - Consumes: Tasks 1–8, `OpenedVault`, `VaultConfig`.
-- Produces: `DEFAULT_MAX_CLEARTEXT_NAME_LENGTH = 10 * 1024`; `CryptoFsOptions { read_only: bool, max_cleartext_name_length: usize, events: EventSink }` (`Default`, manuelles `Debug`); `CryptoFs::{open(OpenedVault, CryptoFsOptions) -> Self, with_rng(OpenedVault, CryptoFsOptions, rng: Box<dyn Rng + Send>, rng_factory: RngFactory) -> Self, vault_path(), config(), is_read_only(), stats() -> &CryptoFsStats, mapper() -> &CryptoPathMapper, read_dir(&CleartextPath) -> io::Result<Vec<DirEntry>>, metadata(&CleartextPath) -> io::Result<FileAttributes>, symlink_metadata(&CleartextPath), ciphertext_path(&CleartextPath) -> io::Result<PathBuf>, open_file(&CleartextPath, OpenOptions) -> io::Result<FileHandle>, read_file(&CleartextPath) -> io::Result<Vec<u8>>, write_file(&CleartextPath, &[u8], overwrite: bool) -> io::Result<()>, copy_to_writer(&CleartextPath, &mut dyn Write) -> io::Result<u64>, write_from_reader(&CleartextPath, &mut dyn Read, overwrite: bool) -> io::Result<u64>, create_dir(&CleartextPath) -> io::Result<()>, create_dir_all(&CleartextPath) -> io::Result<()>, create_symlink(&CleartextPath, target: &str) -> io::Result<()>, read_link(&CleartextPath) -> io::Result<String>, close(self) -> io::Result<()>}`.
+- Produces: `DEFAULT_MAX_CLEARTEXT_NAME_LENGTH = 10 * 1024`; `CryptoFsOptions { read_only: bool, max_cleartext_name_length: usize, events: EventSink }` (`Default`, manual `Debug`); `CryptoFs::{open(OpenedVault, CryptoFsOptions) -> Self, with_rng(OpenedVault, CryptoFsOptions, rng: Box<dyn Rng + Send>, rng_factory: RngFactory) -> Self, vault_path(), config(), is_read_only(), stats() -> &CryptoFsStats, mapper() -> &CryptoPathMapper, read_dir(&CleartextPath) -> io::Result<Vec<DirEntry>>, metadata(&CleartextPath) -> io::Result<FileAttributes>, symlink_metadata(&CleartextPath), ciphertext_path(&CleartextPath) -> io::Result<PathBuf>, open_file(&CleartextPath, OpenOptions) -> io::Result<FileHandle>, read_file(&CleartextPath) -> io::Result<Vec<u8>>, write_file(&CleartextPath, &[u8], overwrite: bool) -> io::Result<()>, copy_to_writer(&CleartextPath, &mut dyn Write) -> io::Result<u64>, write_from_reader(&CleartextPath, &mut dyn Read, overwrite: bool) -> io::Result<u64>, create_dir(&CleartextPath) -> io::Result<()>, create_dir_all(&CleartextPath) -> io::Result<()>, create_symlink(&CleartextPath, target: &str) -> io::Result<()>, read_link(&CleartextPath) -> io::Result<String>, close(self) -> io::Result<()>}`.
 
 - [ ] **Step 1: Failing integration test `tests/crypto_fs_fixtures.rs`**
 
@@ -3293,7 +3293,7 @@ fn ciphertext_paths_and_streaming_reads() {
 }
 ```
 
-Unit-Tests in `crypto_fs.rs` (Anlegen):
+Unit tests in `crypto_fs.rs` (creation):
 
 ```rust
 #[cfg(test)]
@@ -3382,7 +3382,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung `fs/crypto_fs.rs` (Teil 1)**
+- [ ] **Step 2: Implementation `fs/crypto_fs.rs` (part 1)**
 
 ```rust
 //! `CryptoFileSystemImpl`: the cleartext view of a vault. Every method takes `&self`; the caches
@@ -3715,28 +3715,28 @@ impl CryptoFs {
 }
 ```
 
-(`&mut **super::lock(&self.rng)` liefert `&mut dyn Rng` aus `MutexGuard<Box<dyn Rng + Send>>`; falls der Borrow-Checker meckert: `let mut rng = super::lock(&self.rng); write_dir_id_backup(&self.cryptor, &ciphertext_dir, rng.as_mut())`.)
+(`&mut **super::lock(&self.rng)` yields `&mut dyn Rng` from `MutexGuard<Box<dyn Rng + Send>>`; if the borrow checker complains: `let mut rng = super::lock(&self.rng); write_dir_id_backup(&self.cryptor, &ciphertext_dir, rng.as_mut())`.)
 
 `lib.rs`: `pub use fs::{CryptoFs, CryptoFsOptions, DirEntry, FileAttributes, FileHandle, OpenOptions};`
 
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::crypto_fs && cargo test -p cryptomator-core --test crypto_fs_fixtures`
-Expected: PASS (4 Unit-Tests, 2 Integrationstests; alle 8 Fixtures gleichen `expected.json`)
+Expected: PASS (4 unit tests, 2 integration tests; all 8 fixtures match `expected.json`)
 
-- [ ] **Step 4: Gate + Commit** („Add CryptoFs facade: listing, attributes, reads, creates“)
+- [ ] **Step 4: Gate + Commit** ("Add CryptoFs facade: listing, attributes, reads, creates")
 
 ---
 
-### Task 10: `CryptoFs` – löschen, verschieben, kopieren, Zeitstempel
+### Task 10: `CryptoFs` – delete, move, copy, timestamps
 
 **Files:**
 - Modify: `crates/cryptomator-core/src/fs/crypto_fs.rs`
 
 **Interfaces:**
-- Produces: `CryptoFs::{delete(&CleartextPath) -> io::Result<()>` (Verzeichnisse müssen leer sein), `delete_recursive(&CleartextPath)`, `rename(src, dst, replace_existing: bool) -> io::Result<()>`, `copy(src, dst, replace_existing: bool) -> io::Result<()>` (Datei: Ciphertext-Kopie; Symlink: Link-Kopie; Verzeichnis: nicht rekursiv wie `Files.copy`), `set_times(&CleartextPath, modified: Option<SystemTime>, accessed: Option<SystemTime>) -> io::Result<()>}`.
+- Produces: `CryptoFs::{delete(&CleartextPath) -> io::Result<()>` (directories must be empty), `delete_recursive(&CleartextPath)`, `rename(src, dst, replace_existing: bool) -> io::Result<()>`, `copy(src, dst, replace_existing: bool) -> io::Result<()>` (file: ciphertext copy; symlink: link copy; directory: not recursive, like `Files.copy`), `set_times(&CleartextPath, modified: Option<SystemTime>, accessed: Option<SystemTime>) -> io::Result<()>}`.
 
-- [ ] **Step 1: Failing tests** (in `crypto_fs.rs` `mod tests` ergänzen)
+- [ ] **Step 1: Failing tests** (add to `mod tests` in `crypto_fs.rs`)
 
 ```rust
     #[test]
@@ -3830,7 +3830,7 @@ Expected: PASS (4 Unit-Tests, 2 Integrationstests; alle 8 Fixtures gleichen `exp
     }
 ```
 
-- [ ] **Step 2: Implementierung (Teil 2 von `crypto_fs.rs`)**
+- [ ] **Step 2: Implementation (part 2 of `crypto_fs.rs`)**
 
 ```rust
 use crate::constants::DIR_ID_BACKUP_FILE_NAME;
@@ -4078,13 +4078,13 @@ impl CryptoFs {
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::crypto_fs && cargo test -p cryptomator-core --test crypto_fs_fixtures`
-Expected: PASS (7 Unit-Tests + 2 Integrationstests)
+Expected: PASS (7 unit tests + 2 integration tests)
 
-- [ ] **Step 4: Gate + Commit** („Add delete, rename, copy and set_times to CryptoFs“)
+- [ ] **Step 4: Gate + Commit** ("Add delete, rename, copy and set_times to CryptoFs")
 
 ---
 
-### Task 11: Namensentschlüsselung und Capability-Probe
+### Task 11: Name decryption and capability probe
 
 **Files:**
 - Create: `crates/cryptomator-core/src/fs/name_decryptor.rs`, `crates/cryptomator-core/src/fs/capabilities.rs`
@@ -4147,7 +4147,7 @@ mod tests {
 }
 ```
 
-(Der `other_fs`-Test nutzt denselben Masterkey aus `testutil` – **anderen Schlüssel** verwenden: `Masterkey::from_raw([7u8; 64])` und `initialize` direkt, damit der Auth-Fehler echt ist; der Implementierer passt den Helfer entsprechend an.)
+(The `other_fs` test uses the same masterkey from `testutil` – use a **different key**: `Masterkey::from_raw([7u8; 64])` and `initialize` directly, so that the auth error is real; the implementer adapts the helper accordingly.)
 
 `capabilities.rs`:
 
@@ -4178,7 +4178,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implementierung**
+- [ ] **Step 2: Implementation**
 
 `fs/name_decryptor.rs`:
 
@@ -4312,23 +4312,23 @@ fn can_list_dir(dir: &Path) -> bool {
 - [ ] **Step 3: Tests**
 
 Run: `cargo test -p cryptomator-core fs::name_decryptor fs::capabilities`
-Expected: PASS (3 Tests)
+Expected: PASS (3 tests)
 
-- [ ] **Step 4: Gate + Commit** („Add ciphertext name decryption and file name length probing“)
+- [ ] **Step 4: Gate + Commit** ("Add ciphertext name decryption and file name length probing")
 
 ---
 
 ### Task 12: CLI `crypto fs ls|tree|cat|get|put|rm|mkdir|mv`
 
 **Files:**
-- Modify: `crates/crypto/src/cli.rs`, `crates/crypto/src/main.rs`, `crates/crypto/src/commands/mod.rs`, `crates/crypto/src/output.rs`, `crates/crypto/tests/cli.rs` (Sandbox nach `tests/common/mod.rs` verschieben)
+- Modify: `crates/crypto/src/cli.rs`, `crates/crypto/src/main.rs`, `crates/crypto/src/commands/mod.rs`, `crates/crypto/src/output.rs`, `crates/crypto/tests/cli.rs` (move Sandbox to `tests/common/mod.rs`)
 - Create: `crates/crypto/src/commands/fs.rs`, `crates/crypto/tests/common/mod.rs`, `crates/crypto/tests/cli_fs.rs`
 
 **Interfaces:**
 - Consumes: `CryptoFs`, `CleartextPath`, `OpenOptions`, `PasswordArgs`/`read_passphrase`, `locked_vault_path`, `resolve_vault_index`.
-- Produces: `commands::locked_vault(ctx, reference) -> Result<(VaultSettingsJson, PathBuf)>`; `commands::fs::open_fs(ctx, reference, &PasswordArgs, needs_write: bool) -> Result<CryptoFs>`; `output::format_timestamp(SystemTime) -> String` (`YYYY-MM-DD HH:MM:SS` UTC) und `output::epoch_seconds(SystemTime) -> u64`; Test-Helfer `tests/common/mod.rs`: `Sandbox::{new, settings, path, crypto(&[&str]) -> Command, add_fixture(name) -> PathBuf}` (kopiert ein Fixture in die Sandbox und registriert es mit `vault add`, Rückgabe = Vault-Pfad).
+- Produces: `commands::locked_vault(ctx, reference) -> Result<(VaultSettingsJson, PathBuf)>`; `commands::fs::open_fs(ctx, reference, &PasswordArgs, needs_write: bool) -> Result<CryptoFs>`; `output::format_timestamp(SystemTime) -> String` (`YYYY-MM-DD HH:MM:SS` UTC) and `output::epoch_seconds(SystemTime) -> u64`; test helpers `tests/common/mod.rs`: `Sandbox::{new, settings, path, crypto(&[&str]) -> Command, add_fixture(name) -> PathBuf}` (copies a fixture into the sandbox and registers it with `vault add`, returns the vault path).
 
-- [ ] **Step 1: Grammatik in `cli.rs`**
+- [ ] **Step 1: Grammar in `cli.rs`**
 
 ```rust
     /// Read and write vault contents without mounting
@@ -4338,7 +4338,7 @@ Expected: PASS (3 Tests)
     },
 ```
 
-und:
+and:
 
 ```rust
 #[derive(Subcommand, Debug)]
@@ -4462,9 +4462,9 @@ pub struct FsMvArgs {
 
 `main.rs`: `Command::Fs { command } => commands::fs::run(&ctx, command),`.
 
-- [ ] **Step 2: Test-Helfer `crates/crypto/tests/common/mod.rs`**
+- [ ] **Step 2: Test helpers `crates/crypto/tests/common/mod.rs`**
 
-`Sandbox` (Struct, `new`, `settings`, `path`, `crypto`) unverändert aus `tests/cli.rs` hierher verschieben (`cli.rs` bekommt `mod common; use common::{Sandbox, PW};`), plus:
+Move `Sandbox` (struct, `new`, `settings`, `path`, `crypto`) unchanged from `tests/cli.rs` to here (`cli.rs` gets `mod common; use common::{Sandbox, PW};`), plus:
 
 ```rust
 pub fn fixtures_root() -> PathBuf {
@@ -4609,11 +4609,11 @@ fn read_only_setting_and_password_errors() {
 }
 ```
 
-(`sb.crypto(&["fs","rm","v","/docs/".to_string().as_str()])` vereinfachen zu `"/docs"` ohne `-r` → Exit 1, weil nicht leer.)
+(Simplify `sb.crypto(&["fs","rm","v","/docs/".to_string().as_str()])` to `"/docs"` without `-r` → exit 1, because it is not empty.)
 
-- [ ] **Step 4: Implementierung `commands/mod.rs` (Ergänzung), `output.rs`, `commands/fs.rs`**
+- [ ] **Step 4: Implementation `commands/mod.rs` (addition), `output.rs`, `commands/fs.rs`**
 
-`commands/mod.rs` – `locked_vault_path` auf einen gemeinsamen Helfer aufsetzen:
+`commands/mod.rs` – build `locked_vault_path` on top of a shared helper:
 
 ```rust
 /// Resolves a vault reference to its settings entry and path, requiring state LOCKED.
@@ -4641,9 +4641,9 @@ pub fn locked_vault_path(ctx: &Ctx, reference: &str) -> Result<PathBuf> {
 }
 ```
 
-(`pub mod fs;` und `pub mod name;` ergänzen.)
+(Add `pub mod fs;` and `pub mod name;`.)
 
-`output.rs` – Zeitformat ohne zusätzliche Crate (Howard Hinnants `civil_from_days`):
+`output.rs` – time format without an extra crate (Howard Hinnant's `civil_from_days`):
 
 ```rust
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -4897,16 +4897,16 @@ fn mv(ctx: &Ctx, args: FsMvArgs) -> Result<u8> {
 fn _traits(_: &dyn Read, _: &dyn Write) {}
 ```
 
-(Den `_traits`-Platzhalter weglassen, wenn `Read`/`Write` bereits durch die Trait-Objekte gebraucht werden; sonst die ungenutzten Imports entfernen.) `crypto`'s `Cargo.toml` braucht `sha2.workspace = true` und `data-encoding.workspace = true` als Dependencies.
+(Leave out the `_traits` placeholder if `Read`/`Write` are already needed by the trait objects; otherwise remove the unused imports.) `crypto`'s `Cargo.toml` needs `sha2.workspace = true` and `data-encoding.workspace = true` as dependencies.
 
-Fehlertexte: anyhow-Kontexte wie `cannot read /docs` + io-Fehler `…: is a directory` – die Tests prüfen Substrings `is a directory`, `no such file`, `already exists`, `not empty`, `read-only`.
+Error texts: anyhow contexts such as `cannot read /docs` + io error `…: is a directory` – the tests check the substrings `is a directory`, `no such file`, `already exists`, `not empty`, `read-only`.
 
 - [ ] **Step 5: Tests**
 
 Run: `cargo test -p crypto --test cli_fs && cargo test -p crypto --test cli`
-Expected: PASS (4 neue Tests; die bestehenden 20 unverändert grün)
+Expected: PASS (4 new tests; the existing 20 still green, unchanged)
 
-- [ ] **Step 6: Gate + Commit** („Add crypto fs commands for mount-less vault access“)
+- [ ] **Step 6: Gate + Commit** ("Add crypto fs commands for mount-less vault access")
 
 ---
 
@@ -4918,9 +4918,9 @@ Expected: PASS (4 neue Tests; die bestehenden 20 unverändert grün)
 
 **Interfaces:**
 - Consumes: `commands::fs::open_fs`, `cryptomator_core::fs::decrypt_filename`, `CryptoFs::{ciphertext_path, mapper}`.
-- Produces: Kommandos `name decrypt <VAULT> <CIPHERTEXT-PATH>...` und `name locate <VAULT> <CLEARTEXT-PATH> [--contents]`.
+- Produces: commands `name decrypt <VAULT> <CIPHERTEXT-PATH>...` and `name locate <VAULT> <CLEARTEXT-PATH> [--contents]`.
 
-- [ ] **Step 1: Grammatik**
+- [ ] **Step 1: Grammar**
 
 ```rust
     /// Translate between cleartext and ciphertext names
@@ -5004,7 +5004,7 @@ fn locate_and_decrypt_round_trip() {
 }
 ```
 
-- [ ] **Step 3: Implementierung `commands/name.rs`**
+- [ ] **Step 3: Implementation `commands/name.rs`**
 
 ```rust
 //! `crypto name decrypt|locate`
@@ -5064,23 +5064,23 @@ fn locate(ctx: &Ctx, args: NameLocateArgs) -> Result<u8> {
 }
 ```
 
-`CryptoFs` braucht dafür einen öffentlichen Zugriff auf den Cryptor: in `crypto_fs.rs` `pub fn cryptor_ref(&self) -> &Cryptor { &self.cryptor }` ergänzen (das `pub(crate) cryptor()` aus Task 9 kann darauf umgestellt werden).
+For this, `CryptoFs` needs public access to the cryptor: add `pub fn cryptor_ref(&self) -> &Cryptor { &self.cryptor }` in `crypto_fs.rs` (the `pub(crate) cryptor()` from Task 9 can be switched over to it).
 
 - [ ] **Step 4: Tests**
 
 Run: `cargo test -p crypto --test cli_name`
 Expected: PASS
 
-- [ ] **Step 5: Gate + Commit** („Add crypto name decrypt and locate“)
+- [ ] **Step 5: Gate + Commit** ("Add crypto name decrypt and locate")
 
 ---
 
-### Task 14: Bidirektionaler Java-Interop-Test und Dokumentation
+### Task 14: Bidirectional Java interop test and documentation
 
 **Files:**
 - Modify: `crates/crypto/tests/java_interop.rs`, `README.md`, `CHANGELOG.md`, `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`
 
-- [ ] **Step 1: Interop-Test ergänzen** (in `java_interop.rs`, bestehende Helfer `repo_root`, `verify_with_java` wiederverwenden)
+- [ ] **Step 1: Add interop test** (in `java_interop.rs`, reuse the existing helpers `repo_root`, `verify_with_java`)
 
 ```rust
 use cryptomator_core::fs::{CleartextPath, CryptoFs, CryptoFsOptions};
@@ -5135,20 +5135,20 @@ fn java_reads_a_tree_written_by_crypto_fs() {
 }
 ```
 
-Hinweis für den Vergleich: Java sortiert Kinder pro Verzeichnis nach `Path.toString()` (UTF-16-Vergleich); `fs tree` sortiert nach `cleartext_name` (UTF-8-Byte-Vergleich). Für BMP-Zeichen sind beide Ordnungen identisch, für Emoji (Surrogatpaare) nicht zwingend – **`fs tree` sortiert deshalb pro Verzeichnis nach UTF-16-Code-Units** (`name.encode_utf16().collect::<Vec<u16>>()` als Sortierschlüssel im `walk`, sowohl in `commands/fs.rs` als auch – für den Test aus Task 9 unerheblich – nicht in `DirectoryLister`). Falls der Vergleich dennoch an der Reihenfolge scheitert, beide Arrays vor dem `assert_eq!` nach `path` sortieren.
+Note on the comparison: Java sorts children per directory by `Path.toString()` (UTF-16 comparison); `fs tree` sorts by `cleartext_name` (UTF-8 byte comparison). For BMP characters both orderings are identical, for emoji (surrogate pairs) not necessarily – **`fs tree` therefore sorts per directory by UTF-16 code units** (`name.encode_utf16().collect::<Vec<u16>>()` as the sort key in `walk`, both in `commands/fs.rs` and – irrelevant for the test from Task 9 – not in `DirectoryLister`). If the comparison still fails on the ordering, sort both arrays by `path` before the `assert_eq!`.
 
-- [ ] **Step 2: Dokumentation**
+- [ ] **Step 2: Documentation**
 
-`README.md` – Tabelle „Commands“ um Zeilen für `fs ls|tree|cat|get|put|rm|mkdir|mv` und `name decrypt|locate` ergänzen (je ein Beispiel, z. B. `crypto fs put Secret ./report.pdf /2026/report.pdf`, `crypto fs tree Secret --json --hash`, `crypto name locate Secret /2026/report.pdf --contents`). Neuer Abschnitt „Mount-less access“: Vault muss `LOCKED` sein (kein laufender Mount), Passwortquellen wie oben, `usesReadOnlyMode` wird respektiert, `fs put -` schließt `--password-stdin` aus, Klartextnamen werden NFC-normalisiert, beim Listing werden Sync-Konfliktkopien wie in der Desktop-App umbenannt (`name (1).ext`), `fs mv` verschiebt nie in ein Zielverzeichnis hinein, `--force` ersetzt (Verzeichnisse nur, wenn leer), `fs rm` löscht Verzeichnisse nur mit `-r`.
+`README.md` – add rows to the "Commands" table for `fs ls|tree|cat|get|put|rm|mkdir|mv` and `name decrypt|locate` (one example each, e.g. `crypto fs put Secret ./report.pdf /2026/report.pdf`, `crypto fs tree Secret --json --hash`, `crypto name locate Secret /2026/report.pdf --contents`). New section "Mount-less access": the vault must be `LOCKED` (no running mount), password sources as above, `usesReadOnlyMode` is respected, `fs put -` excludes `--password-stdin`, cleartext names are NFC-normalized, when listing, sync conflict copies are renamed as in the desktop app (`name (1).ext`), `fs mv` never moves into a destination directory, `--force` replaces (directories only if empty), `fs rm` deletes directories only with `-r`.
 
-`CHANGELOG.md` – `### M3 – File system and mount-less operations` unter `## Unreleased`: `cryptomator_core::fs` (Path-Mapper, Listing mit Konfliktauflösung, lange Namen, Chunk-Cache, Symlinks, Attribute, Events, Statistik, Namensentschlüsselung, Capability-Probe), CLI `fs *` und `name *`, bidirektionaler Interop-Test, und die fünf bewussten Abweichungen aus den Global Constraints.
+`CHANGELOG.md` – `### M3 – File system and mount-less operations` under `## Unreleased`: `cryptomator_core::fs` (path mapper, listing with conflict resolution, long names, chunk cache, symlinks, attributes, events, statistics, name decryption, capability probe), CLI `fs *` and `name *`, bidirectional interop test, and the five deliberate deviations from the Global Constraints.
 
-Spec – Meilensteintabelle M3 ✅ (mit Fußnote wie bei M2: Verzeichnis-Cache ohne Expiry bis M4); in der Tabelle `cryptomator-core` bei `fs/symlinks.rs` den Satz „relative Ziele werden gegen das Elternverzeichnis des Links aufgelöst (POSIX-Semantik, Abweichung von cryptofs)“ ergänzen.
+Spec – milestone table M3 ✅ (with a footnote as for M2: directory cache without expiry until M4); in the `cryptomator-core` table, add the sentence "relative targets are resolved against the parent directory of the link (POSIX semantics, deviation from cryptofs)" to `fs/symlinks.rs`.
 
 - [ ] **Step 3: Gate + Commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo test -p crypto --test java_interop --locked -- --ignored`
-Expected: PASS (3 Interop-Tests)
+Expected: PASS (3 interop tests)
 
 ```bash
 git add crates/crypto/tests/java_interop.rs README.md CHANGELOG.md docs/superpowers/specs/2026-09-04-crypto-cli-design.md
@@ -5159,13 +5159,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Selbstprüfung
+## Self-check
 
-- **Spec-Abdeckung M3:** `fs/dir_id.rs`, `fs/long_names.rs` (Task 2, 3); `fs/path_mapper.rs` mit Cache und Präfix-Invalidierung (4); `fs/dir_stream.rs` Listing-Pipeline inkl. Konflikte, `.c9u`, BrokenDirectoryFilter (5); `fs/open_file.rs`/`fs/open_files.rs` Chunk-Cache 5, dirty flags, read_at/write_at/truncate/flush, Sparse-Zero-Fill, Registry, Two-Phase-Move (6, 7); `fs/symlinks.rs`, `fs/attrs.rs`, `fs/events.rs`, `fs/stats.rs` (1, 8); `fs/crypto_fs.rs` Fassade mit open/read_dir/metadata/create_dir/delete/rename/copy/symlink/read_link/set_times (9, 10); `fs/capabilities.rs`, `fs/name_decryptor.rs` (11); `crypto fs *` (12), `crypto name decrypt/locate` (13); Meilenstein „bidirektionaler Interop auf allen Fixtures; proptests“: alle 8 Fixtures via `CryptoFs` (9) und via `fs tree` (12), Rust-geschriebener Baum in Java (14), proptest für Chunk-Grenzen (6). Nicht in M3 (Spec ordnet es M4 zu): Cache-Expiry, `FileIsInUseEvent`/`.c9u`-Erzeugung (Hub-only, ausgeklammert), `fs`-Zugriff auf gemountete Vaults.
-- **Typkonsistenz:** `CleartextPath::{parse, join, join_path, parent, file_name, is_root, starts_with, rebase}` (1) in 4, 5, 8, 9, 10, 12, 13; `EventSink`/`FilesystemEvent::{BrokenDirFile, BrokenFileNode, ConflictResolved, ConflictResolutionFailed, DecryptionFailed}` (1) in 3, 4, 5, 6; `CiphertextFilePath::{raw_path, file_path, dir_file_path, symlink_file_path, inflated_name_path, is_shortened, persist_long_file_name}` (2) in 4, 5, 8, 9, 10, 13; `DirIdLoader::{load, delete, move_id}` (3) in 4, 9, 10; `CryptoPathMapper::{ciphertext_file_type, ciphertext_file_path, ciphertext_dir, resolve_directory, resolve_directory_id, assert_non_existing, invalidate_path_mapping, move_path_mapping, shortening_threshold, root}` (4) in 5, 8, 9, 10, 13; `DirectoryLister{mapper, cryptor, events, read_only}.list` (5) in 9, 10; `OpenOptions::{read_only, read_write, write_new, write_truncate, normalized}`, `OpenCryptoFile::{size, read_at, write_at, truncate, flush, sync, path, set_path, reopen_writable, retain, release, last_modified, set_last_modified, persist_last_modified}` (6) in 7, 8; `OpenCryptoFiles::{open, get, delete, prepare_move, close_all}`, `FileHandle::{read_at, read_exact_at, write_at, write_all_at, truncate, size, flush, close}`, `RngFactory` (7) in 8, 9, 10; `attributes_of`, `FileAttributes::{is_dir, is_file, is_symlink, size, modified, file_type}` (8) in 9, 12; `Symlinks::{create_symbolic_link, read_symbolic_link, resolve_recursively}` (8) in 9, 10; `CryptoFs::{open, with_rng, read_dir, metadata, symlink_metadata, ciphertext_path, open_file, read_file, write_file, copy_to_writer, write_from_reader, create_dir, create_dir_all, create_symlink, read_link, close, mapper, cryptor_ref, vault_path, config, stats}` (9, 10, 13) in 11–14; `decrypt_filename(vault_path, cryptor, node)` (11) in 13; `open_fs`, `locked_vault` (12) in 13; `Sandbox::add_fixture` (12) in 13.
-- **Platzhalter:** keine (die zwei markierten „Platzhalter-Warnungen“ in Task 3 und 12 weisen den Implementierer ausdrücklich an, den betreffenden Schnipsel **nicht** zu übernehmen).
-- **Exit-Code-Mapping:** io-Fehler der fs-Schicht → 1 (`GENERAL`, mit Kontext im Text), `WrongState` (LOCKED bzw. read-only) → 5, `InvalidValue` (`put -` + `--password-stdin`) → 2, `InvalidPassphrase` → 4, `VaultNotFound` → 3, Hub → 9; `name decrypt` mit Teilfehlern → 1 nach vollständiger Ausgabe.
+- **Spec coverage M3:** `fs/dir_id.rs`, `fs/long_names.rs` (Tasks 2, 3); `fs/path_mapper.rs` with cache and prefix invalidation (4); `fs/dir_stream.rs` listing pipeline incl. conflicts, `.c9u`, BrokenDirectoryFilter (5); `fs/open_file.rs`/`fs/open_files.rs` chunk cache 5, dirty flags, read_at/write_at/truncate/flush, sparse zero fill, registry, two-phase move (6, 7); `fs/symlinks.rs`, `fs/attrs.rs`, `fs/events.rs`, `fs/stats.rs` (1, 8); `fs/crypto_fs.rs` facade with open/read_dir/metadata/create_dir/delete/rename/copy/symlink/read_link/set_times (9, 10); `fs/capabilities.rs`, `fs/name_decryptor.rs` (11); `crypto fs *` (12), `crypto name decrypt/locate` (13); milestone "bidirectional interop on all fixtures; proptests": all 8 fixtures via `CryptoFs` (9) and via `fs tree` (12), Rust-written tree in Java (14), proptest for chunk boundaries (6). Not in M3 (the spec assigns it to M4): cache expiry, `FileIsInUseEvent`/`.c9u` creation (Hub-only, excluded), `fs` access to mounted vaults.
+- **Type consistency:** `CleartextPath::{parse, join, join_path, parent, file_name, is_root, starts_with, rebase}` (1) in 4, 5, 8, 9, 10, 12, 13; `EventSink`/`FilesystemEvent::{BrokenDirFile, BrokenFileNode, ConflictResolved, ConflictResolutionFailed, DecryptionFailed}` (1) in 3, 4, 5, 6; `CiphertextFilePath::{raw_path, file_path, dir_file_path, symlink_file_path, inflated_name_path, is_shortened, persist_long_file_name}` (2) in 4, 5, 8, 9, 10, 13; `DirIdLoader::{load, delete, move_id}` (3) in 4, 9, 10; `CryptoPathMapper::{ciphertext_file_type, ciphertext_file_path, ciphertext_dir, resolve_directory, resolve_directory_id, assert_non_existing, invalidate_path_mapping, move_path_mapping, shortening_threshold, root}` (4) in 5, 8, 9, 10, 13; `DirectoryLister{mapper, cryptor, events, read_only}.list` (5) in 9, 10; `OpenOptions::{read_only, read_write, write_new, write_truncate, normalized}`, `OpenCryptoFile::{size, read_at, write_at, truncate, flush, sync, path, set_path, reopen_writable, retain, release, last_modified, set_last_modified, persist_last_modified}` (6) in 7, 8; `OpenCryptoFiles::{open, get, delete, prepare_move, close_all}`, `FileHandle::{read_at, read_exact_at, write_at, write_all_at, truncate, size, flush, close}`, `RngFactory` (7) in 8, 9, 10; `attributes_of`, `FileAttributes::{is_dir, is_file, is_symlink, size, modified, file_type}` (8) in 9, 12; `Symlinks::{create_symbolic_link, read_symbolic_link, resolve_recursively}` (8) in 9, 10; `CryptoFs::{open, with_rng, read_dir, metadata, symlink_metadata, ciphertext_path, open_file, read_file, write_file, copy_to_writer, write_from_reader, create_dir, create_dir_all, create_symlink, read_link, close, mapper, cryptor_ref, vault_path, config, stats}` (9, 10, 13) in 11–14; `decrypt_filename(vault_path, cryptor, node)` (11) in 13; `open_fs`, `locked_vault` (12) in 13; `Sandbox::add_fixture` (12) in 13.
+- **Placeholders:** none (the two flagged "placeholder warnings" in Tasks 3 and 12 explicitly instruct the implementer **not** to adopt the snippet in question).
+- **Exit code mapping:** io errors of the fs layer → 1 (`GENERAL`, with context in the text), `WrongState` (LOCKED or read-only) → 5, `InvalidValue` (`put -` + `--password-stdin`) → 2, `InvalidPassphrase` → 4, `VaultNotFound` → 3, Hub → 9; `name decrypt` with partial errors → 1 after the complete output.
 
-## Ausführung
+## Execution
 
-`superpowers:subagent-driven-development` mit Opus-5-Subagenten wie in M1/M2; Task 14 benötigt Java + Maven (lokal vorhanden). Reihenfolge strikt 1 → 14 (jede Task baut auf den Interfaces der vorigen auf).
+`superpowers:subagent-driven-development` with Opus 5 subagents as in M1/M2; Task 14 requires Java + Maven (available locally). Order strictly 1 → 14 (each task builds on the interfaces of the previous one).

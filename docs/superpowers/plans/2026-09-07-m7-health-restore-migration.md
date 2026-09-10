@@ -1,130 +1,130 @@
-# M7: Health-Checks, `recovery-key restore` und die Migratoren v5→v6→v7→v8 – Implementation Plan
+# M7: Health checks, `recovery-key restore`, and the v5→v6→v7→v8 migrators – Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `crypto` findet, meldet und repariert die Schäden, die die Desktop-App im „Vault Health"-Fenster zeigt (`crypto health <VAULT> [--check …] [--fix] [--fix-severity …] [--report FILE|--no-report] [--fail-on …]`, Exit **11**), stellt eine verlorene `masterkey.cryptomator` und/oder `vault.cryptomator` aus einem Recovery-Key wieder her (`crypto recovery-key restore <VAULT> (--masterkey|--config|--all)`) und hebt Legacy-Vaults der Formate 5, 6 und 7 in einem Zug auf Format 8 (`crypto migrate <VAULT> [--yes] [--dry-run]`). Dazu kommen die Fixtures, die das prüfbar machen: ein absichtlich beschädigter Vault und je ein Legacy-Vault pro Altformat, beide vom Java-Harness erzeugt.
+**Goal:** `crypto` finds, reports, and repairs the damage the desktop app shows in its "Vault Health" window (`crypto health <VAULT> [--check …] [--fix] [--fix-severity …] [--report FILE|--no-report] [--fail-on …]`, exit **11**), restores a lost `masterkey.cryptomator` and/or `vault.cryptomator` from a recovery key (`crypto recovery-key restore <VAULT> (--masterkey|--config|--all)`), and lifts legacy vaults of formats 5, 6, and 7 to format 8 in one pass (`crypto migrate <VAULT> [--yes] [--dry-run]`). On top of that come the fixtures that make this verifiable: an intentionally damaged vault and one legacy vault per old format, both produced by the Java harness.
 
-**Architecture:** Drei neue Modulbäume in `cryptomator-core`, dazu drei Kommandos im Binary. (1) `health/` – `mod.rs` trägt das Trait `HealthCheck`, den Ergebnistyp `DiagnosticResult` mit `Severity`, das Trait `Fix` und den `CheckContext` (Vault-Pfad, `Cryptor`, `VaultConfig`, RNG); `dir_id.rs`, `file_type.rs` und `shortened.rs` sind die drei Java-Checks eins zu eins, inklusive aller 8 + 3 + 6 Ergebnistypen und ihrer `fix()`-Implementierungen; `report.rs` schreibt den Textreport im Format von `ui/health/ReportWriter.java`. (2) `migration/` – `mod.rs` ist Javas `Migrators` (Version erkennen, Schritt für Schritt bis 8, Backups, Capability-Check), `v6.rs`/`v7.rs`/`v8.rs` sind die drei Migratoren, wobei `v7.rs` mit `FilePathMigration` (BASE32→BASE64URL, `0`/`1S`-Präfixe, `.lng`-Inflation aus `m/`, drei `_n`-Versuche) der größte Einzelposten ist. (3) `recovery/restore.rs` – `RecoveryDirectory` (Temp-Verzeichnis, in das erst geschrieben und aus dem dann verschoben wird), `restore_masterkey`, `restore_config`, `restore_all` und `detect_cipher_combo`. Im Binary sitzt jeweils eine dünne Kommandoschicht darüber, die Passwortquellen, Exit-Codes, `--json` und den Report-Pfad regelt. Die Fixtures entstehen im vorhandenen Maven-Harness `tools/fixture-gen/`, das dafür zu einem Reaktor mit drei zusätzlichen Modulen wird (cryptofs 1.9.15 / 1.8.9 / 1.6.2).
+**Architecture:** Three new module trees in `cryptomator-core`, plus three commands in the binary. (1) `health/` – `mod.rs` carries the `HealthCheck` trait, the result type `DiagnosticResult` with `Severity`, the `Fix` trait, and the `CheckContext` (vault path, `Cryptor`, `VaultConfig`, RNG); `dir_id.rs`, `file_type.rs`, and `shortened.rs` are the three Java checks one to one, including all 8 + 3 + 6 result types and their `fix()` implementations; `report.rs` writes the text report in the format of `ui/health/ReportWriter.java`. (2) `migration/` – `mod.rs` is Java's `Migrators` (detect the version, step by step up to 8, backups, capability check), `v6.rs`/`v7.rs`/`v8.rs` are the three migrators, where `v7.rs` with `FilePathMigration` (BASE32→BASE64URL, `0`/`1S` prefixes, `.lng` inflation from `m/`, three `_n` attempts) is the single biggest item. (3) `recovery/restore.rs` – `RecoveryDirectory` (a temp directory that is written to first and then moved out of), `restore_masterkey`, `restore_config`, `restore_all`, and `detect_cipher_combo`. In the binary a thin command layer sits on top of each of them, handling password sources, exit codes, `--json`, and the report path. The fixtures are produced by the existing Maven harness `tools/fixture-gen/`, which for this becomes a reactor with three additional modules (cryptofs 1.9.15 / 1.8.9 / 1.6.2).
 
-**Tech Stack:** Rust stable ≥ 1.89, keine neuen Crate-Abhängigkeiten – alles Nötige liegt schon im Workspace (`data-encoding` für BASE32/BASE64URL, `sha1`, `crc32fast`, `uuid`, `unicode-normalization` für die NFC-Normalisierung in v6, `zeroize`, `serde_json`, `clap` 4.6, `tempfile`, `assert_cmd` 2, `proptest` 1). Java-Seite: Maven-Reaktor, JDK ≥ 21, cryptofs 2.10.0 (aktuell) sowie 1.9.15 / 1.8.9 / 1.6.2 (Legacy, **von Maven Central, nicht im lokalen `~/.m2`** – der erste Lauf der Fixture-Tasks braucht Netz).
+**Tech Stack:** Rust stable ≥ 1.89, no new crate dependencies – everything needed is already in the workspace (`data-encoding` for BASE32/BASE64URL, `sha1`, `crc32fast`, `uuid`, `unicode-normalization` for the NFC normalization in v6, `zeroize`, `serde_json`, `clap` 4.6, `tempfile`, `assert_cmd` 2, `proptest` 1). Java side: Maven reactor, JDK ≥ 21, cryptofs 2.10.0 (current) plus 1.9.15 / 1.8.9 / 1.6.2 (legacy, **from Maven Central, not in the local `~/.m2`** – the first run of the fixture tasks needs network access).
 
-**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (Modultabelle `health/{mod,dir_id,file_type,shortened,report}.rs`, `migration/{mod,v6,v7,v8}.rs`, `recovery/restore.rs`; Kommandogrammatik `crypto health`, `crypto migrate`, `crypto recovery-key restore`; Exit-Codes **11** und **5**; Meilenstein **M7**; Teststrategie Punkt 1 (`gen-legacy-v7/v6/v5`, `verify`) und Punkt 2 (`migration.rs`); Befund 8 (Legacy-cryptofs auf Maven Central); Risiko 8 (Migration 6→7 ist der größte Einzelposten); Fußnoten `[^m4-scope]`, `[^m5-scope]`, `[^m6-scope]`).
+**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (module table `health/{mod,dir_id,file_type,shortened,report}.rs`, `migration/{mod,v6,v7,v8}.rs`, `recovery/restore.rs`; command grammar `crypto health`, `crypto migrate`, `crypto recovery-key restore`; exit codes **11** and **5**; milestone **M7**; test strategy point 1 (`gen-legacy-v7/v6/v5`, `verify`) and point 2 (`migration.rs`); finding 8 (legacy cryptofs on Maven Central); risk 8 (migration 6→7 is the single biggest item); footnotes `[^m4-scope]`, `[^m5-scope]`, `[^m6-scope]`).
 
 ## Global Constraints
 
-- Arbeitsverzeichnis `/Users/rfoerthe/work/cryptomator-cli`, Branch `feature/m7-health-restore-migration` (von `main@be22e3c`). Niemals `.superpowers/` oder `.idea/` committen.
-- Lizenz AGPL-3.0-only. `#![forbid(unsafe_code)]` gilt weiter in `cryptomator-core` **und** `cryptomator-app`; die neuen Module brauchen kein `unsafe`. Kein `unwrap()`/`expect()` auf Eingabedaten in Library-/Binary-Code (Tests dürfen). **MSRV 1.89** (`rust-version` im Workspace). **Keine neue Crate-Abhängigkeit** – wer eine braucht, hat den falschen Weg gewählt und soll im Report begründen, warum.
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` vor **jedem** Commit sauber; Commit-Nachricht endet mit `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
-- `~/.m2` und der Desktop-Checkout (`/Users/rfoerthe/work/pro/cryptomator/…`) werden **nur gelesen** (`unzip -p`, `cat`) und nie verändert. Maven lädt die Legacy-Artefakte beim ersten Lauf nach `~/.m2` – das ist der einzige erlaubte Schreibzugriff dorthin und passiert durch Maven selbst, nicht durch Handarbeit.
-- **`tests/fixtures/` ist für Implementierende read-only – mit genau zwei Ausnahmen: Task 1 und Task 2.** Diese beiden Tasks legen über den Generator neue Fixture-Verzeichnisse an (`broken_health/`, `legacy_v7/`, `legacy_v6/`, `legacy_v5/`). Kein anderer Task darf eine Datei unter `tests/fixtures/` anlegen, ändern oder löschen, und **niemand** editiert Fixture-Dateien von Hand: was der Generator nicht erzeugt, gehört nicht dorthin.
-- **Jeder Test, der schreibt, arbeitet auf einer Kopie in einem Tempdir.** Health-Fixes, Migratoren und Restore verändern Vaults; kein Test darf ein eingechecktes Fixture anfassen. Der vorhandene Helfer `crates/crypto/tests/common/mod.rs::copy_recursively` bzw. ein gleichnamiger Helfer in `crates/cryptomator-core/tests/common/mod.rs` kopiert nach `tempfile::tempdir()`. Ein Test, der `tests/fixtures/**` direkt öffnet, darf das nur lesend tun.
-- Passwörter und Recovery-Keys erscheinen nie in argv, Logs, Fehlermeldungen, Reports oder JSON. Jede Passphrase und jeder Recovery-Key wandert als `Zeroizing<String>` durch den Code. **Der Health-Report enthält keine Klartextnamen** – nur Ciphertext-Pfade, so wie Javas `ReportWriter` auch (die `details()`-Werte sind ausschließlich Pfade, Größen und Typen).
-- Nie echte Keychain-E2E laufen lassen: kein `CRYPTO_E2E_KEYCHAIN=1`, kein `security`-Kommando unbeaufsichtigt. Alle Tests dieses Meilensteins, die eine Keychain berühren (nur Task 12 tut das, für das Nachziehen des Eintrags nach der NFC-Normalisierung), benutzen den Fake aus `CRYPTO_KEYCHAIN_FAKE` über `Sandbox::crypto_keychain`.
-- Nie einen Mount oder Daemon zurücklassen. M7 mountet nichts; die einzige Berührung ist, dass `health`, `migrate` und `restore` einen laufenden Daemon **ablehnen** müssen (`VaultRegistry::require_locked`).
-- Exit-Codes (`crates/crypto/src/exit.rs`): 0 ok, 1 allgemein, 2 Usage, 3 Vault nicht gefunden, 4 Passwort/Recovery-Key ungültig, 5 falscher Zustand, 6 Mount, 7 Unmount, 8 Keychain, 9 Hub, 10 Daemon, **11 Health-Befunde ≥ `--fail-on` (neu, war reserviert)**, 12 kein Vault-Verzeichnis.
-- Java-Parität (cryptofs 2.10.0, Cryptomator 1.19.x). Die Konstanten, Severities, Meldungstexte und Reihenfolgen unten sind aus dem Quelltext abgeschrieben und in den Tasks wörtlich zitiert; wer davon abweicht, macht die Reports der beiden Programme unvergleichbar. Die vier bewussten Abweichungen stehen in den Rulings.
+- Working directory `/Users/rfoerthe/work/cryptomator-cli`, branch `feature/m7-health-restore-migration` (off `main@be22e3c`). Never commit `.superpowers/` or `.idea/`.
+- License AGPL-3.0-only. `#![forbid(unsafe_code)]` still applies in `cryptomator-core` **and** `cryptomator-app`; the new modules need no `unsafe`. No `unwrap()`/`expect()` on input data in library/binary code (tests may). **MSRV 1.89** (`rust-version` in the workspace). **No new crate dependency** – whoever needs one has taken the wrong route and should justify in the report why.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` clean before **every** commit; the commit message ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- `~/.m2` and the desktop checkout (`/Users/rfoerthe/work/pro/cryptomator/…`) are **only read** (`unzip -p`, `cat`) and never modified. Maven downloads the legacy artifacts into `~/.m2` on the first run – that is the only write access allowed there, and it happens through Maven itself, not by hand.
+- **`tests/fixtures/` is read-only for implementers – with exactly two exceptions: Task 1 and Task 2.** These two tasks create new fixture directories via the generator (`broken_health/`, `legacy_v7/`, `legacy_v6/`, `legacy_v5/`). No other task may create, change, or delete a file under `tests/fixtures/`, and **nobody** edits fixture files by hand: what the generator does not produce does not belong there.
+- **Every test that writes works on a copy in a tempdir.** Health fixes, migrators, and restore change vaults; no test may touch a checked-in fixture. The existing helper `crates/crypto/tests/common/mod.rs::copy_recursively`, or a helper of the same name in `crates/cryptomator-core/tests/common/mod.rs`, copies into `tempfile::tempdir()`. A test that opens `tests/fixtures/**` directly may only do so for reading.
+- Passwords and recovery keys never appear in argv, logs, error messages, reports, or JSON. Every passphrase and every recovery key travels through the code as `Zeroizing<String>`. **The health report contains no cleartext names** – only ciphertext paths, just like Java's `ReportWriter` (the `details()` values are exclusively paths, sizes, and types).
+- Never run a real keychain E2E: no `CRYPTO_E2E_KEYCHAIN=1`, no unattended `security` command. All tests of this milestone that touch a keychain (only Task 12 does, for updating the entry after the NFC normalization) use the fake from `CRYPTO_KEYCHAIN_FAKE` via `Sandbox::crypto_keychain`.
+- Never leave a mount or daemon behind. M7 mounts nothing; the only contact is that `health`, `migrate`, and `restore` must **reject** a running daemon (`VaultRegistry::require_locked`).
+- Exit codes (`crates/crypto/src/exit.rs`): 0 ok, 1 general, 2 usage, 3 vault not found, 4 password/recovery key invalid, 5 wrong state, 6 mount, 7 unmount, 8 keychain, 9 hub, 10 daemon, **11 health findings ≥ `--fail-on` (new, was reserved)**, 12 no vault directory.
+- Java parity (cryptofs 2.10.0, Cryptomator 1.19.x). The constants, severities, message texts, and orderings below are copied from the source and quoted verbatim in the tasks; anyone deviating from them makes the reports of the two programs incomparable. The four deliberate deviations are listed in the rulings.
 
-### Rulings dieses Meilensteins (im Code kommentieren, in Task 14 dokumentieren)
+### Rulings for this milestone (comment them in the code, document them in Task 14)
 
-1. **Pfade in Ergebnissen sind vault-relativ.** Java ist hier uneinheitlich (`DirIdCheck` liefert absolute Pfade, `LooseDirFile.fix` macht darauf ein wirkungsloses `pathToVault.resolve(dirFile)`; `OrphanContentDir` liefert `d`-relative Pfade). Wir liefern **immer** vault-relativ (`d/AB/CDEF…/dir.c9r`), und jeder `Fix` löst gegen `ctx.vault_path` auf. Das macht Reports maschinenlesbar und reproduzierbar.
-2. **`--fail-on` ist `CRITICAL` per Default.** Java kennt den Schalter nicht (das UI zeigt nur an). Ein CLI muss aber einen Exit-Code liefern, der in einem Cron-Job etwas bedeutet: `CRITICAL` = „Datenverlust ist bereits passiert" ist die Schwelle, die eine Meldung verdient. `--fail-on WARN` verschärft, mehr Werte gibt es nicht (`GOOD`/`INFO` als Fehlerschwelle wäre sinnlos, weil `GOOD` bei jedem gesunden Vault massenhaft auftritt).
-3. **`--fix` repariert ab `WARN`, nicht ab `INFO`.** `--fix-severity` verschiebt die Schwelle auf `CRITICAL`. `INFO`-Befunde (`MissingDirIdBackup`, `LooseDirFile`) haben Fixes, aber sie sind Kosmetik; wer sie will, nimmt `--fix --fix-severity WARN` (der Default) — das schließt sie **nicht** ein. Wer *alles* will, gibt es nicht: die Schwelle kennt nur `WARN` und `CRITICAL`, weil die Grammatik in der Spec genau diese zwei Werte nennt. Dokumentiert als bewusste Lücke; `INFO`-Fixes bleiben über die Desktop-App erreichbar.
-4. **Nach `--fix` wird neu geprüft.** Ein Fix kann neue Befunde erzeugen (die LOST+FOUND-Adoption legt Verzeichnisse an, die der nächste Lauf als `HealthyDir` sieht) und alte auflösen. `crypto health --fix` läuft deshalb zweimal und druckt beides („before"/„after"); der Exit-Code entscheidet sich am **zweiten** Lauf. Ohne diesen zweiten Lauf könnte `--fix` nie exit 0 liefern.
-5. **Der Report-Pfad ist das aktuelle Verzeichnis.** Java schreibt nach `env.getLogDir().orElse(user.home)` als `healthReport_<displayName>_<yyyyMMdd-HHmmss>.log`. Das CLI hat für ein Vordergrundkommando kein Log-Verzeichnis (das State-Dir gehört den Daemons und liegt oft unter `/tmp`). Wir behalten Javas **Dateinamen** exakt und legen die Datei im **cwd** ab; der Pfad wird auf stderr genannt bzw. steht im JSON unter `report`. `--report FILE` überschreibt, `--no-report` unterdrückt. Der Zeitstempel ist **UTC** statt Systemzeitzone, weil der Workspace keine Zeitzonendatenbank hat und M7 keine neue Abhängigkeit bekommt.
-6. **Migration läuft in place mit Backups, in einer Schleife bis Format 8.** Javas `Migrators.migrate` führt genau *einen* Migrator aus und überlässt der App die Wiederholung. `crypto migrate` schleift intern (5→6→7→8) und meldet die Kette. Vor jedem Schritt legen die Migratoren dieselben Backups an wie Java (`attempt_backup` auf `masterkey.cryptomator`, in v8 zusätzlich implizit über die neue `vault.cryptomator`, die `open_vault` beim ersten Öffnen sichert). Keine Kopie des ganzen Vaults – bei mehreren GB wäre das keine Sicherheit, sondern eine zweite Fehlerquelle. Der Hinweis „vorher sichern" steht in der Bestätigungsfrage.
-7. **`--dry-run` ist Pflicht, nicht Komfort.** 6→7 benennt jede Datei im Vault um. `crypto migrate --dry-run` listet die geplanten Umbenennungen (alt → neu, inklusive der `_n`-Kollisionsauflösung, soweit ohne Schreiben bestimmbar) und die Schritte, die die Schlüsseldateien anfassen würden, und ändert nichts.
-8. **Schon auf Format 8 ist kein Fehler.** `crypto migrate` auf einem aktuellen Vault meldet „already at version 8" und endet mit **0**. Exit **5** bleibt der Zustand „braucht Migration" bei allen *anderen* Kommandos (`unlock`, `fs`, `health`, …).
-9. **Nicht-TTY ohne `--yes` ist Exit 2.** Sowohl die Bestätigungsfrage von `migrate` als auch Javas `REQUIRES_FULL_VAULT_DIR_SCAN`-Rückfrage in v7 werden ohne Terminal zu `AppError::NoPasswordSource`-artigen Usage-Fehlern — konkret `AppError::InvalidValue { key: "--yes", … }` → Exit 2. Ein Skript, das migrieren will, sagt das mit `--yes`.
-10. **`recovery-key restore --config` nimmt das Vault-Passwort, nicht den Recovery-Key.** Das ist Javas `RecoveryKeyCreationController.restoreWithPassword`: die `masterkey.cryptomator` ist ja noch da, nur die `vault.cryptomator` fehlt. `--masterkey` und `--all` nehmen den Recovery-Key plus ein *neues* Passwort. Wer die Kombination verwechselt, bekommt einen Usage-Fehler mit dem richtigen Flag im Text.
-11. **Der Check-Katalog ist fest, nicht plugin-fähig.** Java lädt `HealthCheck` über den `ServiceLoader`. Wir haben drei Checks, sie heißen `dirid`, `type`, `shortened`, und `--check` nimmt eine Komma-Liste davon (Default: alle drei, in dieser Reihenfolge). Ein unbekannter Name ist Exit 2 mit der Liste der gültigen.
+1. **Paths in results are vault-relative.** Java is inconsistent here (`DirIdCheck` returns absolute paths, `LooseDirFile.fix` performs an ineffective `pathToVault.resolve(dirFile)` on them; `OrphanContentDir` returns `d`-relative paths). We **always** return vault-relative (`d/AB/CDEF…/dir.c9r`), and every `Fix` resolves against `ctx.vault_path`. That makes reports machine-readable and reproducible.
+2. **`--fail-on` is `CRITICAL` by default.** Java does not have the switch (the UI only displays). But a CLI has to return an exit code that means something in a cron job: `CRITICAL` = "data loss has already happened" is the threshold that deserves a report. `--fail-on WARN` tightens it, and there are no other values (`GOOD`/`INFO` as an error threshold would be pointless, because `GOOD` occurs en masse in every healthy vault).
+3. **`--fix` repairs from `WARN` up, not from `INFO`.** `--fix-severity` moves the threshold to `CRITICAL`. `INFO` findings (`MissingDirIdBackup`, `LooseDirFile`) have fixes, but they are cosmetic; whoever wants them uses `--fix --fix-severity WARN` (the default) — which does **not** include them. Whoever wants *everything* is out of luck: the threshold knows only `WARN` and `CRITICAL`, because the grammar in the spec names exactly these two values. Documented as a deliberate gap; `INFO` fixes remain reachable through the desktop app.
+4. **After `--fix` the checks run again.** A fix can produce new findings (the LOST+FOUND adoption creates directories that the next run sees as `HealthyDir`) and resolve old ones. `crypto health --fix` therefore runs twice and prints both ("before"/"after"); the exit code is decided by the **second** run. Without that second run, `--fix` could never return exit 0.
+5. **The report path is the current directory.** Java writes to `env.getLogDir().orElse(user.home)` as `healthReport_<displayName>_<yyyyMMdd-HHmmss>.log`. The CLI has no log directory for a foreground command (the state dir belongs to the daemons and often lives under `/tmp`). We keep Java's **file name** exactly and place the file in the **cwd**; the path is named on stderr, or appears in the JSON under `report`. `--report FILE` overrides, `--no-report` suppresses. The timestamp is **UTC** instead of the system time zone, because the workspace has no time zone database and M7 gets no new dependency.
+6. **Migration runs in place with backups, in a loop up to format 8.** Java's `Migrators.migrate` runs exactly *one* migrator and leaves the repetition to the app. `crypto migrate` loops internally (5→6→7→8) and reports the chain. Before each step the migrators create the same backups as Java (`attempt_backup` on `masterkey.cryptomator`, in v8 additionally implicitly via the new `vault.cryptomator`, which `open_vault` backs up when first opened). No copy of the whole vault – with several GB that would not be a safeguard but a second source of errors. The note "back it up beforehand" is part of the confirmation prompt.
+7. **`--dry-run` is mandatory, not a convenience.** 6→7 renames every file in the vault. `crypto migrate --dry-run` lists the planned renames (old → new, including the `_n` collision resolution as far as it can be determined without writing) and the steps that would touch the key files, and changes nothing.
+8. **Already at format 8 is not an error.** `crypto migrate` on a current vault reports "already at version 8" and ends with **0**. Exit **5** remains the state "needs migration" for all *other* commands (`unlock`, `fs`, `health`, …).
+9. **Non-TTY without `--yes` is exit 2.** Both `migrate`'s confirmation prompt and Java's `REQUIRES_FULL_VAULT_DIR_SCAN` query in v7 become `AppError::NoPasswordSource`-style usage errors without a terminal — concretely `AppError::InvalidValue { key: "--yes", … }` → exit 2. A script that wants to migrate says so with `--yes`.
+10. **`recovery-key restore --config` takes the vault password, not the recovery key.** That is Java's `RecoveryKeyCreationController.restoreWithPassword`: the `masterkey.cryptomator` is still there, only the `vault.cryptomator` is missing. `--masterkey` and `--all` take the recovery key plus a *new* password. Whoever mixes up the combination gets a usage error naming the right flag in the text.
+11. **The check catalog is fixed, not pluggable.** Java loads `HealthCheck` via the `ServiceLoader`. We have three checks, they are called `dirid`, `type`, `shortened`, and `--check` takes a comma-separated list of them (default: all three, in this order). An unknown name is exit 2 with the list of valid ones.
 
 ---
 
-## Dateistruktur
+## File structure
 
 ```
-tools/fixture-gen/pom.xml                                   → Reaktor-POM (packaging pom, <modules>)
-tools/fixture-gen/gen-current/pom.xml                       NEU: das bisherige Modul (cryptofs 2.10.0)
-tools/fixture-gen/gen-current/src/main/java/.../Gen.java    verschoben, + `broken`-Kommando
-tools/fixture-gen/gen-legacy-v7/pom.xml                     NEU: cryptofs 1.9.15 → Format 7
-tools/fixture-gen/gen-legacy-v7/src/main/java/.../GenV7.java   NEU
-tools/fixture-gen/gen-legacy-v6/pom.xml                     NEU: cryptofs 1.8.9  → Format 6
-tools/fixture-gen/gen-legacy-v6/src/main/java/.../GenV6.java   NEU
-tools/fixture-gen/gen-legacy-v5/pom.xml                     NEU: cryptofs 1.6.2  → Format 6, danach auf 5 zurückgestempelt
-tools/fixture-gen/gen-legacy-v5/src/main/java/.../GenV5.java   NEU
-tools/fixture-gen/README.md                                 Doku der neuen Kommandos
-tests/fixtures/broken_health/                               NEU (Task 1, nur über den Generator)
-tests/fixtures/legacy_v7/  legacy_v6/  legacy_v5/           NEU (Task 2, nur über den Generator)
+tools/fixture-gen/pom.xml                                   → reactor POM (packaging pom, <modules>)
+tools/fixture-gen/gen-current/pom.xml                       NEW: the previous module (cryptofs 2.10.0)
+tools/fixture-gen/gen-current/src/main/java/.../Gen.java    moved, + `broken` command
+tools/fixture-gen/gen-legacy-v7/pom.xml                     NEW: cryptofs 1.9.15 → format 7
+tools/fixture-gen/gen-legacy-v7/src/main/java/.../GenV7.java   NEW
+tools/fixture-gen/gen-legacy-v6/pom.xml                     NEW: cryptofs 1.8.9  → format 6
+tools/fixture-gen/gen-legacy-v6/src/main/java/.../GenV6.java   NEW
+tools/fixture-gen/gen-legacy-v5/pom.xml                     NEW: cryptofs 1.6.2  → format 6, then stamped back down to 5
+tools/fixture-gen/gen-legacy-v5/src/main/java/.../GenV5.java   NEW
+tools/fixture-gen/README.md                                 docs for the new commands
+tests/fixtures/broken_health/                               NEW (Task 1, generator only)
+tests/fixtures/legacy_v7/  legacy_v6/  legacy_v5/           NEW (Task 2, generator only)
 
-crates/cryptomator-core/src/lib.rs                          + pub mod health; pub mod migration; Re-Exports
-crates/cryptomator-core/src/health/mod.rs                   NEU: Severity, DiagnosticResult, Fix, HealthCheck, CheckContext, run_checks, CHECK_IDS
-crates/cryptomator-core/src/health/dir_id.rs                NEU: DirIdCheck + 8 Ergebnistypen + Fixes
-crates/cryptomator-core/src/health/orphan.rs                NEU: der LOST+FOUND-Fix von OrphanContentDir
-crates/cryptomator-core/src/health/file_type.rs             NEU: CiphertextFileTypeCheck + 3 Ergebnistypen
-crates/cryptomator-core/src/health/shortened.rs             NEU: ShortenedNamesCheck + 6 Ergebnistypen
-crates/cryptomator-core/src/health/report.rs                NEU: ReportWriter-Format
-crates/cryptomator-core/src/migration/mod.rs                NEU: Migrators, MigrationStep, MigrationPlan, assert_all_capabilities
-crates/cryptomator-core/src/migration/v6.rs                 NEU: 5→6 (NFC)
-crates/cryptomator-core/src/migration/v7.rs                 NEU: 6→7 (FilePathMigration, PreMigration, m/ löschen)
-crates/cryptomator-core/src/migration/v8.rs                 NEU: 7→8 (vault.cryptomator)
-crates/cryptomator-core/src/recovery/restore.rs             NEU: RecoveryDirectory, restore_*, detect_cipher_combo
+crates/cryptomator-core/src/lib.rs                          + pub mod health; pub mod migration; re-exports
+crates/cryptomator-core/src/health/mod.rs                   NEW: Severity, DiagnosticResult, Fix, HealthCheck, CheckContext, run_checks, CHECK_IDS
+crates/cryptomator-core/src/health/dir_id.rs                NEW: DirIdCheck + 8 result types + fixes
+crates/cryptomator-core/src/health/orphan.rs                NEW: the LOST+FOUND fix from OrphanContentDir
+crates/cryptomator-core/src/health/file_type.rs             NEW: CiphertextFileTypeCheck + 3 result types
+crates/cryptomator-core/src/health/shortened.rs             NEW: ShortenedNamesCheck + 6 result types
+crates/cryptomator-core/src/health/report.rs                NEW: ReportWriter format
+crates/cryptomator-core/src/migration/mod.rs                NEW: Migrators, MigrationStep, MigrationPlan, assert_all_capabilities
+crates/cryptomator-core/src/migration/v6.rs                 NEW: 5→6 (NFC)
+crates/cryptomator-core/src/migration/v7.rs                 NEW: 6→7 (FilePathMigration, PreMigration, delete m/)
+crates/cryptomator-core/src/migration/v8.rs                 NEW: 7→8 (vault.cryptomator)
+crates/cryptomator-core/src/recovery/restore.rs             NEW: RecoveryDirectory, restore_*, detect_cipher_combo
 crates/cryptomator-core/src/recovery/mod.rs                 + pub mod restore;
 crates/cryptomator-core/src/error.rs                        + CoreError::{FileNameTooLong, MissingCapability, CipherComboUndetectable, MigrationBlocked}
 crates/cryptomator-core/tests/common/mod.rs                 + fixture(), copy_fixture()
-crates/cryptomator-core/tests/health.rs                     NEU: die drei Checks gegen broken_health
-crates/cryptomator-core/tests/migration.rs                  NEU: die Migratoren gegen legacy_v{5,6,7}
+crates/cryptomator-core/tests/health.rs                     NEW: the three checks against broken_health
+crates/cryptomator-core/tests/migration.rs                  NEW: the migrators against legacy_v{5,6,7}
 
 crates/crypto/src/exit.rs                                   + HEALTH_FINDINGS = 11
 crates/crypto/src/cli.rs                                    + Command::{Health, Migrate}, RecoveryKeyCommand::Restore
 crates/crypto/src/commands/mod.rs                           + migratable_vault()
-crates/crypto/src/commands/health.rs                        NEU: `crypto health`
-crates/crypto/src/commands/migrate.rs                       NEU: `crypto migrate`
+crates/crypto/src/commands/health.rs                        NEW: `crypto health`
+crates/crypto/src/commands/migrate.rs                       NEW: `crypto migrate`
 crates/crypto/src/commands/recovery.rs                      + restore()
-crates/crypto/src/main.rs                                   + Dispatch
+crates/crypto/src/main.rs                                   + dispatch
 crates/crypto/src/output.rs                                 + format_compact_timestamp()
-crates/crypto/tests/cli_health.rs                           NEU
-crates/crypto/tests/cli_migrate.rs                          NEU
+crates/crypto/tests/cli_health.rs                           NEW
+crates/crypto/tests/cli_migrate.rs                          NEW
 crates/crypto/tests/cli.rs                                  + recovery-key restore
-crates/crypto/tests/cli_daemon.rs                           Log-Assertion für den detachten Daemon (Nachtrag)
-crates/crypto/tests/java_interop.rs                         + migrierte Legacy-Vaults durch `verify`
-.github/workflows/ci.yml                                    interop-java lädt die Legacy-Artefakte mit
-README.md, CHANGELOG.md, Spec                               Doku
+crates/crypto/tests/cli_daemon.rs                           log assertion for the detached daemon (addendum)
+crates/crypto/tests/java_interop.rs                         + migrated legacy vaults through `verify`
+.github/workflows/ci.yml                                    interop-java downloads the legacy artifacts too
+README.md, CHANGELOG.md, Spec                               docs
 ```
 
-### Gemeinsame Typen (Details in den Tasks)
+### Common types (details in the tasks)
 
 - `cryptomator_core::health::{Severity, DiagnosticResult, Fix, HealthCheck, CheckContext, run_checks, checks_by_ids, CHECK_IDS, ALL_CHECKS}` (Task 3).
 - `cryptomator_core::health::dir_id::{DirIdCheck, DIR_ID_CHECK_NAME}` (Task 4), `health::orphan::AdoptOrphan` (Task 5).
-- `cryptomator_core::health::file_type::{CiphertextFileTypeCheck, TYPE_CHECK_NAME}` und `health::shortened::{ShortenedNamesCheck, SHORTENED_CHECK_NAME}` (Task 6).
+- `cryptomator_core::health::file_type::{CiphertextFileTypeCheck, TYPE_CHECK_NAME}` and `health::shortened::{ShortenedNamesCheck, SHORTENED_CHECK_NAME}` (Task 6).
 - `cryptomator_core::health::report::{write_report, report_file_name, REPORT_HEADER, CHECK_SEPARATOR}` (Task 7).
-- `cryptomator_core::migration::{Migrators, MigrationStep, MigrationPlan, PlannedRename, assert_all_capabilities}` (Task 10, ergänzt in 11).
+- `cryptomator_core::migration::{Migrators, MigrationStep, MigrationPlan, PlannedRename, assert_all_capabilities}` (Task 10, extended in 11).
 - `cryptomator_core::recovery::restore::{RecoveryDirectory, restore_masterkey, restore_config, restore_all, detect_cipher_combo}` (Task 13).
 - `crypto::exit::HEALTH_FINDINGS` (Task 8), `crypto::commands::migratable_vault` (Task 12).
 
 ---
 
-### Task 1: Beschädigtes Fixture `broken_health` aus dem Java-Harness
+### Task 1: Damaged fixture `broken_health` from the Java harness
 
 **Files:**
-- Modify: `tools/fixture-gen/pom.xml` (Reaktor), `tools/fixture-gen/README.md`
+- Modify: `tools/fixture-gen/pom.xml` (reactor), `tools/fixture-gen/README.md`
 - Create: `tools/fixture-gen/gen-current/pom.xml`
 - Move: `tools/fixture-gen/src/main/java/org/cryptomator/cli/fixtures/Gen.java` → `tools/fixture-gen/gen-current/src/main/java/org/cryptomator/cli/fixtures/Gen.java`
-- Create (Generator-Ausgabe, **einzige erlaubte Änderung unter `tests/fixtures/`**): `tests/fixtures/broken_health/`
+- Create (generator output, **the only permitted change under `tests/fixtures/`**): `tests/fixtures/broken_health/`
 - Test: `crates/cryptomator-core/tests/common/mod.rs`, `crates/cryptomator-core/tests/health.rs`
 
 **Interfaces:**
-- Consumes: das bestehende `Gen.java` (cryptofs 2.10.0), `Gen.PASSPHRASE = "test-password-123"`, `Gen.KEY_ID`.
+- Consumes: the existing `Gen.java` (cryptofs 2.10.0), `Gen.PASSPHRASE = "test-password-123"`, `Gen.KEY_ID`.
 - Produces:
-  - Maven: `mvn -q -f tools/fixture-gen/pom.xml compile` baut den Reaktor; `mvn -q -f tools/fixture-gen/gen-current/pom.xml compile exec:exec -Dfixture.cmd=broken -Dfixture.arg1=<outDir>` erzeugt `<outDir>/broken_health`.
-  - `tests/fixtures/broken_health/` – ein SIV_GCM-Vault, Threshold 220, Passphrase `test-password-123`, plus `fixture.json` (wie bisher) und `expected-findings.json`:
+  - Maven: `mvn -q -f tools/fixture-gen/pom.xml compile` builds the reactor; `mvn -q -f tools/fixture-gen/gen-current/pom.xml compile exec:exec -Dfixture.cmd=broken -Dfixture.arg1=<outDir>` produces `<outDir>/broken_health`.
+  - `tests/fixtures/broken_health/` – a SIV_GCM vault, threshold 220, passphrase `test-password-123`, plus `fixture.json` (as before) and `expected-findings.json`:
     ```json
     [ { "check": "dirid", "severity": "WARN",  "result": "OrphanContentDir", "path": "d/…/…" }, … ]
     ```
   - Rust: `cryptomator_core::tests::common::{fixture, copy_fixture}` (in `crates/cryptomator-core/tests/common/mod.rs`).
 
-- [ ] **Step 1: Reaktor anlegen**
+- [ ] **Step 1: Create the reactor**
 
-`tools/fixture-gen/pom.xml` wird zum Aggregator; der bisherige Inhalt (Dependencies, exec-Plugin) zieht nach `gen-current/pom.xml` um und bekommt dort `<parent>`. Neues Aggregator-POM:
+`tools/fixture-gen/pom.xml` becomes the aggregator; the previous content (dependencies, exec plugin) moves into `gen-current/pom.xml` and gets a `<parent>` there. New aggregator POM:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -151,21 +151,21 @@ README.md, CHANGELOG.md, Spec                               Doku
 </project>
 ```
 
-`gen-current/pom.xml` erbt davon und behält alles Bisherige unverändert – Dependencies (cryptofs 2.10.0, gson 2.13.2, slf4j-simple 2.0.17), das `exec-maven-plugin` mit `exec:exec` und dem geforkten JVM-Aufruf, sowie `<exec.mainClass>org.cryptomator.cli.fixtures.Gen</exec.mainClass>`. Der Default von `fixture.arg1` wird zu `${project.basedir}/../../../tests/fixtures` (eine Ebene tiefer als vorher).
+`gen-current/pom.xml` inherits from it and keeps everything as before unchanged – dependencies (cryptofs 2.10.0, gson 2.13.2, slf4j-simple 2.0.17), the `exec-maven-plugin` with `exec:exec` and the forked JVM invocation, plus `<exec.mainClass>org.cryptomator.cli.fixtures.Gen</exec.mainClass>`. The default of `fixture.arg1` becomes `${project.basedir}/../../../tests/fixtures` (one level deeper than before).
 
-**Die Module `gen-legacy-*` legt Task 2 an.** Damit dieser Task für sich baut, stehen sie hier noch **nicht** in `<modules>`; Task 2 fügt die drei Zeilen hinzu. Der Reaktor hat in diesem Task also genau einen Modul-Eintrag `gen-current`.
+**The `gen-legacy-*` modules are created by Task 2.** So that this task builds on its own, they are **not** listed in `<modules>` here yet; Task 2 adds the three lines. In this task the reactor therefore has exactly one module entry, `gen-current`.
 
-- [ ] **Step 2: Prüfen, dass der Reaktor unverändert baut und die alten Fixtures reproduziert**
+- [ ] **Step 2: Verify that the reactor builds unchanged and reproduces the old fixtures**
 
 Run: `cd /Users/rfoerthe/work/cryptomator-cli && mvn -q -f tools/fixture-gen/pom.xml compile`
-Expected: BUILD SUCCESS, keine Ausgabe.
+Expected: BUILD SUCCESS, no output.
 
 Run: `cargo test -p crypto --test java_interop --locked -- --ignored`
-Expected: alle Tests grün (der Interop-Test ruft `-f tools/fixture-gen/pom.xml`; er muss auf `gen-current/pom.xml` umgestellt werden – das ist Teil dieses Steps, `crates/crypto/tests/java_interop.rs::run_java_verify` bekommt `"tools/fixture-gen/gen-current/pom.xml"`).
+Expected: all tests green (the interop test calls `-f tools/fixture-gen/pom.xml`; it has to be switched over to `gen-current/pom.xml` – that is part of this step, `crates/crypto/tests/java_interop.rs::run_java_verify` gets `"tools/fixture-gen/gen-current/pom.xml"`).
 
-- [ ] **Step 3: Das `broken`-Kommando in `Gen.java`**
+- [ ] **Step 3: The `broken` command in `Gen.java`**
 
-`main` bekommt einen dritten Zweig; `argv.get(0).equals("broken")` mit einem Argument (Ausgabeverzeichnis). Der Ablauf: erst einen gesunden Vault `broken_health` mit einer bekannten Struktur erzeugen (dieselbe Mechanik wie `generate`, Masterkey = SHA-512("broken_health")), dann den Ciphertext gezielt beschädigen und die erwarteten Befunde protokollieren.
+`main` gets a third branch; `argv.get(0).equals("broken")` with one argument (the output directory). The flow: first create a healthy vault `broken_health` with a known structure (same mechanics as `generate`, masterkey = SHA-512("broken_health")), then damage the ciphertext in a targeted way and record the expected findings.
 
 ```java
 static final String BROKEN_NAME = "broken_health";
@@ -174,46 +174,46 @@ static void broken(Path out) throws Exception {
     Path vault = out.resolve(BROKEN_NAME);
     Spec spec = new Spec(BROKEN_NAME, CryptorProvider.Scheme.SIV_GCM, 220, fs -> {
         write(fs, "/healthy.txt", "this file stays intact\n");
-        Files.createDirectory(fs.getPath("/keep"));           // bleibt heil
+        Files.createDirectory(fs.getPath("/keep"));           // stays intact
         write(fs, "/keep/inside.txt", "kept\n");
-        Files.createDirectory(fs.getPath("/orphaned"));       // wird zum Waisen-Verzeichnis
+        Files.createDirectory(fs.getPath("/orphaned"));       // becomes the orphan directory
         write(fs, "/orphaned/adopted.txt", "adopt me\n");
-        Files.createDirectory(fs.getPath("/nodirid"));        // verliert seine dirid.c9r
-        Files.createDirectory(fs.getPath("/nocontent"));      // verliert sein Inhaltsverzeichnis
-        write(fs, "/" + "L".repeat(200) + ".txt", "shortened\n");   // wird zu .c9s
-        write(fs, "/" + "M".repeat(200) + ".txt", "mismatch\n");    // .c9s mit falschem Namen
-        write(fs, "/" + "T".repeat(200) + ".txt", "trailing\n");    // .c9s mit Trailing Bytes
-        write(fs, "/" + "N".repeat(200) + ".txt", "noname\n");      // .c9s ohne name.c9s
+        Files.createDirectory(fs.getPath("/nodirid"));        // loses its dirid.c9r
+        Files.createDirectory(fs.getPath("/nocontent"));      // loses its content directory
+        write(fs, "/" + "L".repeat(200) + ".txt", "shortened\n");   // becomes .c9s
+        write(fs, "/" + "M".repeat(200) + ".txt", "mismatch\n");    // .c9s with the wrong name
+        write(fs, "/" + "T".repeat(200) + ".txt", "trailing\n");    // .c9s with trailing bytes
+        write(fs, "/" + "N".repeat(200) + ".txt", "noname\n");      // .c9s without name.c9s
     });
-    generate(vault, spec);                                    // schreibt auch fixture.json/expected.json
+    generate(vault, spec);                                    // also writes fixture.json/expected.json
     List<Map<String, Object>> findings = damage(vault);
     var gson = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
     Files.writeString(vault.resolve("expected-findings.json"), gson.toJson(findings) + "\n", StandardCharsets.UTF_8);
-    Files.delete(vault.resolve("expected.json"));  // der Klartext-Baum ist nach der Beschädigung sinnlos
+    Files.delete(vault.resolve("expected.json"));  // the cleartext tree is meaningless after the damage
 }
 ```
 
-- [ ] **Step 4: `damage(Path vault)` – die neun Schadensfälle**
+- [ ] **Step 4: `damage(Path vault)` – the nine damage cases**
 
-`damage` öffnet den Vault mit cryptolib (Masterkey aus `fixture.json`), baut einen `Cryptor` für die Namensfunktionen und schreibt danach nur noch auf der Ciphertext-Ebene. Jeder Fall liefert eine Zeile in `expected-findings.json` mit `check`, `severity`, `result` und `path` (vault-relativ, mit `/` als Trenner – Ruling 1).
+`damage` opens the vault with cryptolib (masterkey from `fixture.json`), builds a `Cryptor` for the name functions, and from then on writes only at the ciphertext level. Each case produces one line in `expected-findings.json` with `check`, `severity`, `result`, and `path` (vault-relative, with `/` as the separator – Ruling 1).
 
-| # | Schaden | erwarteter Befund |
+| # | Damage | Expected finding |
 |---|---|---|
-| 1 | im `.c9r`-Knoten von `/orphaned` die Datei `dir.c9r` löschen (das Inhaltsverzeichnis bleibt stehen) | `dirid` WARN `OrphanContentDir` auf `d/XX/YYY…` |
-| 2 | im Inhaltsverzeichnis von `/nodirid` die `dirid.c9r` löschen | `dirid` INFO `MissingDirIdBackup` |
-| 3 | das Inhaltsverzeichnis von `/nocontent` rekursiv löschen (das `dir.c9r` bleibt) | `dirid` WARN `MissingContentDir` |
-| 4 | eine leere Datei `d/XX/YYY…/dir.c9r` neben dem Wurzelverzeichnis anlegen, wobei `XX/YYY…` das Wurzel-Inhaltsverzeichnis ist → Elternname endet nicht auf `.c9r`/`.c9s` | `dirid` INFO `LooseDirFile` |
-| 5 | in einem neu angelegten `d/<root>/collide.c9r/dir.c9r` die dirId von `/keep` noch einmal schreiben | `dirid` CRITICAL `DirIdCollision` |
-| 6 | ein neues `d/<root>/unknown.c9r/` anlegen, das weder `dir.c9r` noch `symlink.c9r` noch `contents.c9r` enthält (eine belanglose Datei `x` hinein, damit das Verzeichnis existiert und nicht leer ist) | `type` CRITICAL `UnknownType` |
-| 7 | im `.c9s`-Knoten von `M…` die `name.c9s` mit dem Namen eines *anderen* Knotens überschreiben | `shortened` WARN `LongShortNamesMismatch` |
-| 8 | an die `name.c9s` von `T…` den Text `garbage` anhängen | `shortened` WARN `TrailingBytesInNameFile` |
-| 9 | im `.c9s`-Knoten von `N…` die `name.c9s` löschen | `shortened` CRITICAL `MissingLongName` |
+| 1 | delete the file `dir.c9r` in the `.c9r` node of `/orphaned` (the content directory stays) | `dirid` WARN `OrphanContentDir` on `d/XX/YYY…` |
+| 2 | delete the `dirid.c9r` in the content directory of `/nodirid` | `dirid` INFO `MissingDirIdBackup` |
+| 3 | delete the content directory of `/nocontent` recursively (the `dir.c9r` stays) | `dirid` WARN `MissingContentDir` |
+| 4 | create an empty file `d/XX/YYY…/dir.c9r` next to the root directory, where `XX/YYY…` is the root content directory → the parent name does not end in `.c9r`/`.c9s` | `dirid` INFO `LooseDirFile` |
+| 5 | write the dirId of `/keep` a second time in a newly created `d/<root>/collide.c9r/dir.c9r` | `dirid` CRITICAL `DirIdCollision` |
+| 6 | create a new `d/<root>/unknown.c9r/` that contains neither `dir.c9r` nor `symlink.c9r` nor `contents.c9r` (put an irrelevant file `x` inside so that the directory exists and is not empty) | `type` CRITICAL `UnknownType` |
+| 7 | overwrite the `name.c9s` in the `.c9s` node of `M…` with the name of a *different* node | `shortened` WARN `LongShortNamesMismatch` |
+| 8 | append the text `garbage` to the `name.c9s` of `T…` | `shortened` WARN `TrailingBytesInNameFile` |
+| 9 | delete the `name.c9s` in the `.c9s` node of `N…` | `shortened` CRITICAL `MissingLongName` |
 
-Fall 4 braucht einen Elternnamen, der *kein* `.c9r`/`.c9s`-Suffix hat: Java prüft `parentDirName.endsWith(".c9r") || endsWith(".c9s")`. Das Wurzel-Inhaltsverzeichnis `d/XX/YYY…` heißt 30 BASE32-Zeichen — also `Files.writeString(rootContentDir.resolve("dir.c9r"), "")`. Es ist gleichzeitig leer, aber `EmptyDirFile` wird nicht gemeldet: der `LooseDirFile`-Zweig kommt **vor** der Größenprüfung und endet mit `CONTINUE`.
+Case 4 needs a parent name that has *no* `.c9r`/`.c9s` suffix: Java checks `parentDirName.endsWith(".c9r") || endsWith(".c9s")`. The root content directory `d/XX/YYY…` is 30 BASE32 characters — so `Files.writeString(rootContentDir.resolve("dir.c9r"), "")`. It is empty at the same time, but `EmptyDirFile` is not reported: the `LooseDirFile` branch comes **before** the size check and ends with `CONTINUE`.
 
-Zusätzlich zu den neun Zeilen enthält `expected-findings.json` **keine** `GOOD`-Befunde – die zählt der Rust-Test nur, er vergleicht sie nicht einzeln.
+Beyond the nine lines, `expected-findings.json` contains **no** `GOOD` findings – the Rust test only counts those, it does not compare them individually.
 
-Hilfsfunktion für Fall 5/6, weil dort neue Ciphertext-Namen gebraucht werden:
+Helper function for cases 5/6, because new ciphertext names are needed there:
 
 ```java
 static String cipherName(Cryptor cryptor, String clear, String dirId) {
@@ -226,7 +226,7 @@ static Path contentDir(Path vault, Cryptor cryptor, String dirId) {
 }
 ```
 
-- [ ] **Step 5: Fixture erzeugen und Größe prüfen**
+- [ ] **Step 5: Generate the fixture and check its size**
 
 Run:
 ```bash
@@ -235,14 +235,14 @@ mvn -q -f tools/fixture-gen/gen-current/pom.xml compile exec:exec \
     -Dfixture.cmd=broken -Dfixture.arg1=tests/fixtures
 du -sh tests/fixtures/broken_health
 ```
-Expected: das Verzeichnis existiert und ist **unter 200 KB**. Ist es größer, sind die Dateiinhalte zu lang – sie sind alle einzeilig, also darf das nicht passieren; sonst Inhalte kürzen und neu erzeugen.
+Expected: the directory exists and is **under 200 KB**. If it is larger, the file contents are too long – they are all single-line, so that must not happen; otherwise shorten the contents and regenerate.
 
 Run: `cat tests/fixtures/broken_health/expected-findings.json`
-Expected: neun Objekte, jedes mit `check` ∈ {`dirid`,`type`,`shortened`}, `severity` ∈ {`INFO`,`WARN`,`CRITICAL`} und einem vault-relativen `path`.
+Expected: nine objects, each with `check` ∈ {`dirid`,`type`,`shortened`}, `severity` ∈ {`INFO`,`WARN`,`CRITICAL`} and a vault-relative `path`.
 
-- [ ] **Step 6: Rust-Testhelfer und der erste (noch trivial grüne) Test**
+- [ ] **Step 6: Rust test helpers and the first (still trivially green) test**
 
-`crates/cryptomator-core/tests/common/mod.rs` bekommt:
+`crates/cryptomator-core/tests/common/mod.rs` gets:
 
 ```rust
 use std::path::{Path, PathBuf};
@@ -251,8 +251,8 @@ pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").join(name)
 }
 
-/// Kopiert ein Fixture in ein Tempdir. Jeder Test, der schreibt (Health-Fixes, Migration,
-/// Restore), arbeitet ausschliesslich auf so einer Kopie -- `tests/fixtures/` bleibt unberuehrt.
+/// Copies a fixture into a tempdir. Every test that writes (health fixes, migration,
+/// restore) works exclusively on such a copy -- `tests/fixtures/` stays untouched.
 pub fn copy_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let dst = dir.path().join(name);
@@ -274,7 +274,7 @@ pub fn copy_recursively(src: &Path, dst: &Path) {
 }
 ```
 
-Neue Datei `crates/cryptomator-core/tests/health.rs` mit dem Manifest-Typ und einem Test, der nur belegt, dass das Fixture da und lesbar ist:
+New file `crates/cryptomator-core/tests/health.rs` with the manifest type and a test that only proves the fixture is there and readable:
 
 ```rust
 mod common;
@@ -301,7 +301,7 @@ fn the_broken_fixture_carries_nine_expected_findings() {
     assert_eq!(findings.len(), 9, "{findings:#?}");
     assert!(findings.iter().any(|f| f.result == "OrphanContentDir"));
     assert!(findings.iter().any(|f| f.result == "MissingLongName"));
-    // Der Vault laesst sich weiterhin oeffnen -- beschaedigt ist die Struktur, nicht der Schluessel.
+    // The vault still opens -- what is damaged is the structure, not the key.
     let (_tmp, vault) = common::copy_fixture("broken_health");
     cryptomator_core::open_vault(
         &vault,
@@ -318,7 +318,7 @@ Run: `cargo test -p cryptomator-core --test health --locked`
 Expected: 1 passed.
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Expected: alles grün.
+Expected: everything green.
 
 ```bash
 git add tools/fixture-gen tests/fixtures/broken_health crates/cryptomator-core/tests crates/crypto/tests/java_interop.rs
@@ -329,28 +329,28 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Legacy-Fixtures v7, v6 und v5
+### Task 2: Legacy fixtures v7, v6, and v5
 
 **Files:**
-- Modify: `tools/fixture-gen/pom.xml` (drei `<module>`-Einträge), `tools/fixture-gen/README.md`
+- Modify: `tools/fixture-gen/pom.xml` (three `<module>` entries), `tools/fixture-gen/README.md`
 - Create: `tools/fixture-gen/gen-legacy-v7/{pom.xml,src/main/java/org/cryptomator/cli/fixtures/GenV7.java}`
 - Create: `tools/fixture-gen/gen-legacy-v6/{pom.xml,src/main/java/org/cryptomator/cli/fixtures/GenV6.java}`
 - Create: `tools/fixture-gen/gen-legacy-v5/{pom.xml,src/main/java/org/cryptomator/cli/fixtures/GenV5.java}`
-- Create (Generator-Ausgabe): `tests/fixtures/legacy_v7/`, `tests/fixtures/legacy_v6/`, `tests/fixtures/legacy_v5/`
+- Create (generator output): `tests/fixtures/legacy_v7/`, `tests/fixtures/legacy_v6/`, `tests/fixtures/legacy_v5/`
 - Test: `crates/cryptomator-core/tests/migration.rs`
 
 **Interfaces:**
 - Consumes: `common::{fixture, copy_fixture}` (Task 1), `cryptomator_core::{determine_vault_version, needs_migration, VaultState, determine_vault_state}`.
-- Produces: drei Fixture-Verzeichnisse mit je `fixture.json`:
+- Produces: three fixture directories, each with a `fixture.json`:
   ```json
   { "name": "legacy_v7", "vaultVersion": 7, "passphrase": "test-password-123",
     "masterkeyHex": "…", "expected": [ { "path": "/hello.txt", "type": "file", "sha256": "…" }, … ] }
   ```
-  Für `legacy_v5` ist `"passphrase"` die **NFD**-Form von `"tästpaß-123"` (also `a` + U+0308 statt `ä`), zusätzlich als `"passphraseNfc"` die NFC-Form.
+  For `legacy_v5`, `"passphrase"` is the **NFD** form of `"tästpaß-123"` (i.e. `a` + U+0308 instead of `ä`), plus the NFC form as `"passphraseNfc"`.
 
-**Wichtig vorab (verifiziert):** In `~/.m2` liegt **nur** cryptofs 2.10.0. Die drei Legacy-Artefakte sind auf Maven Central vorhanden (`https://repo1.maven.org/maven2/org/cryptomator/cryptofs/{1.9.15,1.8.9,1.6.2}/` → HTTP 200, geprüft), werden aber beim ersten Bau heruntergeladen: **dieser Task braucht Netzzugang.** Ohne Netz bricht Maven mit `Could not resolve dependencies` ab; dann ist der Task zu vertagen, nicht zu umgehen.
+**Important upfront (verified):** `~/.m2` contains **only** cryptofs 2.10.0. The three legacy artifacts are present on Maven Central (`https://repo1.maven.org/maven2/org/cryptomator/cryptofs/{1.9.15,1.8.9,1.6.2}/` → HTTP 200, checked), but they are downloaded on the first build: **this task needs network access.** Without network, Maven aborts with `Could not resolve dependencies`; then the task is to be deferred, not worked around.
 
-**Zweiter Befund (verifiziert):** `Constants.VAULT_VERSION` ist in cryptofs **1.9.15 = 7**, **1.8.9 = 6** und **1.6.2 = 6** – es gibt keine Bibliothek, die Format 5 schreibt. Format 5 und 6 unterscheiden sich ausschließlich in der Passphrase-Normalisierung (der `Version6Migrator` schreibt nur die Masterkey-Datei mit NFC-Passphrase neu, die Verzeichnisstruktur bleibt gleich). `gen-legacy-v5` erzeugt deshalb mit **1.6.2** einen Vault mit einer **NFD**-Passphrase und stempelt anschließend die Masterkey-Datei auf `version: 5` um, inklusive neu berechnetem `versionMac` = HMAC-SHA256(hmacMasterKey, BE32(5)). Das ist genau das, was ein echter v5-Vault ist.
+**Second finding (verified):** `Constants.VAULT_VERSION` in cryptofs is **1.9.15 = 7**, **1.8.9 = 6** and **1.6.2 = 6** – there is no library that writes format 5. Formats 5 and 6 differ solely in the passphrase normalization (the `Version6Migrator` only rewrites the masterkey file with an NFC passphrase, the directory structure stays the same). `gen-legacy-v5` therefore uses **1.6.2** to create a vault with an **NFD** passphrase and afterwards stamps the masterkey file down to `version: 5`, including a recomputed `versionMac` = HMAC-SHA256(hmacMasterKey, BE32(5)). That is exactly what a real v5 vault is.
 
 - [ ] **Step 1: `gen-legacy-v7`**
 
@@ -390,7 +390,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 </project>
 ```
 
-`GenV7.java` – cryptofs 1.x hat eine ganz andere API als 2.x: kein `Masterkey`-Objekt, kein `withKeyLoader`, stattdessen Passphrase-basiert.
+`GenV7.java` – cryptofs 1.x has a completely different API from 2.x: no `Masterkey` object, no `withKeyLoader`, passphrase-based instead.
 
 ```java
 package org.cryptomator.cli.fixtures;
@@ -405,7 +405,7 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.*;
 
-/** Erzeugt einen Vault im Format 7 mit cryptofs 1.9.15 (Constants.VAULT_VERSION == 7). */
+/** Creates a vault in format 7 with cryptofs 1.9.15 (Constants.VAULT_VERSION == 7). */
 public final class GenV7 {
 
     static final String NAME = "legacy_v7";
@@ -432,40 +432,40 @@ public final class GenV7 {
 }
 ```
 
-`LegacySupport` ist eine kleine Klasse, die in **jedem** der drei Legacy-Module als Kopie liegt (die Module teilen keinen Code, weil sie inkompatible cryptofs-Versionen auf dem Klassenpfad haben und `CryptoFileSystem` in 1.6.2/1.8.9/1.9.15 verschiedene Signaturen hat). Ihr Inhalt:
+`LegacySupport` is a small class that exists as a copy in **each** of the three legacy modules (the modules share no code, because they have incompatible cryptofs versions on the classpath and `CryptoFileSystem` has different signatures in 1.6.2/1.8.9/1.9.15). Its content:
 
 ```java
-static void recreate(Path vault) throws IOException {          // löscht rekursiv und legt neu an
+static void recreate(Path vault) throws IOException {          // deletes recursively and creates anew
 static void populate(CryptoFileSystem fs) throws IOException {
     Files.writeString(fs.getPath("/hello.txt"), "Hello, legacy!\n", StandardCharsets.UTF_8);
     Files.createDirectory(fs.getPath("/docs"));
     Files.writeString(fs.getPath("/docs/notes.md"), "# Notes\n\nlegacy\n", StandardCharsets.UTF_8);
     Files.createDirectory(fs.getPath("/docs/deep"));
     Files.writeString(fs.getPath("/docs/deep/inner.txt"), "nested\n", StandardCharsets.UTF_8);
-    // Ein Name, der laenger als 129 Zeichen wird und damit in v5/v6 als `.lng` in `m/` landet
-    // (Constants.SHORT_NAMES_MAX_LENGTH == 129) bzw. in v7 als `.c9s`:
+    // A name that grows longer than 129 characters and therefore lands in v5/v6 as a `.lng` in `m/`
+    // (Constants.SHORT_NAMES_MAX_LENGTH == 129), or in v7 as a `.c9s`:
     Files.writeString(fs.getPath("/" + "l".repeat(150) + ".txt"), "long name\n", StandardCharsets.UTF_8);
     Files.createSymbolicLink(fs.getPath("/link.txt"), fs.getPath("hello.txt"));
 }
-static void walk(Path dir, List<Map<String, Object>> out) throws IOException {   // wie Gen.walk
+static void walk(Path dir, List<Map<String, Object>> out) throws IOException {   // like Gen.walk
 static void writeManifest(Path vault, String name, int version, String passphrase,
                           String passphraseNfc, List<Map<String, Object>> expected) throws IOException
 ```
 
-`walk` und `sha256` werden aus `gen-current/…/Gen.java` wörtlich übernommen (Pfad, Typ, Größe, SHA-256, Symlink-Ziel). `writeManifest` schreibt `fixture.json` mit `name`, `vaultVersion`, `passphrase`, optional `passphraseNfc`, `masterkeyHex` (aus der erzeugten Masterkey-Datei ist der Rohschlüssel nicht ablesbar – das Feld entfällt hier, anders als bei `Gen`) und `expected`.
+`walk` and `sha256` are taken verbatim from `gen-current/…/Gen.java` (path, type, size, SHA-256, symlink target). `writeManifest` writes `fixture.json` with `name`, `vaultVersion`, `passphrase`, optionally `passphraseNfc`, `masterkeyHex` (the raw key cannot be read out of the generated masterkey file – the field is omitted here, unlike in `Gen`) and `expected`.
 
 - [ ] **Step 2: `gen-legacy-v6`**
 
-Identisch zu Step 1, aber `<version>1.8.9</version>`, Klasse `GenV6`, `NAME = "legacy_v6"`, `vaultVersion = 6`. In 1.8.9 liegt `Constants` im Paket `org.cryptomator.cryptofs` (nicht `…cryptofs.common`) – das spielt für `GenV6` keine Rolle, weil nur die öffentliche Provider-API benutzt wird, die identisch ist (`initialize(Path, String, CharSequence)`, `newFileSystem(Path, CryptoFileSystemProperties)`, Builder mit `withPassphrase`/`withMasterkeyFilename`).
+Identical to Step 1, but `<version>1.8.9</version>`, class `GenV6`, `NAME = "legacy_v6"`, `vaultVersion = 6`. In 1.8.9 `Constants` lives in the package `org.cryptomator.cryptofs` (not `…cryptofs.common`) – that does not matter for `GenV6`, because only the public provider API is used, which is identical (`initialize(Path, String, CharSequence)`, `newFileSystem(Path, CryptoFileSystemProperties)`, builder with `withPassphrase`/`withMasterkeyFilename`).
 
-Der so erzeugte Vault hat die v6-Struktur: `d/XX/YYY…/BASE32==` für Dateien, `0BASE32==` für Verzeichnisse, `1SBASE32==` für Symlinks, und `m/xx/yy/<32 BASE32-Zeichen>.lng` für den 150-Zeichen-Namen.
+The vault produced this way has the v6 structure: `d/XX/YYY…/BASE32==` for files, `0BASE32==` for directories, `1SBASE32==` for symlinks, and `m/xx/yy/<32 BASE32 characters>.lng` for the 150-character name.
 
 - [ ] **Step 3: `gen-legacy-v5`**
 
-`<version>1.6.2</version>`, Klasse `GenV5`, `NAME = "legacy_v5"`. Zwei Unterschiede zu Step 2:
+`<version>1.6.2</version>`, class `GenV5`, `NAME = "legacy_v5"`. Two differences from Step 2:
 
-1. Die Passphrase ist **NFD**: `String PASSPHRASE_NFD = "tästpaß-123";` (also `t`, `a`, U+0308 COMBINING DIAERESIS, `stpaß-123`) und `String PASSPHRASE_NFC = java.text.Normalizer.normalize(PASSPHRASE_NFD, java.text.Normalizer.Form.NFC);`. Der Vault wird mit **PASSPHRASE_NFD** initialisiert; cryptolib 1.x normalisiert nicht, also ist der KEK aus genau diesen Bytes abgeleitet. Ein `assert !PASSPHRASE_NFD.equals(PASSPHRASE_NFC)` im Generator stellt sicher, dass der Unterschied wirklich da ist.
-2. Nach dem Schließen des Dateisystems wird die Masterkey-Datei auf Version 5 umgestempelt:
+1. The passphrase is **NFD**: `String PASSPHRASE_NFD = "tästpaß-123";` (that is `t`, `a`, U+0308 COMBINING DIAERESIS, `stpaß-123`) and `String PASSPHRASE_NFC = java.text.Normalizer.normalize(PASSPHRASE_NFD, java.text.Normalizer.Form.NFC);`. The vault is initialized with **PASSPHRASE_NFD**; cryptolib 1.x does not normalize, so the KEK is derived from exactly these bytes. An `assert !PASSPHRASE_NFD.equals(PASSPHRASE_NFC)` in the generator makes sure the difference is really there.
+2. After the file system is closed, the masterkey file is stamped over to version 5:
 
 ```java
 static void stampVersion5(Path masterkeyFile) throws Exception {
@@ -473,29 +473,29 @@ static void stampVersion5(Path masterkeyFile) throws Exception {
     var obj = gson.fromJson(Files.readString(masterkeyFile), com.google.gson.JsonObject.class);
     obj.addProperty("version", 5);
     byte[] hmacKey = Base64.getDecoder().decode(obj.get("hmacMasterKey").getAsString());
-    // Das ist der *gewrappte* HMAC-Schluessel -- der versionMac wird mit dem *entpackten*
-    // gebildet. Deshalb ueber cryptolib gehen statt selbst zu rechnen:
+    // This is the *wrapped* HMAC key -- the versionMac is formed with the *unwrapped*
+    // one. So go through cryptolib instead of computing it yourself:
     //   Cryptor c = Cryptors.version1(csprng).createFromKeyFile(KeyFile.parse(bytes), pass, 6);
-    //   byte[] mac = c.fileHeaderCryptor() ...   -- gibt es in 1.x nicht oeffentlich.
-    // Loesung: den versionMac auf die Bytes von cryptolib selbst schreiben lassen, indem der
-    // Vault mit `CryptoFileSystemProvider.changePassphrase(vault, MASTERKEY, pass, pass)` neu
-    // geschrieben wird -- das kann die Version aber nicht setzen.
-    throw new UnsupportedOperationException("siehe Step 4");
+    //   byte[] mac = c.fileHeaderCryptor() ...   -- not public in 1.x.
+    // Solution: let cryptolib write the versionMac bytes itself, by rewriting the vault with
+    // `CryptoFileSystemProvider.changePassphrase(vault, MASTERKEY, pass, pass)` -- but that
+    // cannot set the version.
+    throw new UnsupportedOperationException("see Step 4");
 }
 ```
 
-Der obige Block ist **absichtlich** eine Sackgasse und steht hier, damit der Implementierende sie nicht selbst neu läuft: der `versionMac` braucht den entpackten HMAC-Schlüssel, den cryptolib 1.x nicht herausgibt. Der gangbare Weg steht in Step 4.
+The block above is **deliberately** a dead end and stands here so that the implementer does not run into it again: the `versionMac` needs the unwrapped HMAC key, which cryptolib 1.x does not hand out. The viable route is in Step 4.
 
-- [ ] **Step 4: Version 5 korrekt stempeln – über unser eigenes `MasterkeyFileAccess`**
+- [ ] **Step 4: Stamp version 5 correctly – via our own `MasterkeyFileAccess`**
 
-Der `versionMac` wird **nicht** in Java berechnet, sondern in Rust, und zwar in einem `#[ignore]`-Test, der das Fixture fertigstellt. Grund: `crates/cryptomator-core/src/masterkey_file.rs` kann genau das schon (`MasterkeyFileAccess::{load, persist}` mit `vault_version`-Parameter, `lock()` schreibt `versionMac` = HMAC-SHA256 über `vault_version.to_be_bytes()` unter dem MAC-Key), und cryptolib 1.x und 2.x schreiben bitgleiche Masterkey-Dateien.
+The `versionMac` is **not** computed in Java but in Rust, in an `#[ignore]` test that finishes the fixture. Reason: `crates/cryptomator-core/src/masterkey_file.rs` can already do exactly that (`MasterkeyFileAccess::{load, persist}` with a `vault_version` parameter, `lock()` writes `versionMac` = HMAC-SHA256 over `vault_version.to_be_bytes()` under the MAC key), and cryptolib 1.x and 2.x write bit-identical masterkey files.
 
-`GenV5.main` erzeugt also einen Vault mit `version: 6` und der NFD-Passphrase und meldet das im Manifest als `"vaultVersion": 5, "stampPending": true`. Danach läuft in `crates/cryptomator-core/tests/migration.rs`:
+`GenV5.main` therefore creates a vault with `version: 6` and the NFD passphrase and reports that in the manifest as `"vaultVersion": 5, "stampPending": true`. After that, the following runs in `crates/cryptomator-core/tests/migration.rs`:
 
 ```rust
-/// Stempelt `tests/fixtures/legacy_v5/masterkey.cryptomator` von Version 6 auf 5 um. Laeuft einmal
-/// nach `mvn … GenV5` und schreibt als einziger Test in `tests/fixtures/` -- deshalb `#[ignore]`.
-/// Aufruf: `cargo test -p cryptomator-core --test migration -- --ignored stamp_legacy_v5`
+/// Stamps `tests/fixtures/legacy_v5/masterkey.cryptomator` over from version 6 to 5. Runs once
+/// after `mvn … GenV5` and is the only test that writes into `tests/fixtures/` -- hence `#[ignore]`.
+/// Invocation: `cargo test -p cryptomator-core --test migration -- --ignored stamp_legacy_v5`
 #[test]
 #[ignore = "regenerates a checked-in fixture; run only after the Java generator"]
 fn stamp_legacy_v5() {
@@ -513,25 +513,25 @@ fn stamp_legacy_v5() {
 }
 ```
 
-Der Testlauf ändert danach noch `stampPending` auf `false` — nein: einfacher und ohne Zustand, `writeManifest` lässt das Feld ganz weg und schreibt direkt `"vaultVersion": 5`; der Rust-Test ist der zweite Teil desselben Generatorschritts und in `tools/fixture-gen/README.md` als solcher dokumentiert. Nach dem Umstempeln ist die Datei fertig und wird eingecheckt.
+The test run then also flips `stampPending` to `false` — no: simpler and stateless, `writeManifest` leaves the field out entirely and writes `"vaultVersion": 5` directly; the Rust test is the second part of the same generator step and is documented as such in `tools/fixture-gen/README.md`. After the stamping the file is finished and gets checked in.
 
-- [ ] **Step 5: Alle drei Fixtures erzeugen**
+- [ ] **Step 5: Generate all three fixtures**
 
 Run:
 ```bash
 cd /Users/rfoerthe/work/cryptomator-cli
-mvn -q -f tools/fixture-gen/pom.xml compile                      # laedt 1.9.15/1.8.9/1.6.2 nach ~/.m2
+mvn -q -f tools/fixture-gen/pom.xml compile                      # downloads 1.9.15/1.8.9/1.6.2 into ~/.m2
 mvn -q -f tools/fixture-gen/gen-legacy-v7/pom.xml exec:exec
 mvn -q -f tools/fixture-gen/gen-legacy-v6/pom.xml exec:exec
 mvn -q -f tools/fixture-gen/gen-legacy-v5/pom.xml exec:exec
 cargo test -p cryptomator-core --test migration --locked -- --ignored stamp_legacy_v5
 du -sh tests/fixtures/legacy_v*
 ```
-Expected: drei Verzeichnisse, jedes **unter 200 KB**; `generated legacy_v7|v6|v5` auf stdout; der Rust-Test grün.
+Expected: three directories, each **under 200 KB**; `generated legacy_v7|v6|v5` on stdout; the Rust test green.
 
-Schlägt der erste `mvn`-Aufruf mit `Could not resolve dependencies` fehl, fehlt Netz – im Report festhalten und den Task abbrechen, nicht die Versionen ändern.
+If the first `mvn` call fails with `Could not resolve dependencies`, the network is missing – record it in the report and abort the task, do not change the versions.
 
-- [ ] **Step 6: Die Struktur der drei Fixtures nachweisen**
+- [ ] **Step 6: Prove the structure of the three fixtures**
 
 Run:
 ```bash
@@ -539,9 +539,9 @@ ls tests/fixtures/legacy_v7/d/*/*/ | head
 ls tests/fixtures/legacy_v6/ && ls tests/fixtures/legacy_v6/m/*/*/ | head
 ls tests/fixtures/legacy_v5/ && head -c 200 tests/fixtures/legacy_v5/masterkey.cryptomator
 ```
-Expected: `legacy_v7` hat `.c9r`/`.c9s`-Namen und **kein** `m/`; `legacy_v6` und `legacy_v5` haben BASE32-Namen mit `0`/`1S`-Präfixen und ein `m/xx/yy/…lng`; die v5-Masterkey-Datei beginnt mit `{"version": 5,` (bzw. `"version":5`).
+Expected: `legacy_v7` has `.c9r`/`.c9s` names and **no** `m/`; `legacy_v6` and `legacy_v5` have BASE32 names with `0`/`1S` prefixes and an `m/xx/yy/…lng`; the v5 masterkey file starts with `{"version": 5,` (or `"version":5`).
 
-- [ ] **Step 7: Rust-Test über die erkannten Versionen**
+- [ ] **Step 7: Rust test over the detected versions**
 
 In `crates/cryptomator-core/tests/migration.rs`:
 
@@ -558,7 +558,7 @@ fn the_legacy_fixtures_report_their_formats() {
         assert_eq!(determine_vault_state(&vault).unwrap(), VaultState::NeedsMigration, "{name}");
         assert!(!vault.join("vault.cryptomator").exists(), "{name} has no vault config yet");
     }
-    // v6 und v5 haben das Metadatenverzeichnis, v7 nicht mehr.
+    // v6 and v5 have the metadata directory, v7 no longer does.
     assert!(common::fixture("legacy_v6").join("m").is_dir());
     assert!(common::fixture("legacy_v5").join("m").is_dir());
     assert!(!common::fixture("legacy_v7").join("m").exists());
@@ -579,12 +579,12 @@ fn the_v5_fixture_needs_an_nfd_passphrase() {
 }
 ```
 
-- [ ] **Step 8: Doku, Gate, Commit**
+- [ ] **Step 8: Docs, gate, commit**
 
-`tools/fixture-gen/README.md` bekommt einen Abschnitt „Legacy fixtures" mit den vier Kommandos aus Step 5, dem Hinweis auf den Netzbedarf beim ersten Lauf und dem Satz, dass `legacy_v5` erst nach dem Rust-Stempelschritt fertig ist.
+`tools/fixture-gen/README.md` gets a section "Legacy fixtures" with the four commands from Step 5, the note about the network requirement on the first run, and the sentence that `legacy_v5` is only finished after the Rust stamping step.
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Expected: grün (der `stamp_legacy_v5`-Test läuft dabei nicht, er ist `#[ignore]`).
+Expected: green (the `stamp_legacy_v5` test does not run there, it is `#[ignore]`).
 
 ```bash
 git add tools/fixture-gen tests/fixtures/legacy_v7 tests/fixtures/legacy_v6 tests/fixtures/legacy_v5 crates/cryptomator-core/tests/migration.rs
@@ -595,7 +595,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Das Health-Gerüst – `Severity`, `DiagnosticResult`, `Fix`, `HealthCheck`, `CheckContext`
+### Task 3: The health scaffolding – `Severity`, `DiagnosticResult`, `Fix`, `HealthCheck`, `CheckContext`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/health/mod.rs`
@@ -612,7 +612,7 @@ pub const CHECK_IDS: [&str; 3] = ["dirid", "type", "shortened"];
 pub enum Severity { Good, Info, Warn, Critical }
 impl Severity {
     pub fn as_str(self) -> &'static str;          // "GOOD" | "INFO" | "WARN" | "CRITICAL"
-    pub fn parse_threshold(s: &str) -> Result<Severity>;  // nur "WARN" | "CRITICAL", case-insensitive
+    pub fn parse_threshold(s: &str) -> Result<Severity>;  // only "WARN" | "CRITICAL", case-insensitive
 }
 
 pub trait Fix: std::fmt::Debug + Send {
@@ -622,9 +622,9 @@ pub trait Fix: std::fmt::Debug + Send {
 #[derive(Debug)]
 pub struct DiagnosticResult {
     pub severity: Severity,
-    pub check: &'static str,        // eine der CHECK_IDS
-    pub message: String,            // wortgleich mit Javas toString()
-    pub paths: Vec<PathBuf>,        // vault-relativ (Ruling 1)
+    pub check: &'static str,        // one of the CHECK_IDS
+    pub message: String,            // word for word with Java's toString()
+    pub paths: Vec<PathBuf>,        // vault-relative (Ruling 1)
     pub fix: Option<Box<dyn Fix>>,
 }
 impl DiagnosticResult {
@@ -635,7 +635,7 @@ impl DiagnosticResult {
 
 pub trait HealthCheck: std::fmt::Debug {
     fn id(&self) -> &'static str;              // "dirid" | "type" | "shortened"
-    fn name(&self) -> &'static str;            // Javas HealthCheck.name(), für den Report
+    fn name(&self) -> &'static str;            // Java's HealthCheck.name(), for the report
     fn run(&self, ctx: &CheckContext, sink: &mut dyn FnMut(DiagnosticResult));
 }
 
@@ -646,17 +646,17 @@ impl CheckContext {
     pub fn with_rng(opened: OpenedVault, rng: Box<dyn Rng + Send>) -> Self;
     pub fn data_dir(&self) -> PathBuf;                             // <vault>/d
     pub fn resolve(&self, relative: &Path) -> PathBuf;             // vault_path.join(relative)
-    pub fn relativize(&self, absolute: &Path) -> PathBuf;          // strip_prefix(vault_path), sonst unveraendert
-    pub fn rng<T>(&self, f: impl FnOnce(&mut dyn Rng) -> T) -> T;  // serialisiert ueber die Mutex
+    pub fn relativize(&self, absolute: &Path) -> PathBuf;          // strip_prefix(vault_path), otherwise unchanged
+    pub fn rng<T>(&self, f: impl FnOnce(&mut dyn Rng) -> T) -> T;  // serialized through the mutex
 }
 
 pub fn all_checks() -> Vec<Box<dyn HealthCheck>>;
 pub fn checks_by_ids(ids: &[String]) -> Result<Vec<Box<dyn HealthCheck>>>;
 pub fn run_checks(checks: &[Box<dyn HealthCheck>], ctx: &CheckContext) -> Vec<DiagnosticResult>;
 ```
-und `CoreError::UnknownHealthCheck(String)` (→ Exit 2 über `CoreError::InvalidArgument`-Nachbarschaft; siehe Step 3).
+plus `CoreError::UnknownHealthCheck(String)` (→ exit 2 through the `CoreError::InvalidArgument` neighbourhood; see Step 3).
 
-- [ ] **Step 1: Failing test für `Severity` und den Katalog**
+- [ ] **Step 1: Failing test for `Severity` and the catalog**
 
 ```rust
 #[cfg(test)]
@@ -701,24 +701,24 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core health::tests --locked`
 Expected: FAIL, `unresolved module` / `cannot find`.
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
-`health/mod.rs` mit den Typen aus dem Interfaces-Block. Details, die nicht raten lassen:
+`health/mod.rs` with the types from the Interfaces block. Details that leave nothing to guess:
 
-- `Severity` leitet `PartialOrd, Ord` in der Deklarationsreihenfolge `Good, Info, Warn, Critical` ab – daran hängen `--fail-on` und `--fix-severity`.
-- `parse_threshold` akzeptiert case-insensitiv `"warn"`/`"critical"` und liefert sonst
+- `Severity` derives `PartialOrd, Ord` in the declaration order `Good, Info, Warn, Critical` – `--fail-on` and `--fix-severity` hang off that.
+- `parse_threshold` accepts `"warn"`/`"critical"` case-insensitively and otherwise returns
   `CoreError::InvalidArgument(format!("unknown severity {input:?}; expected WARN or CRITICAL"))`.
-- `checks_by_ids` geht **über `CHECK_IDS` in Katalogreihenfolge** und nimmt jede ID auf, die in `ids` vorkommt (dadurch Dedup und stabile Reihenfolge, unabhängig davon, wie der Nutzer sie sortiert hat). Danach prüft es, ob jedes Element von `ids` in `CHECK_IDS` steht, und meldet sonst
+- `checks_by_ids` walks **`CHECK_IDS` in catalog order** and picks up every ID that occurs in `ids` (which gives dedup and a stable order, independent of how the user sorted them). It then checks that every element of `ids` is in `CHECK_IDS`, and otherwise reports
   `CoreError::InvalidArgument(format!("unknown check {id:?}; valid checks are {}", CHECK_IDS.join(", ")))`.
-- `all_checks()` gibt `vec![Box::new(DirIdCheck), Box::new(CiphertextFileTypeCheck), Box::new(ShortenedNamesCheck)]` zurück. **In diesem Task existieren die drei Typen noch nicht.** Bis Task 4/6 sie liefern, steht in `all_checks()` genau dies:
+- `all_checks()` returns `vec![Box::new(DirIdCheck), Box::new(CiphertextFileTypeCheck), Box::new(ShortenedNamesCheck)]`. **In this task the three types do not exist yet.** Until Task 4/6 deliver them, `all_checks()` contains exactly this:
   ```rust
   pub fn all_checks() -> Vec<Box<dyn HealthCheck>> {
-      // Task 4 ersetzt die erste, Task 6 die zweite und dritte Zeile durch die echten Checks.
+      // Task 4 replaces the first line, Task 6 the second and third, with the real checks.
       vec![
           Box::new(Placeholder { id: "dirid", name: "Directory Check" }),
           Box::new(Placeholder { id: "type", name: "Resource Type Check" }),
@@ -726,8 +726,8 @@ Expected: FAIL, `unresolved module` / `cannot find`.
       ]
   }
 
-  /// Nur bis Task 4/6: ein Check, der nichts findet. Steht hier, damit `run_checks`, `--check`
-  /// und der Report schon in diesem Task getestet werden koennen.
+  /// Only until Task 4/6: a check that finds nothing. It is here so that `run_checks`, `--check`
+  /// and the report can already be tested in this task.
   #[derive(Debug)]
   struct Placeholder { id: &'static str, name: &'static str }
   impl HealthCheck for Placeholder {
@@ -736,12 +736,12 @@ Expected: FAIL, `unresolved module` / `cannot find`.
       fn run(&self, _ctx: &CheckContext, _sink: &mut dyn FnMut(DiagnosticResult)) {}
   }
   ```
-- `run_checks` ruft jeden Check der Reihe nach auf, sammelt in einen `Vec` und gibt ihn **in der Reihenfolge Check → Fundzeitpunkt** zurück. Kein Nebenläufigkeit: Java streamt über einen Executor, wir brauchen das nicht und ein deterministischer Report ist mehr wert.
-- Panics eines Checks werden **nicht** abgefangen; ein Panic ist ein Bug, kein Befund. Javas `CheckFailed` (CRITICAL) bilden wir für den einen Fall nach, den Java auch abfängt: ein `walkdir`-Fehler beim Traversieren – das machen die Checks selbst in Task 4/6.
-- `CheckContext::relativize` benutzt `strip_prefix(&self.vault_path).unwrap_or(absolute)` und gibt einen `PathBuf` zurück.
-- `CheckContext::rng` sperrt die `Mutex` mit `lock().unwrap_or_else(|e| e.into_inner())` (dasselbe Muster wie `Ctx::keychain`).
+- `run_checks` calls each check in turn, collects into a `Vec`, and returns it **in the order check → time of finding**. No concurrency: Java streams via an executor, we do not need that and a deterministic report is worth more.
+- Panics from a check are **not** caught; a panic is a bug, not a finding. We reproduce Java's `CheckFailed` (CRITICAL) for the one case Java catches too: a `walkdir` error while traversing – the checks do that themselves in Task 4/6.
+- `CheckContext::relativize` uses `strip_prefix(&self.vault_path).unwrap_or(absolute)` and returns a `PathBuf`.
+- `CheckContext::rng` locks the `Mutex` with `lock().unwrap_or_else(|e| e.into_inner())` (the same pattern as `Ctx::keychain`).
 
-`lib.rs`: `pub mod health;` und
+`lib.rs`: `pub mod health;` and
 ```rust
 pub use health::{
     all_checks, checks_by_ids, run_checks, CheckContext, DiagnosticResult, Fix, HealthCheck,
@@ -749,12 +749,12 @@ pub use health::{
 };
 ```
 
-- [ ] **Step 4: Lauf – muss bestehen**
+- [ ] **Step 4: Run – must pass**
 
 Run: `cargo test -p cryptomator-core health --locked`
 Expected: 5 passed.
 
-- [ ] **Step 5: Gate und Commit**
+- [ ] **Step 5: Gate and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -767,7 +767,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: `DirIdCheck` – acht Ergebnistypen und die Fixes ohne LOST+FOUND
+### Task 4: `DirIdCheck` – eight result types and the fixes without LOST+FOUND
 
 **Files:**
 - Create: `crates/cryptomator-core/src/health/dir_id.rs`
@@ -785,15 +785,15 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 4;      // d/2/30/Fo0==.c9r/dir.c9r
 #[derive(Debug)] pub struct DirIdCheck;
 impl HealthCheck for DirIdCheck { … }
 
-// Fixes (jeweils `pub(crate)`, weil sie nur ueber `DiagnosticResult::fix` erreichbar sind):
+// Fixes (each `pub(crate)`, because they are only reachable via `DiagnosticResult::fix`):
 #[derive(Debug)] struct DeleteLooseDirFile { dir_file: PathBuf }
 #[derive(Debug)] struct WriteDirIdBackup   { dir_id: String, content_dir: PathBuf }
 #[derive(Debug)] struct CreateContentDir   { dir_id: String }
 ```
 
-**Java-Vorlage, wörtlich (cryptofs 2.10.0 `health/dirid/*`).** Die acht Ergebnisse, ihre Severity, ihr `toString()` und ihr Fix:
+**Java template, verbatim (cryptofs 2.10.0 `health/dirid/*`).** The eight results, their severity, their `toString()`, and their fix:
 
-| Ergebnis | Severity | Meldung (Java-Formatstring) | Fix |
+| Result | Severity | Message (Java format string) | Fix |
 |---|---|---|---|
 | `HealthyDir` | GOOD | `Good directory %s (%s) -> %s` (dirFile, dirId, dir) | – |
 | `MissingDirIdBackup` | INFO | `Directory ID backup for directory %s is missing.` (contentDir) | `DirectoryIdBackup.write(cryptor, {dirId, absCipherDir})` |
@@ -802,13 +802,13 @@ impl HealthCheck for DirIdCheck { … }
 | `EmptyDirFile` | CRITICAL | `File %s is empty, expected content` (dirFile) | – |
 | `DirIdCollision` | CRITICAL | `Directory ID reused: %s found in %s and %s` (dirId, dirFile, otherDirFile) | – |
 | `MissingContentDir` | WARN | `dir.c9r file (%s) points to non-existing directory.` (dirFile) | `createDirectories(d/h[0..2]/h[2..32])` + `DirectoryIdBackup.write` |
-| `OrphanContentDir` | WARN | `Orphan directory: %s` (contentDir) | LOST+FOUND-Adoption → **Task 5** |
+| `OrphanContentDir` | WARN | `Orphan directory: %s` (contentDir) | LOST+FOUND adoption → **Task 5** |
 
-Die Meldung von `LooseDirFile` endet tatsächlich auf `". ."` – Tippfehler im Original, wird wörtlich übernommen, damit Reports vergleichbar bleiben.
+The message of `LooseDirFile` really does end in `". ."` – a typo in the original, adopted verbatim so that reports stay comparable.
 
-- [ ] **Step 1: Failing test gegen `broken_health`**
+- [ ] **Step 1: Failing test against `broken_health`**
 
-In `crates/cryptomator-core/tests/health.rs` (die Helfer `expected_findings`/`ExpectedFinding` stehen dort schon aus Task 1):
+In `crates/cryptomator-core/tests/health.rs` (the helpers `expected_findings`/`ExpectedFinding` are already there from Task 1):
 
 ```rust
 use cryptomator_core::health::{CheckContext, DiagnosticResult, Severity};
@@ -827,8 +827,8 @@ fn run(id: &str, ctx: &CheckContext) -> Vec<DiagnosticResult> {
     cryptomator_core::run_checks(&checks, ctx)
 }
 
-/// Wie oft eine Meldung mit diesem Praefix vorkommt. Die Ergebnistypen selbst sind privat --
-/// die Meldung ist ihre oeffentliche Identitaet, genau wie in Javas Report.
+/// How often a message with this prefix occurs. The result types themselves are private --
+/// the message is their public identity, exactly as in Java's report.
 fn count(results: &[DiagnosticResult], prefix: &str) -> usize {
     results.iter().filter(|r| r.message.starts_with(prefix)).count()
 }
@@ -844,7 +844,7 @@ fn the_dirid_check_finds_every_damaged_directory() {
     assert_eq!(count(&results, "Directory ID reused:"), 1);
     assert!(count(&results, "Good directory") >= 1, "the intact directories are still good");
     assert!(results.iter().all(|r| r.check == "dirid"));
-    // Ruling 1: jeder Pfad ist vault-relativ.
+    // Ruling 1: every path is vault-relative.
     assert!(results.iter().flat_map(|r| &r.paths).all(|p| p.is_relative()), "{results:#?}");
     assert!(results.iter().flat_map(|r| &r.paths).all(|p| p.starts_with("d")), "{results:#?}");
 }
@@ -877,7 +877,7 @@ fn the_three_fixable_dirid_findings_repair_the_vault() {
     let (_tmp, _vault, ctx) = open_broken();
     let before = run("dirid", &ctx);
     for result in &before {
-        // Der Waisen-Fix kommt erst mit Task 5; hier werden die drei anderen angewandt.
+        // The orphan fix only arrives with Task 5; here the three others are applied.
         if result.message.starts_with("Orphan directory:") { continue; }
         if let Some(fix) = &result.fix {
             fix.apply(&ctx).expect("the fix applies");
@@ -887,9 +887,9 @@ fn the_three_fixable_dirid_findings_repair_the_vault() {
     assert_eq!(count(&after, "Directory ID backup for directory"), 0);
     assert_eq!(count(&after, "dir.c9r file ("), 0);
     assert_eq!(count(&after, "A dir.c9r without proper parent found:"), 0);
-    // Der Waisenfund bleibt, weil sein Fix uebersprungen wurde.
+    // The orphan finding stays, because its fix was skipped.
     assert_eq!(count(&after, "Orphan directory:"), 1);
-    // Idempotenz: ein zweiter Durchlauf derselben Fixes aendert nichts mehr.
+    // Idempotence: a second pass of the same fixes changes nothing any more.
     for result in &after {
         if result.message.starts_with("Orphan directory:") { continue; }
         if let Some(fix) = &result.fix { fix.apply(&ctx).expect("idempotent"); }
@@ -898,29 +898,29 @@ fn the_three_fixable_dirid_findings_repair_the_vault() {
 }
 ```
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core --test health --locked`
-Expected: FAIL – der `Placeholder` aus Task 3 liefert nichts, also `assert_eq!(count(…), 1)` schlägt fehl.
+Expected: FAIL – the `Placeholder` from Task 3 returns nothing, so `assert_eq!(count(…), 1)` fails.
 
-- [ ] **Step 3: Der Scan**
+- [ ] **Step 3: The scan**
 
-`DirIdCheck::run` in zwei Phasen, exakt wie `DirIdCheck.check`:
+`DirIdCheck::run` in two phases, exactly like `DirIdCheck.check`:
 
-**Phase 1 – Traversieren** (`walkdir` gibt es nicht im Workspace, also `std::fs::read_dir` rekursiv mit einer Tiefenbegrenzung von 4 ab `d/`, gemessen wie Javas `Files.walkFileTree(dataDirPath, Set.of(), 4, visitor)`: `d` = Tiefe 0, `d/XX` = 1, `d/XX/YYY…` = 2, `d/XX/YYY…/name.c9r` = 3, `d/XX/YYY…/name.c9r/dir.c9r` = 4). Gesammelt wird:
-- `dir_ids: BTreeMap<String, Option<PathBuf>>` – vorbelegt mit `("".to_string(), None)` (Javas „wir haben immer die leere dirId für die Wurzel").
-- `second_level_dirs: BTreeSet<PathBuf>` – jeder Pfad, der relativ zu `d/` genau zwei Namenskomponenten hat (also `XX/YYY…`).
+**Phase 1 – traversal** (`walkdir` is not in the workspace, so `std::fs::read_dir` recursively with a depth limit of 4 starting at `d/`, measured like Java's `Files.walkFileTree(dataDirPath, Set.of(), 4, visitor)`: `d` = depth 0, `d/XX` = 1, `d/XX/YYY…` = 2, `d/XX/YYY…/name.c9r` = 3, `d/XX/YYY…/name.c9r/dir.c9r` = 4). Collected are:
+- `dir_ids: BTreeMap<String, Option<PathBuf>>` – pre-seeded with `("".to_string(), None)` (Java's "we always have the empty dirId for the root").
+- `second_level_dirs: BTreeSet<PathBuf>` – every path that has exactly two name components relative to `d/` (that is, `XX/YYY…`).
 
-`BTreeMap`/`BTreeSet` statt `HashMap`/`HashSet`: der Report soll bei gleichem Vault gleich aussehen.
+`BTreeMap`/`BTreeSet` instead of `HashMap`/`HashSet`: the report should look the same for the same vault.
 
-Beim Besuch einer **Datei** namens `dir.c9r` (Javas `visitFile` → `visitDirFile`):
-1. Elternname endet weder auf `.c9r` noch `.c9s` → `LooseDirFile` (INFO, Fix `DeleteLooseDirFile`), weiter mit dem nächsten Geschwisterknoten (`CONTINUE`).
-2. Größe > `MAX_DIR_ID_LENGTH` (36) → `ObeseDirFile` (CRITICAL, kein Fix).
-3. Größe == 0 → `EmptyDirFile` (CRITICAL, kein Fix).
-4. sonst Inhalt als UTF-8 lesen (`String::from_utf8_lossy`, wie Javas `new String(bytes, UTF_8)`); ist die dirId schon in `dir_ids` → `DirIdCollision` (CRITICAL) mit dem *anderen* Pfad, sonst eintragen.
-Nach Fall 2–4 folgt Java `SKIP_SIBLINGS` – innerhalb eines `.c9r`-Verzeichnisses gibt es nach `dir.c9r` nichts mehr zu sehen. Unsere rekursive Variante bricht die Schleife über die Geschwister an dieser Stelle ab.
+When visiting a **file** named `dir.c9r` (Java's `visitFile` → `visitDirFile`):
+1. parent name ends in neither `.c9r` nor `.c9s` → `LooseDirFile` (INFO, fix `DeleteLooseDirFile`), continue with the next sibling node (`CONTINUE`).
+2. size > `MAX_DIR_ID_LENGTH` (36) → `ObeseDirFile` (CRITICAL, no fix).
+3. size == 0 → `EmptyDirFile` (CRITICAL, no fix).
+4. otherwise read the content as UTF-8 (`String::from_utf8_lossy`, like Java's `new String(bytes, UTF_8)`); if the dirId is already in `dir_ids` → `DirIdCollision` (CRITICAL) with the *other* path, otherwise insert it.
+After cases 2–4 Java follows with `SKIP_SIBLINGS` – inside a `.c9r` directory there is nothing more to see after `dir.c9r`. Our recursive variant breaks out of the loop over the siblings at that point.
 
-**Phase 2 – Paare auflösen:**
+**Phase 2 – resolve the pairs:**
 ```rust
 for (dir_id, dir_file) in std::mem::take(&mut dir_ids) {
     let hash = ctx.cryptor.file_name_cryptor().hash_directory_id(&dir_id);
@@ -938,16 +938,16 @@ for (dir_id, dir_file) in std::mem::take(&mut dir_ids) {
 }
 for dir in second_level_dirs { sink(orphan_content_dir(&dir)); }
 ```
-Zwei Java-Eigenheiten, die mitkommen: die Wurzel hat `dir_file == None` (Java setzt `null`), und ihr `HealthyDir`-Text enthält dann `null`; wir schreiben stattdessen `-` und halten das im Doc-Kommentar fest (ein Rust-`None` als `"None"` zu drucken wäre schlechter lesbar als beides). Und: der `MissingContentDir`-Fund für die *Wurzel* (dirId `""`) kann nur auftreten, wenn `d/<roothash>` fehlt – dann steht in der Meldung `dir.c9r file (-) points to non-existing directory.`
+Two Java quirks come along: the root has `dir_file == None` (Java sets `null`), and its `HealthyDir` text then contains `null`; we write `-` instead and record that in the doc comment (printing a Rust `None` as `"None"` would read worse than either). And: the `MissingContentDir` finding for the *root* (dirId `""`) can only occur if `d/<roothash>` is missing – the message then reads `dir.c9r file (-) points to non-existing directory.`
 
-- [ ] **Step 4: Die drei Fixes**
+- [ ] **Step 4: The three fixes**
 
 ```rust
 #[derive(Debug)] struct DeleteLooseDirFile { dir_file: PathBuf }
 impl Fix for DeleteLooseDirFile {
     fn apply(&self, ctx: &CheckContext) -> std::io::Result<()> {
         match std::fs::remove_file(ctx.resolve(&self.dir_file)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),   // Javas deleteIfExists
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),   // Java's deleteIfExists
             other => other,
         }
     }
@@ -958,7 +958,7 @@ impl Fix for WriteDirIdBackup {
     fn apply(&self, ctx: &CheckContext) -> std::io::Result<()> {
         let dir = CiphertextDirectory { dir_id: self.dir_id.clone(), path: ctx.resolve(&self.content_dir) };
         match ctx.rng(|rng| crate::fs::dir_id::write_dir_id_backup(&ctx.cryptor, &dir, rng)) {
-            // CREATE_NEW: eine schon vorhandene dirid.c9r ist der Erfolgsfall eines zweiten Laufs.
+            // CREATE_NEW: an already existing dirid.c9r is the success case of a second run.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             other => other,
         }
@@ -969,8 +969,8 @@ impl Fix for WriteDirIdBackup {
 impl Fix for CreateContentDir {
     fn apply(&self, ctx: &CheckContext) -> std::io::Result<()> {
         let hash = ctx.cryptor.file_name_cryptor().hash_directory_id(&self.dir_id);
-        // Java: substring(2, 32) statt substring(2) -- der Hash ist genau 32 Zeichen lang, also
-        // dasselbe; hier steht die kuerzere Form.
+        // Java: substring(2, 32) instead of substring(2) -- the hash is exactly 32 characters long,
+        // so it is the same; the shorter form is used here.
         let dir = ctx.data_dir().join(&hash[..2]).join(&hash[2..]);
         std::fs::create_dir_all(&dir)?;
         let ct = CiphertextDirectory { dir_id: self.dir_id.clone(), path: dir };
@@ -982,16 +982,16 @@ impl Fix for CreateContentDir {
 }
 ```
 
-Die `AlreadyExists`-Toleranz ist unsere Zutat und der Grund, warum `--fix` idempotent ist: Java wirft dort (bis auf `prepareStepParent`, das den Fall selbst abfängt).
+The `AlreadyExists` tolerance is our addition and the reason why `--fix` is idempotent: Java throws there (except in `prepareStepParent`, which catches the case itself).
 
-- [ ] **Step 5: `all_checks` verdrahten**
+- [ ] **Step 5: Wire up `all_checks`**
 
-In `health/mod.rs` die erste `Placeholder`-Zeile durch `Box::new(dir_id::DirIdCheck)` ersetzen und `pub mod dir_id;` ergänzen. Die beiden anderen Placeholder bleiben bis Task 6 stehen.
+In `health/mod.rs` replace the first `Placeholder` line with `Box::new(dir_id::DirIdCheck)` and add `pub mod dir_id;`. The other two placeholders stay until Task 6.
 
-- [ ] **Step 6: Tests, Gate, Commit**
+- [ ] **Step 6: Tests, gate, commit**
 
 Run: `cargo test -p cryptomator-core --test health --locked`
-Expected: 5 passed (die vier neuen plus der Fixture-Test aus Task 1).
+Expected: 5 passed (the four new ones plus the fixture test from Task 1).
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -1004,11 +1004,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Der LOST+FOUND-Fix von `OrphanContentDir`
+### Task 5: The LOST+FOUND fix of `OrphanContentDir`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/health/orphan.rs`
-- Modify: `crates/cryptomator-core/src/health/dir_id.rs` (`orphan_content_dir` bekommt den Fix), `crates/cryptomator-core/src/health/mod.rs` (`pub mod orphan;`)
+- Modify: `crates/cryptomator-core/src/health/dir_id.rs` (`orphan_content_dir` gets the fix), `crates/cryptomator-core/src/health/mod.rs` (`pub mod orphan;`)
 - Test: `crates/cryptomator-core/tests/health.rs`
 
 **Interfaces:**
@@ -1020,10 +1020,10 @@ pub(crate) const DIR_PREFIX: &str = "directory";
 pub(crate) const SYMLINK_PREFIX: &str = "symlink";
 pub(crate) const LONG_NAME_SUFFIX_BASE: &str = "_withVeryLongName";
 
-#[derive(Debug)] pub(crate) struct AdoptOrphan { pub content_dir: PathBuf }   // vault-relativ, z. B. d/AB/CDE…
+#[derive(Debug)] pub(crate) struct AdoptOrphan { pub content_dir: PathBuf }   // vault-relative, e.g. d/AB/CDE…
 impl Fix for AdoptOrphan { fn apply(&self, ctx: &CheckContext) -> std::io::Result<()>; }
 
-// visible for testing (crate-privat, in den Unit-Tests dieses Moduls geprueft):
+// visible for testing (crate-private, exercised in this module's unit tests):
 pub(crate) fn prepare_recovery_dir(ctx: &CheckContext) -> std::io::Result<PathBuf>;
 pub(crate) fn prepare_step_parent(ctx: &CheckContext, recovery_dir: &Path, clear_name: &str)
     -> std::io::Result<CiphertextDirectory>;
@@ -1031,7 +1031,7 @@ pub(crate) fn clear_name_to_be_shortened(threshold: u32) -> String;
 pub(crate) fn run_id(rng: &mut dyn Rng) -> String;
 ```
 
-**Java-Vorlage: `OrphanContentDir.fix` (cryptofs 2.10.0), Schritt für Schritt.**
+**Java template: `OrphanContentDir.fix` (cryptofs 2.10.0), step by step.**
 
 - [ ] **Step 1: Failing test**
 
@@ -1043,16 +1043,16 @@ fn the_orphan_fix_adopts_the_lost_files_into_lost_and_found() {
     let orphan = before.iter().find(|r| r.message.starts_with("Orphan directory:")).expect("an orphan");
     orphan.fix.as_ref().expect("the orphan is fixable").apply(&ctx).expect("adoption succeeds");
 
-    // Das Waisenverzeichnis ist weg …
+    // The orphaned directory is gone …
     assert!(!ctx.resolve(&orphan.paths[0]).exists(), "the orphaned content dir was removed");
-    // … und ein LOST+FOUND-Knoten steht in der Vault-Wurzel.
+    // … and a LOST+FOUND node sits in the vault root.
     let root = cryptomator_core::root_content_dir(&vault, &ctx.cryptor);
     let lost_and_found = ctx.cryptor.file_name_cryptor().encrypt_filename("LOST+FOUND", &[b""]) + ".c9r";
     let dir_file = root.join(&lost_and_found).join("dir.c9r");
     assert_eq!(std::fs::read_to_string(&dir_file).unwrap(), "recovery");
 
-    // Der Fund ist nach dem Fix verschwunden, und der Vault ist wieder vollstaendig gesund
-    // in dem Sinne, dass kein Waisenverzeichnis mehr uebrig ist.
+    // The finding has disappeared after the fix, and the vault is fully healthy again
+    // in the sense that no orphaned directory is left over.
     let after = run("dirid", &ctx);
     assert_eq!(count(&after, "Orphan directory:"), 0, "{after:#?}");
 }
@@ -1070,7 +1070,7 @@ fn the_adopted_file_is_readable_through_the_cleartext_layer() {
     assert_eq!(entries.len(), 1, "one step-parent directory per adopted orphan");
     let step_parent = CleartextPath::root().join("LOST+FOUND").join(&entries[0].name);
     let adopted = fs.read_dir(&step_parent).expect("step parent lists");
-    // Der Waise hatte eine dirid.c9r, also konnten die echten Namen entschluesselt werden.
+    // The orphan had a dirid.c9r, so the real names could be decrypted.
     assert!(adopted.iter().any(|e| e.name == "adopted.txt"), "{adopted:#?}");
 }
 
@@ -1079,23 +1079,23 @@ fn applying_the_orphan_fix_twice_is_harmless() {
     let (_tmp, _vault, ctx) = open_broken();
     let orphan = run("dirid", &ctx).into_iter().find(|r| r.message.starts_with("Orphan directory:")).unwrap();
     orphan.fix.as_ref().unwrap().apply(&ctx).unwrap();
-    // Der zweite Aufruf trifft ein Verzeichnis, das es nicht mehr gibt: NotFound ist kein Fehler.
+    // The second call hits a directory that no longer exists: NotFound is not an error.
     orphan.fix.as_ref().unwrap().apply(&ctx).expect("second run is a no-op");
 }
 ```
 
-Die genauen Namen `CryptoFs::open`, `CryptoFsOptions::default`, `CleartextPath::root`, `fs.read_dir` und das Feld `DirEntry::name` sind aus M3 zu übernehmen; sie stehen in `crates/cryptomator-core/tests/crypto_fs_fixtures.rs` und werden dort schon genau so verwendet – der Implementierende liest die Signaturen dort nach, statt sie zu erraten (`grep -n "CryptoFs::" crates/cryptomator-core/tests/crypto_fs_fixtures.rs`).
+The exact names `CryptoFs::open`, `CryptoFsOptions::default`, `CleartextPath::root`, `fs.read_dir` and the field `DirEntry::name` are to be taken over from M3; they are in `crates/cryptomator-core/tests/crypto_fs_fixtures.rs` and are already used exactly that way there – the implementer reads the signatures there instead of guessing them (`grep -n "CryptoFs::" crates/cryptomator-core/tests/crypto_fs_fixtures.rs`).
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core --test health --locked orphan`
-Expected: FAIL, `the orphan is fixable` panickt (in Task 4 hat `orphan_content_dir` noch keinen Fix).
+Expected: FAIL, `the orphan is fixable` panics (in Task 4 `orphan_content_dir` still has no fix).
 
 - [ ] **Step 3: `prepare_recovery_dir`**
 
 ```rust
-/// `OrphanContentDir.prepareRecoveryDir`: legt `/LOST+FOUND` an (dirId "recovery") und gibt das
-/// zugehoerige Inhaltsverzeichnis zurueck -- absolut, weil die Adoption dorthin verschiebt.
+/// `OrphanContentDir.prepareRecoveryDir`: creates `/LOST+FOUND` (dirId "recovery") and returns its
+/// content directory -- absolute, because the adoption moves things there.
 pub(crate) fn prepare_recovery_dir(ctx: &CheckContext) -> std::io::Result<PathBuf> {
     let names = ctx.cryptor.file_name_cryptor();
     let root_hash = names.hash_directory_id(ROOT_DIR_ID);
@@ -1122,13 +1122,13 @@ pub(crate) fn prepare_recovery_dir(ctx: &CheckContext) -> std::io::Result<PathBu
     Ok(dir)
 }
 ```
-`symlink_metadata` statt `exists()`, weil Java `Files.notExists(…, NOFOLLOW_LINKS)` prüft.
+`symlink_metadata` instead of `exists()`, because Java checks `Files.notExists(…, NOFOLLOW_LINKS)`.
 
 - [ ] **Step 4: `prepare_step_parent`, `clear_name_to_be_shortened`, `run_id`**
 
 ```rust
-/// `OrphanContentDir.prepareStepParent`: ein Unterverzeichnis von LOST+FOUND, dessen Klarname der
-/// Hash des Waisenverzeichnisses ist (`<2 Zeichen><30 Zeichen>`), damit man es wiederfindet.
+/// `OrphanContentDir.prepareStepParent`: a subdirectory of LOST+FOUND whose cleartext name is the
+/// hash of the orphaned directory (`<2 chars><30 chars>`), so that it can be found again.
 pub(crate) fn prepare_step_parent(ctx: &CheckContext, recovery_dir: &Path, clear_name: &str)
     -> std::io::Result<CiphertextDirectory>
 {
@@ -1149,25 +1149,25 @@ pub(crate) fn prepare_step_parent(ctx: &CheckContext, recovery_dir: &Path, clear
     let path = ctx.data_dir().join(&hash[..2]).join(&hash[2..]);
     std::fs::create_dir_all(&path)?;
     let ct = CiphertextDirectory { dir_id: uuid, path };
-    // FileAlreadyExists = ein frueherer Reparaturversuch war schon hier; Java faengt genau das ab.
+    // FileAlreadyExists = an earlier repair attempt was already here; Java catches exactly that.
     if let Err(e) = ctx.rng(|rng| crate::fs::dir_id::write_dir_id_backup(&ctx.cryptor, &ct, rng)) {
         if e.kind() != std::io::ErrorKind::AlreadyExists { return Err(e); }
     }
     Ok(ct)
 }
 
-/// `OrphanContentDir.createClearnameToBeShortened`. Die Rechnung stammt aus Java und ist dort
-/// schief (`%` statt `/`), wird aber bewusst nachgebaut: sie erzeugt nur einen Namen, der lang
-/// genug ist, um verkuerzt zu werden, und beide Programme sollen dieselben Namen vergeben.
+/// `OrphanContentDir.createClearnameToBeShortened`. The arithmetic comes from Java and is wrong
+/// there (`%` instead of `/`), but is reproduced deliberately: it only produces a name that is
+/// long enough to be shortened, and both programs should hand out the same names.
 pub(crate) fn clear_name_to_be_shortened(threshold: u32) -> String {
     let needed = (threshold as i64 - 4) / 4 * 3 - 16;
     let times = (needed.rem_euclid(LONG_NAME_SUFFIX_BASE.len() as i64) + 1) as usize;
     LONG_NAME_SUFFIX_BASE.repeat(times)
 }
 
-/// `Integer.toString((short) UUID.randomUUID().getMostSignificantBits(), 32)`: die unteren 16 Bit
-/// als *vorzeichenbehaftete* Zahl zur Basis 32 mit den Ziffern 0-9a-v; negative Werte bekommen ein
-/// fuehrendes '-'.
+/// `Integer.toString((short) UUID.randomUUID().getMostSignificantBits(), 32)`: the lower 16 bits
+/// as a *signed* number in base 32 with the digits 0-9a-v; negative values get a
+/// leading '-'.
 pub(crate) fn run_id(rng: &mut dyn Rng) -> String {
     let mut buf = [0u8; 2];
     rng.fill(&mut buf);
@@ -1184,7 +1184,7 @@ pub(crate) fn run_id(rng: &mut dyn Rng) -> String {
 }
 ```
 
-Unit-Tests im selben Modul: `clear_name_to_be_shortened(220)` ergibt `needed = 146`, `146 % 17 = 10`, also 11 Wiederholungen à 17 Zeichen = 187 Zeichen; `run_id` liefert für `[0x00, 0x00]` `"0"`, für `[0xff, 0xff]` `"-1"` und für `[0x00, 0x21]` `"11"` (33 = 1·32 + 1).
+Unit tests in the same module: `clear_name_to_be_shortened(220)` yields `needed = 146`, `146 % 17 = 10`, so 11 repetitions of 17 characters = 187 characters; `run_id` returns `"0"` for `[0x00, 0x00]`, `"-1"` for `[0xff, 0xff]` and `"11"` for `[0x00, 0x21]` (33 = 1·32 + 1).
 
 - [ ] **Step 5: `AdoptOrphan::apply`**
 
@@ -1192,14 +1192,14 @@ Unit-Tests im selben Modul: `clear_name_to_be_shortened(220)` ergibt `needed = 1
 impl Fix for AdoptOrphan {
     fn apply(&self, ctx: &CheckContext) -> std::io::Result<()> {
         let orphan = ctx.resolve(&self.content_dir);
-        if !orphan.is_dir() { return Ok(()); }            // schon adoptiert (Idempotenz)
-        // Klarname des Stiefeltern-Verzeichnisses = der Hash des Waisen, also `<XX><YYY…>`.
+        if !orphan.is_dir() { return Ok(()); }            // already adopted (idempotence)
+        // Cleartext name of the step-parent directory = the hash of the orphan, i.e. `<XX><YYY…>`.
         let hash_name = format!("{}{}",
             self.content_dir.parent().and_then(Path::file_name).unwrap_or_default().to_string_lossy(),
             self.content_dir.file_name().unwrap_or_default().to_string_lossy());
 
         let recovery_dir = prepare_recovery_dir(ctx)?;
-        if recovery_dir == orphan { return Ok(()); }      // LOST+FOUND war selbst der Waise
+        if recovery_dir == orphan { return Ok(()); }      // LOST+FOUND was itself the orphan
         let step_parent = prepare_step_parent(ctx, &recovery_dir, &hash_name)?;
 
         let run = ctx.rng(run_id);
@@ -1208,7 +1208,7 @@ impl Fix for AdoptOrphan {
         let (mut files, mut dirs, mut links) = (1u32, 1u32, 1u32);
 
         let mut entries: Vec<_> = std::fs::read_dir(&orphan)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);    // deterministische Nummerierung
+        entries.sort_by_key(std::fs::DirEntry::file_name);    // deterministic numbering
         for entry in &entries {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !matches_encrypted_content_pattern(&name) { continue; }
@@ -1230,7 +1230,7 @@ impl Fix for AdoptOrphan {
         }
 
         let _ = std::fs::remove_file(orphan.join(DIR_ID_BACKUP_FILE_NAME));
-        for entry in std::fs::read_dir(&orphan)? {           // alles, was nicht Cryptomator gehoert
+        for entry in std::fs::read_dir(&orphan)? {           // everything that does not belong to Cryptomator
             let entry = entry?;
             move_path(&entry.path(), &step_parent.path.join(entry.file_name()))?;
         }
@@ -1239,10 +1239,10 @@ impl Fix for AdoptOrphan {
 }
 ```
 
-Die vier Helfer:
-- `matches_encrypted_content_pattern(name)` = `name.chars().count() >= MIN_CIPHER_NAME_LENGTH && (name.ends_with(".c9r") || name.ends_with(".c9s"))` (Javas `DirectoryStreamFactory`-Filter).
-- `determine_type(path)` = `dir.c9r` vorhanden → `Directory`, sonst `symlink.c9r` → `Symlink`, sonst `File` (`symlink_metadata`, kein Folgen).
-- `decrypt_orphan_name(ctx, path, shortened, dir_id)` liest bei `shortened` die `name.c9s`, sonst den Dateinamen, schneidet die letzten 4 Zeichen (`.c9r`) ab und ruft `ctx.cryptor.file_name_cryptor().decrypt_filename(&name, &[dir_id])`; jeder Fehler ergibt `None` (Java loggt eine Warnung und fällt auf den Zählernamen zurück).
+The four helpers:
+- `matches_encrypted_content_pattern(name)` = `name.chars().count() >= MIN_CIPHER_NAME_LENGTH && (name.ends_with(".c9r") || name.ends_with(".c9s"))` (Java's `DirectoryStreamFactory` filter).
+- `determine_type(path)` = `dir.c9r` present → `Directory`, otherwise `symlink.c9r` → `Symlink`, otherwise `File` (`symlink_metadata`, no following).
+- `decrypt_orphan_name(ctx, path, shortened, dir_id)` reads the `name.c9s` when `shortened`, otherwise the file name, cuts off the last 4 characters (`.c9r`) and calls `ctx.cryptor.file_name_cryptor().decrypt_filename(&name, &[dir_id])`; every error yields `None` (Java logs a warning and falls back to the counter name).
 - `adopt(ctx, old, new_clear_name, shortened, step_parent)`:
   ```rust
   let cipher = format!("{}{CRYPTOMATOR_FILE_SUFFIX}", ctx.cryptor.file_name_cryptor()
@@ -1256,21 +1256,21 @@ Die vier Helfer:
       move_path(old, &step_parent.path.join(&cipher))?;
   }
   ```
-  `BASE64URL` ist `data_encoding::BASE64URL` (mit Padding) wie in `fs/long_names.rs::deflate`; `sha1` benutzt `sha1::Sha1` wie dort. Der Implementierende übernimmt beide Zeilen aus `crates/cryptomator-core/src/fs/long_names.rs`, damit die Deflation bitgleich zur restlichen Codebasis bleibt.
-- `move_path(from, to)` ist `std::fs::rename` mit einem Fallback auf Kopieren-und-Löschen bei `ErrorKind::CrossesDevices` (der Waise und LOST+FOUND liegen beide unter `d/`, also praktisch nie – aber ein Vault kann über Mount-Grenzen zusammengesetzt sein).
+  `BASE64URL` is `data_encoding::BASE64URL` (with padding) as in `fs/long_names.rs::deflate`; `sha1` uses `sha1::Sha1` just like there. The implementer takes both lines from `crates/cryptomator-core/src/fs/long_names.rs`, so that the deflation stays bit-identical with the rest of the codebase.
+- `move_path(from, to)` is `std::fs::rename` with a fallback to copy-and-delete on `ErrorKind::CrossesDevices` (the orphan and LOST+FOUND both live under `d/`, so practically never – but a vault can be assembled across mount boundaries).
 
-- [ ] **Step 6: Den Fix an `orphan_content_dir` hängen**
+- [ ] **Step 6: Attach the fix to `orphan_content_dir`**
 
-In `dir_id.rs` bekommt der `OrphanContentDir`-Zweig
+In `dir_id.rs` the `OrphanContentDir` branch gets
 ```rust
 .with_fix(Box::new(crate::health::orphan::AdoptOrphan { content_dir: rel.clone() }))
 ```
-wobei `rel` der vault-relative Pfad `d/XX/YYY…` ist.
+where `rel` is the vault-relative path `d/XX/YYY…`.
 
-- [ ] **Step 7: Tests, Gate, Commit**
+- [ ] **Step 7: Tests, gate, commit**
 
 Run: `cargo test -p cryptomator-core --test health --locked && cargo test -p cryptomator-core health::orphan --locked`
-Expected: alle grün.
+Expected: all green.
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -1283,11 +1283,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 6: `CiphertextFileTypeCheck` und `ShortenedNamesCheck`
+### Task 6: `CiphertextFileTypeCheck` and `ShortenedNamesCheck`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/health/file_type.rs`, `crates/cryptomator-core/src/health/shortened.rs`
-- Modify: `crates/cryptomator-core/src/health/mod.rs` (`all_checks` – die letzten beiden Placeholder verschwinden)
+- Modify: `crates/cryptomator-core/src/health/mod.rs` (`all_checks` – the last two placeholders disappear)
 - Test: `crates/cryptomator-core/tests/health.rs`
 
 **Interfaces:**
@@ -1302,36 +1302,36 @@ pub const SHORTENED_CHECK_NAME: &str = "Shortened Names Check";
 pub const SHORTENED_CHECK_ID: &str = "shortened";
 #[derive(Debug)] pub struct ShortenedNamesCheck;
 
-// crate-privat, `visible for testing` wie in Java:
+// crate-private, `visible for testing` as in Java:
 pub(crate) enum SyntaxResult { Valid, Invalid, TrailingBytes }
 pub(crate) fn check_syntax(long_name: &str) -> SyntaxResult;
 pub(crate) fn deflate_name(long_name: &str) -> String;      // BASE64URL(SHA1(name)) + ".c9s"
 ```
 
-**Java-Vorlage, wörtlich.** Beide Checks laufen mit Tiefenlimit **3** ab `d/` (also bis `d/XX/YYY…/name.c9r`) und betrachten nur **Verzeichnisse**.
+**Java template, verbatim.** Both checks run with depth limit **3** starting at `d/` (that is, down to `d/XX/YYY…/name.c9r`) and look only at **directories**.
 
-`CiphertextFileTypeCheck` (Name „Resource Type Check"): für jedes Verzeichnis, dessen Name auf `.c9r` oder `.c9s` endet, wird die Menge der Typdateien bestimmt – `dir.c9r` → DIRECTORY, `symlink.c9r` → SYMLINK, und **nur bei `.c9s`** auch `contents.c9r` → FILE (jeweils `Files.isRegularFile(…, NOFOLLOW_LINKS)`):
+`CiphertextFileTypeCheck` (name "Resource Type Check"): for every directory whose name ends in `.c9r` or `.c9s`, the set of type files is determined – `dir.c9r` → DIRECTORY, `symlink.c9r` → SYMLINK, and **only for `.c9s`** also `contents.c9r` → FILE (each `Files.isRegularFile(…, NOFOLLOW_LINKS)`):
 
-| Größe der Menge | Ergebnis | Severity | Meldung | Fix |
+| Size of the set | Result | Severity | Message | Fix |
 |---|---|---|---|---|
 | 0 | `UnknownType` | CRITICAL | `C9r dir %s of unknown type.` | `Files.delete(pathToVault.resolve(cipherDir))` |
-| 1 | `KnownType` | GOOD | `Node %s with determined type %s.` (Typ als `DIRECTORY`/`SYMLINK`/`FILE`) | – |
+| 1 | `KnownType` | GOOD | `Node %s with determined type %s.` (type as `DIRECTORY`/`SYMLINK`/`FILE`) | – |
 | >1 | `AmbiguousType` | CRITICAL | `Node %s of ambiguous type. Possible types are: %s` | – |
 
-Die Typmenge in `AmbiguousType` wird wie Javas `EnumSet.toString()` gedruckt: `[DIRECTORY, SYMLINK]` in **Enum-Deklarationsreihenfolge** – in `CiphertextFileType` (cryptofs `common/CiphertextFileType`) ist das `FILE, DIRECTORY, SYMLINK`. Unser `crate::fs::CiphertextFileType` hat dieselbe Reihenfolge; der Implementierende prüft das mit `grep -n "enum CiphertextFileType" -A 6 crates/cryptomator-core/src/fs/ciphertext_path.rs` und sortiert beim Formatieren danach.
+The type set in `AmbiguousType` is printed like Java's `EnumSet.toString()`: `[DIRECTORY, SYMLINK]` in **enum declaration order** – in `CiphertextFileType` (cryptofs `common/CiphertextFileType`) that is `FILE, DIRECTORY, SYMLINK`. Our `crate::fs::CiphertextFileType` has the same order; the implementer verifies that with `grep -n "enum CiphertextFileType" -A 6 crates/cryptomator-core/src/fs/ciphertext_path.rs` and sorts by it when formatting.
 
-`ShortenedNamesCheck` (Name „Shortened Names Check"): für jedes Verzeichnis, dessen Name auf `.c9s` endet:
+`ShortenedNamesCheck` (name "Shortened Names Check"): for every directory whose name ends in `.c9s`:
 
-| Bedingung | Ergebnis | Severity | Meldung | Fix |
+| Condition | Result | Severity | Message | Fix |
 |---|---|---|---|---|
-| `name.c9s` fehlt oder ist keine reguläre Datei | `MissingLongName` | CRITICAL | `Shortened resource %s either misses name.c9s or the file has invalid content.` | – |
-| Größe > 10240 | `ObeseNameFile` | CRITICAL | `Long filename file %s with size %d exceeds limit of %d for this type.` | – |
+| `name.c9s` is missing or is not a regular file | `MissingLongName` | CRITICAL | `Shortened resource %s either misses name.c9s or the file has invalid content.` | – |
+| size > 10240 | `ObeseNameFile` | CRITICAL | `Long filename file %s with size %d exceeds limit of %d for this type.` | – |
 | Syntax `Invalid` | `NotDecodableLongName` | CRITICAL | `String "%s" stored in %s is not a valid Cryptomator filename.` (longName, nameFile) | – |
-| Syntax `TrailingBytes` | `TrailingBytesInNameFile` | WARN | `Encrypted filename "%s" stored in %s contains trailing bytes.` | auf `…​.c9r` kürzen |
-| Verzeichnisname ≠ `deflate(longName)` | `LongShortNamesMismatch` | WARN | `Name of %s is not a base64url encoded SHA1 hash of String inside name.c9s.` | `rename(c9sDir, sibling(expectedShortName))` |
-| sonst | `ValidShortenedFile` | GOOD | `Found valid shortened resource at %s.` | – |
+| Syntax `TrailingBytes` | `TrailingBytesInNameFile` | WARN | `Encrypted filename "%s" stored in %s contains trailing bytes.` | truncate to `…​.c9r` |
+| directory name ≠ `deflate(longName)` | `LongShortNamesMismatch` | WARN | `Name of %s is not a base64url encoded SHA1 hash of String inside name.c9s.` | `rename(c9sDir, sibling(expectedShortName))` |
+| otherwise | `ValidShortenedFile` | GOOD | `Found valid shortened resource at %s.` | – |
 
-`check_syntax` (Javas `DirVisitor.checkSyntax`, Bug cryptofs#121):
+`check_syntax` (Java's `DirVisitor.checkSyntax`, bug cryptofs#121):
 ```rust
 pub(crate) fn check_syntax(to_analyse: &str) -> SyntaxResult {
     let Some(pos) = to_analyse.find(CRYPTOMATOR_FILE_SUFFIX) else { return SyntaxResult::Invalid };
@@ -1344,7 +1344,7 @@ pub(crate) fn check_syntax(to_analyse: &str) -> SyntaxResult {
     SyntaxResult::Valid
 }
 ```
-Javas `BaseEncoding.base64Url().canDecode` akzeptiert padded und unpadded Eingaben; `data_encoding::BASE64URL` ist padded. Für echte Cryptomator-Namen (immer padded, Länge ≡ 0 mod 4) ist das identisch; der Unterschied betrifft nur kaputte Eingaben, wo beide „invalid" sagen sollen und wir es strenger tun. Als Kommentar festhalten.
+Java's `BaseEncoding.base64Url().canDecode` accepts padded and unpadded input; `data_encoding::BASE64URL` is padded. For real Cryptomator names (always padded, length ≡ 0 mod 4) this is identical; the difference only affects broken input, where both are supposed to say "invalid" and we do it more strictly. Record as a comment.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1382,15 +1382,15 @@ fn the_type_and_shortened_fixes_repair_what_they_can() {
     assert_eq!(count(&after, "Encrypted filename "), 0, "the trailing bytes were cut");
     assert_eq!(count(&after, "Name of "), 0, "the c9s dir was renamed");
     assert_eq!(count(&after, "Shortened resource "), 1, "MissingLongName has no fix");
-    // Der Fund bleibt: Javas `Files.delete` raeumt nur *leere* Verzeichnisse, und das
-    // Fixture-Verzeichnis enthaelt die Datei `x` (ein leeres Verzeichnis ueberlebt git nicht).
+    // The finding stays: Java's `Files.delete` only clears *empty* directories, and the
+    // fixture directory contains the file `x` (an empty directory does not survive git).
     assert_eq!(count(&after, "C9r dir "), 1, "a non-empty unknown node is not deleted");
 }
 
 #[test]
 fn an_empty_unknown_node_is_deleted() {
     let (_tmp, _vault, ctx) = open_broken();
-    // Dasselbe wie im Fixture, nur leer -- so wie es aussieht, wenn die Desktop-App es erzeugt.
+    // Same as in the fixture, only empty -- the way it looks when the desktop app creates it.
     let root = cryptomator_core::root_content_dir(&ctx.vault_path, &ctx.cryptor);
     let name = ctx.cryptor.file_name_cryptor().encrypt_filename("empty", &[b""]) + ".c9r";
     std::fs::create_dir(root.join(&name)).unwrap();
@@ -1425,26 +1425,26 @@ fn check_syntax_matches_the_java_cases() {
 }
 ```
 
-Damit dieser Test kompiliert, sind `check_syntax`, `deflate_name` und `SyntaxResult` `pub` statt `pub(crate)` und das Modul `shortened` `pub` – das ist die Rust-Entsprechung von Javas „visible for testing".
+For this test to compile, `check_syntax`, `deflate_name` and `SyntaxResult` are `pub` instead of `pub(crate)` and the module `shortened` is `pub` – that is the Rust equivalent of Java's "visible for testing".
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core --test health --locked`
-Expected: FAIL (die Placeholder liefern nichts).
+Expected: FAIL (the placeholders return nothing).
 
-- [ ] **Step 3: `file_type.rs` implementieren**
+- [ ] **Step 3: Implement `file_type.rs`**
 
-Ein rekursiver Walk ab `d/` mit Tiefenlimit 3, der nur Verzeichnisse betrachtet. Ein I/O-Fehler beim Traversieren erzeugt – wie Javas `catch (IOException)` – **einen** Befund
+A recursive walk starting at `d/` with depth limit 3 that looks only at directories. An I/O error during traversal produces – like Java's `catch (IOException)` – **one** finding
 `DiagnosticResult::new(TYPE_CHECK_ID, Severity::Critical, "Check failed: Traversal of data dir failed. See log for details.".into(), vec![])`
-und beendet den Check. `UnknownType::fix` ist `std::fs::remove_dir(ctx.resolve(&cipher_dir))` mit `NotFound` als Erfolg; Java benutzt `Files.delete`, das an einem *nicht leeren* Verzeichnis scheitert – wir übernehmen das. Ein `remove_dir_all` wäre bequemer und falsch: in einem Knoten unbekannten Typs können Nutzdaten liegen (eine `contents.c9r` in einem `.c9r`- statt `.c9s`-Verzeichnis etwa), und ein Fix darf nie löschen, was er nicht versteht.
+and ends the check. `UnknownType::fix` is `std::fs::remove_dir(ctx.resolve(&cipher_dir))` with `NotFound` as success; Java uses `Files.delete`, which fails on a *non-empty* directory – we adopt that. A `remove_dir_all` would be more convenient and wrong: payload data can sit in a node of unknown type (a `contents.c9r` in a `.c9r` instead of a `.c9s` directory, for instance), and a fix must never delete what it does not understand.
 
-Das erklärt die zweigeteilte Zusicherung in Step 1: das eingecheckte Fixture enthält in `unknown.c9r/` die Datei `x` (ein leeres Verzeichnis überlebt git nicht), sein Fund bleibt also nach `--fix` bestehen; der Zusatztest `an_empty_unknown_node_is_deleted` legt einen wirklich leeren Knoten an und zeigt, dass der Fix dort greift.
+That explains the two-part assertion in Step 1: the checked-in fixture contains the file `x` in `unknown.c9r/` (an empty directory does not survive git), so its finding persists after `--fix`; the extra test `an_empty_unknown_node_is_deleted` creates a truly empty node and shows that the fix takes effect there.
 
-- [ ] **Step 4: `shortened.rs` implementieren**
+- [ ] **Step 4: Implement `shortened.rs`**
 
-Derselbe Walk mit Tiefenlimit 3, nur `.c9s`-Verzeichnisse. Die Reihenfolge der Prüfungen ist die Java-Reihenfolge (fehlend → obese → Syntax → Deflation → gültig), jeder Zweig endet mit `return`. `deflate_name` ist wörtlich `crate::fs::long_names::deflate`s Rechnung, aber auf einem `&str` statt einem Pfad – der Implementierende zieht die drei Zeilen aus `fs/long_names.rs::deflate` heraus in eine gemeinsame `pub(crate) fn deflate_str(name: &str) -> String` und lässt beide Aufrufer darauf zeigen (DRY; `deflate` selbst bleibt in seiner Signatur unverändert, damit M3-Code nicht angefasst wird).
+The same walk with depth limit 3, only `.c9s` directories. The order of the checks is the Java order (missing → obese → syntax → deflation → valid), each branch ends with `return`. `deflate_name` is verbatim the arithmetic of `crate::fs::long_names::deflate`, but on a `&str` instead of a path – the implementer pulls the three lines out of `fs/long_names.rs::deflate` into a shared `pub(crate) fn deflate_str(name: &str) -> String` and points both callers at it (DRY; `deflate` itself keeps its signature unchanged so that M3 code is not touched).
 
-Die beiden Fixes:
+The two fixes:
 ```rust
 #[derive(Debug)] struct TruncateTrailingBytes { name_file: PathBuf, long_name: String }
 impl Fix for TruncateTrailingBytes {
@@ -1461,20 +1461,20 @@ impl Fix for RenameToExpectedShortName {
     fn apply(&self, ctx: &CheckContext) -> std::io::Result<()> {
         let from = ctx.resolve(&self.c9s_dir);
         let to = from.with_file_name(&self.expected);
-        if to.exists() { return Ok(()); }        // schon umbenannt (Idempotenz)
+        if to.exists() { return Ok(()); }        // already renamed (idempotence)
         std::fs::rename(from, to)
     }
 }
 ```
 
-- [ ] **Step 5: `all_checks` fertigstellen**
+- [ ] **Step 5: Finish `all_checks`**
 
-`health/mod.rs`: die zwei restlichen `Placeholder`-Zeilen durch `Box::new(file_type::CiphertextFileTypeCheck)` und `Box::new(shortened::ShortenedNamesCheck)` ersetzen, `struct Placeholder` samt `impl` **löschen**, `pub mod file_type; pub mod shortened;` ergänzen.
+`health/mod.rs`: replace the two remaining `Placeholder` lines with `Box::new(file_type::CiphertextFileTypeCheck)` and `Box::new(shortened::ShortenedNamesCheck)`, **delete** `struct Placeholder` together with its `impl`, and add `pub mod file_type; pub mod shortened;`.
 
-- [ ] **Step 6: Tests, Gate, Commit**
+- [ ] **Step 6: Tests, gate, commit**
 
 Run: `cargo test -p cryptomator-core --test health --locked`
-Expected: alle grün, inklusive `a_healthy_vault_passes_all_three_checks` über sieben Fixtures.
+Expected: all green, including `a_healthy_vault_passes_all_three_checks` over seven fixtures.
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -1487,11 +1487,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Der Textreport im Format von `ReportWriter`
+### Task 7: The text report in the format of `ReportWriter`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/health/report.rs`
-- Modify: `crates/cryptomator-core/src/health/mod.rs` (`pub mod report;`), `crates/cryptomator-core/src/lib.rs` (Re-Export)
+- Modify: `crates/cryptomator-core/src/health/mod.rs` (`pub mod report;`), `crates/cryptomator-core/src/lib.rs` (re-export)
 - Test: in `crates/cryptomator-core/src/health/report.rs`
 
 **Interfaces:**
@@ -1503,13 +1503,13 @@ pub const REPORT_HEADER: &str = "\
 *     Cryptomator Vault Health Report     *
 *******************************************
 ";
-pub const CHECK_SEPARATOR: &str = "------------------------------";   // 30 Bindestriche
+pub const CHECK_SEPARATOR: &str = "------------------------------";   // 30 hyphens
 
-/// `healthReport_<vaultName>_<yyyyMMdd-HHmmss>.log` -- Javas Dateiname, aber UTC (Ruling 5).
+/// `healthReport_<vaultName>_<yyyyMMdd-HHmmss>.log` -- Java's file name, but UTC (Ruling 5).
 pub fn report_file_name(vault_name: &str, at: std::time::SystemTime) -> String;
 
-/// Schreibt den Report von `ReportWriter.writeReport`. `sections` ist eine Liste aus
-/// (Check-Anzeigename, seine Ergebnisse in Fundreihenfolge).
+/// Writes the report of `ReportWriter.writeReport`. `sections` is a list of
+/// (check display name, its results in order of finding).
 pub fn render_report(
     vault_id: &str,
     vault_name: &str,
@@ -1520,7 +1520,7 @@ pub fn render_report(
 pub fn write_report(path: &std::path::Path, contents: &str) -> std::io::Result<()>;
 ```
 
-**Java-Vorlage, wörtlich (`ui/health/ReportWriter.java`).** Drei Formatstrings, ein Zeitformat:
+**Java template, verbatim (`ui/health/ReportWriter.java`).** Three format strings, one time format:
 
 ```java
 REPORT_HEADER = """
@@ -1530,13 +1530,13 @@ REPORT_HEADER = """
     Analyzed vault: %s (Current name "%s")
     Vault storage path: %s
     """;                                          // vaultConfig.getId(), displayName, path
-REPORT_CHECK_HEADER = "\n\nCheck %s\n------------------------------\n";   // zwei Leerzeilen davor
-REPORT_CHECK_RESULT = "%8s - %s\n";                                       // Severity rechtsbuendig auf 8
+REPORT_CHECK_HEADER = "\n\nCheck %s\n------------------------------\n";   // two blank lines before it
+REPORT_CHECK_RESULT = "%8s - %s\n";                                       // severity right-aligned to 8
 TIME_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 ```
-(Im Original stehen in `REPORT_CHECK_HEADER` zwei Zeilen aus je drei Leerzeichen; Javas Text-Blocks entfernen abschließenden Leerraum je Zeile, es bleiben zwei Leerzeilen.)
+(In the original, `REPORT_CHECK_HEADER` contains two lines of three spaces each; Java's text blocks strip trailing whitespace per line, leaving two blank lines.)
 
-Nach dem Check-Header folgt `"STATUS: SUCCESS\nRESULTS:\n"` und dann je Ergebnis eine Zeile aus `REPORT_CHECK_RESULT`. Die Zweige `CANCELED` und `FAILED` gibt es bei uns nicht: `crypto health` bricht nichts ab, und ein Check, der nicht laufen kann, meldet das als `CheckFailed`-Befund innerhalb von `SUCCESS`.
+The check header is followed by `"STATUS: SUCCESS\nRESULTS:\n"` and then one line per result from `REPORT_CHECK_RESULT`. The `CANCELED` and `FAILED` branches do not exist for us: `crypto health` cancels nothing, and a check that cannot run reports that as a `CheckFailed` finding inside `SUCCESS`.
 
 - [ ] **Step 1: Failing test**
 
@@ -1603,21 +1603,21 @@ RESULTS:
 }
 ```
 
-Die 1788534245 ist mit `date -u -r 1788534245 +%Y%m%d-%H%M%S` gegenzuprüfen; weicht sie ab, wird die Konstante im Test korrigiert, nicht die Formatierung.
+The 1788534245 is to be double-checked with `date -u -r 1788534245 +%Y%m%d-%H%M%S`; if it deviates, the constant in the test is corrected, not the formatting.
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core health::report --locked`
-Expected: FAIL, Modul fehlt.
+Expected: FAIL, module missing.
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
-`render_report` baut die Zeichenkette mit `write!` in einen `String`. Die Severity-Spalte ist `format!("{:>8}", severity.as_str())`. Der Dateiname:
+`render_report` builds the string with `write!` into a `String`. The severity column is `format!("{:>8}", severity.as_str())`. The file name:
 
 ```rust
 pub fn report_file_name(vault_name: &str, at: std::time::SystemTime) -> String {
-    // Alles, was einen Pfad aufspannen koennte, faellt raus -- der Anzeigename kommt aus
-    // settings.json und ist damit Nutzereingabe.
+    // Anything that could span a path is dropped -- the display name comes from
+    // settings.json and is therefore user input.
     let safe: String = vault_name
         .chars()
         .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
@@ -1625,11 +1625,11 @@ pub fn report_file_name(vault_name: &str, at: std::time::SystemTime) -> String {
     format!("healthReport_{safe}_{}.log", compact_utc(at))
 }
 ```
-`compact_utc` ist derselbe Zivilkalender-Algorithmus wie in `crates/crypto/src/output.rs::format_timestamp`, nur mit dem Format `yyyyMMdd-HHmmss`. Damit er nicht zweimal existiert, wandert die Umrechnung „Sekunden seit Epoch → (y, m, d, h, min, s)" in `report.rs` als `pub fn civil_utc(at: SystemTime) -> (i64, u32, u32, u32, u32, u32)`, und Task 14 stellt `crypto::output::format_timestamp` darauf um. In diesem Task bleibt `output.rs` unverändert; der doppelte Algorithmus lebt eine Task lang.
+`compact_utc` is the same civil-calendar algorithm as in `crates/crypto/src/output.rs::format_timestamp`, only with the format `yyyyMMdd-HHmmss`. So that it does not exist twice, the conversion "seconds since epoch → (y, m, d, h, min, s)" moves into `report.rs` as `pub fn civil_utc(at: SystemTime) -> (i64, u32, u32, u32, u32, u32)`, and Task 14 switches `crypto::output::format_timestamp` over to it. In this task `output.rs` stays unchanged; the duplicated algorithm lives for one task.
 
-`write_report` ist `std::fs::write` mit `CREATE | TRUNCATE` (Javas Optionen) – also schlicht `std::fs::write(path, contents)`.
+`write_report` is `std::fs::write` with `CREATE | TRUNCATE` (Java's options) – so plainly `std::fs::write(path, contents)`.
 
-- [ ] **Step 4: Lauf und Gate**
+- [ ] **Step 4: Run and gate**
 
 Run: `cargo test -p cryptomator-core health::report --locked`
 Expected: 3 passed.
@@ -1647,7 +1647,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: `crypto health` – Kommando, Exit 11, JSON und Report
+### Task 8: `crypto health` – command, exit 11, JSON and report
 
 **Files:**
 - Create: `crates/crypto/src/commands/health.rs`, `crates/crypto/tests/cli_health.rs`
@@ -1692,9 +1692,9 @@ pub fn run(ctx: &Ctx, args: HealthArgs) -> anyhow::Result<u8>;
 pub(crate) fn to_json(result: &DiagnosticResult, fixed: Option<bool>) -> serde_json::Value;
 ```
 
-**Dieser Task liefert `--fix` noch nicht.** `args.fix` wird geparst und in Step 5 mit einer klaren Meldung abgelehnt; Task 9 füllt ihn.
+**This task does not deliver `--fix` yet.** `args.fix` is parsed and rejected in Step 5 with a clear message; Task 9 fills it in.
 
-- [ ] **Step 1: Failing CLI-Tests**
+- [ ] **Step 1: Failing CLI tests**
 
 `crates/crypto/tests/cli_health.rs`:
 
@@ -1704,7 +1704,7 @@ use common::Sandbox;
 use predicates::prelude::*;
 use serde_json::Value;
 
-/// Registriert ein Fixture unter seinem Namen und gibt den Vault-Pfad zurueck.
+/// Registers a fixture under its name and returns the vault path.
 fn vault(fx: &Sandbox, fixture: &str) -> std::path::PathBuf {
     fx.add_fixture(fixture)
 }
@@ -1747,13 +1747,13 @@ fn a_broken_vault_exits_eleven() {
 fn fail_on_warn_catches_what_fail_on_critical_lets_pass() {
     let fx = Sandbox::new();
     vault(&fx, "broken_health");
-    // Nur der shortened-Check ohne CRITICAL-Fund: der Trailing-Bytes-Fall ist WARN …
+    // Only the shortened check without a CRITICAL finding: the trailing-bytes case is WARN …
     fx.crypto(&["health", "broken_health", "--check", "dirid", "--fail-on", "WARN", "--no-report"])
         .env("CRYPTO_PASSWORD", "test-password-123")
         .assert()
         .code(11);
-    // … waehrend `dirid` auch einen CRITICAL-Fund hat, also beide Schwellen greifen. Der Beleg,
-    // dass die Schwelle wirkt, kommt vom gesunden Vault: dort ist auch WARN folgenlos.
+    // … while `dirid` also has a CRITICAL finding, so both thresholds bite. The proof that
+    // the threshold works comes from the healthy vault: there even WARN has no consequence.
     vault(&fx, "nested");
     fx.crypto(&["health", "nested", "--fail-on", "WARN", "--no-report"])
         .env("CRYPTO_PASSWORD", "test-password-123")
@@ -1824,8 +1824,8 @@ fn without_report_flags_the_file_appears_in_the_working_directory() {
 
 #[test]
 fn health_refuses_a_vault_a_daemon_is_serving() {
-    // Ein Vault, dessen Zustand nicht LOCKED ist, ist Exit 5. Ohne Daemon laesst sich das mit
-    // einem Vault nachstellen, dessen vault.cryptomator fehlt: dann ist der Zustand
+    // A vault whose state is not LOCKED is exit 5. Without a daemon this can be reproduced with
+    // a vault whose vault.cryptomator is missing: the state is then
     // VAULT_CONFIG_MISSING.
     let fx = Sandbox::new();
     let path = vault(&fx, "siv_gcm_basic");
@@ -1833,7 +1833,7 @@ fn health_refuses_a_vault_a_daemon_is_serving() {
     for entry in std::fs::read_dir(&path).unwrap() {
         let entry = entry.unwrap();
         if entry.file_name().to_string_lossy().starts_with("vault.cryptomator.") {
-            std::fs::remove_file(entry.path()).unwrap();     // sonst greift der bkup-Restore
+            std::fs::remove_file(entry.path()).unwrap();     // otherwise the bkup restore kicks in
         }
     }
     fx.crypto(&["health", "siv_gcm_basic", "--no-report"])
@@ -1843,27 +1843,27 @@ fn health_refuses_a_vault_a_daemon_is_serving() {
 }
 ```
 
-`Sandbox::add_fixture` gibt es schon (`crates/crypto/tests/common/mod.rs:167`); es kopiert ein Fixture in die Sandbox und registriert es. Der Implementierende prüft mit `sed -n '160,190p' crates/crypto/tests/common/mod.rs`, ob es den Pfad zurückgibt, und passt die Hilfsfunktion `vault` an, falls nicht.
+`Sandbox::add_fixture` already exists (`crates/crypto/tests/common/mod.rs:167`); it copies a fixture into the sandbox and registers it. The implementer checks with `sed -n '160,190p' crates/crypto/tests/common/mod.rs` whether it returns the path, and adjusts the helper function `vault` if not.
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p crypto --test cli_health --locked`
 Expected: FAIL, `unrecognized subcommand 'health'`.
 
-- [ ] **Step 3: Grammatik und Exit-Code**
+- [ ] **Step 3: Grammar and exit code**
 
-`exit.rs`: `pub const HEALTH_FINDINGS: u8 = 11;` (nur die Konstante; sie wird direkt vom Kommando zurückgegeben, nicht über einen Fehlertyp – ein Befund ist kein Fehler).
-`cli.rs`: `HealthArgs` wie oben und `Command::Health(HealthArgs)` mit dem Doc-Kommentar `/// Check a vault for structural damage and optionally repair it`.
+`exit.rs`: `pub const HEALTH_FINDINGS: u8 = 11;` (only the constant; it is returned directly by the command, not through an error type – a finding is not an error).
+`cli.rs`: `HealthArgs` as above and `Command::Health(HealthArgs)` with the doc comment `/// Check a vault for structural damage and optionally repair it`.
 `main.rs`: `Command::Health(args) => commands::health::run(&ctx, args),`.
 
-- [ ] **Step 4: Das Kommando**
+- [ ] **Step 4: The command**
 
 ```rust
 pub fn run(ctx: &Ctx, args: HealthArgs) -> Result<u8> {
-    let (vault, path) = locked_vault(ctx, &args.vault)?;         // Exit 5 fuer alles nicht-LOCKED
+    let (vault, path) = locked_vault(ctx, &args.vault)?;         // exit 5 for everything not LOCKED
     let fail_on = Severity::parse_threshold(&args.fail_on)?;
     let ids = if args.check.is_empty() { CHECK_IDS.map(String::from).to_vec() } else { args.check.clone() };
-    let checks = checks_by_ids(&ids)?;                            // Exit 2 bei unbekanntem Namen
+    let checks = checks_by_ids(&ids)?;                            // exit 2 on an unknown name
     let passphrase = read_passphrase_with_keychain(
         &args.password, "Password: ",
         || Ok(keychain_source(ctx.keychain()?.as_ref(), &vault)),
@@ -1873,13 +1873,13 @@ pub fn run(ctx: &Ctx, args: HealthArgs) -> Result<u8> {
     let vault_id = opened.config.id.clone();
     let check_ctx = CheckContext::new(opened);
     let results = run_checks(&checks, &check_ctx);
-    // … Report, Ausgabe, Exit-Code (Steps 5-7)
+    // … report, output, exit code (Steps 5-7)
 }
 ```
 
-Reihenfolge ist Absicht: `--fail-on`/`--check` werden **vor** der Passwortabfrage validiert, damit ein Tippfehler nicht erst nach einem Prompt auffällt.
+The order is deliberate: `--fail-on`/`--check` are validated **before** the password prompt, so that a typo is not noticed only after a prompt.
 
-- [ ] **Step 5: `--fix` vorerst ablehnen**
+- [ ] **Step 5: Reject `--fix` for now**
 
 ```rust
 if args.fix {
@@ -1889,9 +1889,9 @@ if args.fix {
     }.into());
 }
 ```
-Task 9 ersetzt diesen Block; bis dahin ist `--fix` ein sauberer Exit 2 statt einer Lüge. Der Marker `not implemented yet` ist der einzige im Repo und wird in Task 9 mit `grep -rn "not implemented yet" crates/` gefunden.
+Task 9 replaces this block; until then `--fix` is a clean exit 2 instead of a lie. The marker `not implemented yet` is the only one in the repo and is found in Task 9 with `grep -rn "not implemented yet" crates/`.
 
-- [ ] **Step 6: Report schreiben**
+- [ ] **Step 6: Write the report**
 
 ```rust
 let report_path = if args.no_report {
@@ -1918,7 +1918,7 @@ if let Some(report_path) = &report_path {
 }
 ```
 
-- [ ] **Step 7: Ausgabe und Exit-Code**
+- [ ] **Step 7: Output and exit code**
 
 ```rust
 pub(crate) fn to_json(result: &DiagnosticResult, fixed: Option<bool>) -> serde_json::Value {
@@ -1928,25 +1928,25 @@ pub(crate) fn to_json(result: &DiagnosticResult, fixed: Option<bool>) -> serde_j
         "message": result.message,
         "paths": result.paths,
         "fixable": result.fixable(),
-        "fixed": fixed,            // ohne --fix immer null
+        "fixed": fixed,            // without --fix always null
     })
 }
 ```
-`--json` liefert **ein** Objekt (wie überall im CLI):
+`--json` returns **one** object (as everywhere in the CLI):
 ```json
 { "vault": "…id…", "path": "/vaults/Secret", "checks": ["dirid","type","shortened"],
   "report": "/…/healthReport_….log", "summary": {"GOOD": 12, "INFO": 1, "WARN": 2, "CRITICAL": 3},
   "failOn": "CRITICAL", "findings": [ … ] }
 ```
-Die Menschenausgabe ist eine Zeile je Befund im Reportformat (`{:>8} - {message}`) **ohne** die `GOOD`-Zeilen (die sind Rauschen auf einem Terminal), dahinter eine Zusammenfassung
-`12 good, 1 info, 2 warnings, 3 critical` und, wenn ein Report geschrieben wurde, dessen Pfad auf stderr.
+The human-readable output is one line per finding in the report format (`{:>8} - {message}`) **without** the `GOOD` lines (those are noise on a terminal), followed by a summary
+`12 good, 1 info, 2 warnings, 3 critical` and, if a report was written, its path on stderr.
 
 ```rust
 let worst = results.iter().map(|r| r.severity).max().unwrap_or(Severity::Good);
 Ok(if worst >= fail_on { exit::HEALTH_FINDINGS } else { exit::OK })
 ```
 
-- [ ] **Step 8: Tests, Gate, Commit**
+- [ ] **Step 8: Tests, gate, commit**
 
 Run: `cargo test -p crypto --test cli_health --locked`
 Expected: 7 passed.
@@ -1962,22 +1962,22 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: `crypto health --fix` und `--fix-severity`
+### Task 9: `crypto health --fix` and `--fix-severity`
 
 **Files:**
 - Modify: `crates/crypto/src/commands/health.rs`, `crates/crypto/tests/cli_health.rs`
 
 **Interfaces:**
-- Consumes: alles aus Task 8, plus `DiagnosticResult::fix` und `Fix::apply`.
-- Produces: keine neuen öffentlichen Namen; `commands::health::run` bekommt den `--fix`-Pfad.
+- Consumes: everything from Task 8, plus `DiagnosticResult::fix` and `Fix::apply`.
+- Produces: no new public names; `commands::health::run` gets the `--fix` path.
 
-**Ruling 4 im Detail.** `--fix` läuft so ab:
-1. Erster Lauf: alle gewählten Checks.
-2. Für jeden Befund mit `severity >= fix_severity` **und** `fix.is_some()`: `fix.apply(&check_ctx)`. Erfolg → `fixed: true`, Fehler → `fixed: false` plus eine Warnung auf stderr mit der Meldung des Befunds und dem I/O-Fehler. Ein fehlgeschlagener Fix bricht den Lauf **nicht** ab; der nächste Befund ist davon unabhängig.
-3. Zweiter Lauf derselben Checks auf demselben `CheckContext`.
-4. Ausgabe: beide Läufe; Exit-Code aus dem **zweiten**.
+**Ruling 4 in detail.** `--fix` proceeds like this:
+1. First run: all selected checks.
+2. For every finding with `severity >= fix_severity` **and** `fix.is_some()`: `fix.apply(&check_ctx)`. Success → `fixed: true`, error → `fixed: false` plus a warning on stderr with the finding's message and the I/O error. A failed fix does **not** abort the run; the next finding is independent of it.
+3. Second run of the same checks on the same `CheckContext`.
+4. Output: both runs; exit code from the **second**.
 
-Die Reihenfolge der Fixes ist die Fundreihenfolge. Das ist wichtig für `dirid`: `CreateContentDir` (MissingContentDir) läuft vor `AdoptOrphan` (OrphanContentDir), weil Phase 2 des Checks erst die Paare auflöst und dann die Waisen meldet — ein Verzeichnis, das gerade erst angelegt wurde, kann also nicht im selben Durchgang als Waise adoptiert werden.
+The order of the fixes is the order in which they were found. That matters for `dirid`: `CreateContentDir` (MissingContentDir) runs before `AdoptOrphan` (OrphanContentDir), because phase 2 of the check first resolves the pairs and only then reports the orphans — so a directory that was only just created cannot be adopted as an orphan in the same pass.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1990,23 +1990,23 @@ fn fix_repairs_what_it_can_and_reruns_the_checks() {
         .crypto(&["--json", "health", "broken_health", "--fix", "--no-report"])
         .env("CRYPTO_PASSWORD", "test-password-123")
         .assert()
-        .code(11)                       // die CRITICAL-Faelle ohne Fix bleiben
+        .code(11)                       // the CRITICAL cases without a fix remain
         .get_output()
         .stdout
         .clone();
     let value: Value = serde_json::from_slice(&out).unwrap();
     let before = value["before"]["findings"].as_array().unwrap();
     let after = value["after"]["findings"].as_array().unwrap();
-    // Vorher: die drei WARN-Faelle mit Fix wurden repariert …
+    // Before: the three WARN cases with a fix were repaired …
     assert!(before.iter().any(|f| f["fixed"] == true));
-    // … und tauchen nachher nicht mehr auf.
+    // … and no longer show up afterwards.
     for message in ["Orphan directory:", "dir.c9r file (", "Encrypted filename ", "Name of "] {
         assert!(
             !after.iter().any(|f| f["message"].as_str().unwrap().starts_with(message)),
             "{message} survived --fix: {after:#?}"
         );
     }
-    // INFO bleibt: --fix-severity ist WARN.
+    // INFO stays: --fix-severity is WARN.
     assert!(after.iter().any(|f| f["severity"] == "INFO"), "{after:#?}");
     assert!(value["after"]["summary"]["CRITICAL"].as_u64().unwrap() > 0);
 }
@@ -2057,7 +2057,7 @@ fn a_fixed_vault_is_still_readable() {
         .env("CRYPTO_PASSWORD", "test-password-123")
         .assert()
         .code(11);
-    // Die heile Datei ist unveraendert, und die adoptierte taucht unter LOST+FOUND auf.
+    // The intact file is unchanged, and the adopted one shows up under LOST+FOUND.
     fx.crypto(&["fs", "cat", "broken_health", "/healthy.txt"])
         .env("CRYPTO_PASSWORD", "test-password-123")
         .assert()
@@ -2083,17 +2083,17 @@ fn fix_without_json_prints_before_and_after() {
 }
 ```
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p crypto --test cli_health --locked fix`
-Expected: FAIL mit Exit 2 (`--fix: not implemented yet`).
+Expected: FAIL with exit 2 (`--fix: not implemented yet`).
 
-- [ ] **Step 3: Den Ablehnungsblock ersetzen**
+- [ ] **Step 3: Replace the rejection block**
 
-`grep -n "not implemented yet" crates/crypto/src/commands/health.rs` findet den Block aus Task 8, Step 5. An seine Stelle kommt nach dem ersten `run_checks`:
+`grep -n "not implemented yet" crates/crypto/src/commands/health.rs` finds the block from Task 8, Step 5. In its place, after the first `run_checks`, comes:
 
 ```rust
-let fix_severity = Severity::parse_threshold(&args.fix_severity)?;   // schon oben, vor dem Passwort
+let fix_severity = Severity::parse_threshold(&args.fix_severity)?;   // already above, before the password
 let mut first = results;
 let mut fixed_flags: Vec<Option<bool>> = vec![None; first.len()];
 if args.fix {
@@ -2112,19 +2112,19 @@ if args.fix {
 let second = if args.fix { Some(run_checks(&checks, &check_ctx)) } else { None };
 ```
 
-- [ ] **Step 4: Ausgabe für beide Läufe**
+- [ ] **Step 4: Output for both runs**
 
-Ohne `--fix` bleibt das JSON von Task 8 unverändert (Rückwärtskompatibilität für Skripte). Mit `--fix` bekommt es die Form
+Without `--fix` the JSON from Task 8 stays unchanged (backwards compatibility for scripts). With `--fix` it takes the form
 
 ```json
 { "vault": "…", "path": "…", "checks": [ … ], "report": "…", "failOn": "CRITICAL",
   "fixSeverity": "WARN",
-  "before": { "summary": { … }, "findings": [ … mit "fixed": true|false|null … ] },
+  "before": { "summary": { … }, "findings": [ … with "fixed": true|false|null … ] },
   "after":  { "summary": { … }, "findings": [ … "fixed": null … ] } }
 ```
-Das Feld `findings` auf oberster Ebene fehlt dann; `before`/`after` fehlen ohne `--fix`. Ein Skript unterscheidet die beiden Formen an genau der Flagge, die es selbst gesetzt hat.
+The top-level `findings` field is then missing; `before`/`after` are missing without `--fix`. A script tells the two forms apart by exactly the flag it set itself.
 
-Menschenausgabe mit `--fix`:
+Human-readable output with `--fix`:
 ```
 before the fixes
     WARN - Orphan directory: d/AB/CDEF…            [fixed]
@@ -2135,13 +2135,13 @@ after the fixes
 CRITICAL - File d/…/dir.c9r is empty, expected content
 15 good, 1 info, 0 warnings, 1 critical
 ```
-Das Suffix ist `[fixed]` bei `Some(true)` und `[fix failed]` bei `Some(false)`.
+The suffix is `[fixed]` for `Some(true)` and `[fix failed]` for `Some(false)`.
 
-Der Report (Task 8, Step 6) wird mit den Ergebnissen des **zweiten** Laufs geschrieben – er soll den Zustand beschreiben, in dem der Vault jetzt ist.
+The report (Task 8, Step 6) is written with the results of the **second** run – it should describe the state the vault is in now.
 
-Exit-Code: `worst` über `second.as_ref().unwrap_or(&first)`.
+Exit code: `worst` over `second.as_ref().unwrap_or(&first)`.
 
-- [ ] **Step 5: Tests, Gate, Commit**
+- [ ] **Step 5: Tests, gate, commit**
 
 Run: `cargo test -p crypto --test cli_health --locked`
 Expected: 12 passed.
@@ -2157,7 +2157,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 10: `migration/{mod,v6,v8}.rs` – Versionserkennung, 5→6 und 7→8
+### Task 10: `migration/{mod,v6,v8}.rs` – version detection, 5→6 and 7→8
 
 **Files:**
 - Create: `crates/cryptomator-core/src/migration/mod.rs`, `crates/cryptomator-core/src/migration/v6.rs`, `crates/cryptomator-core/src/migration/v8.rs`
@@ -2171,7 +2171,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationStep { FiveToSix, SixToSeven, SevenToEight }
 impl MigrationStep {
-    pub fn from_version(v: u32) -> Option<Self>;      // 5|6|7 -> Some, sonst None
+    pub fn from_version(v: u32) -> Option<Self>;      // 5|6|7 -> Some, otherwise None
     pub fn as_str(self) -> &'static str;              // "5->6" | "6->7" | "7->8"
 }
 
@@ -2179,12 +2179,12 @@ impl MigrationStep {
 pub struct MigrationPlan {
     pub from_version: u32,
     pub steps: Vec<MigrationStep>,
-    /// Nur fuer 6->7 gefuellt (Task 11); sonst leer.
+    /// Only filled for 6->7 (Task 11); empty otherwise.
     pub renames: Vec<PlannedRename>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedRename { pub from: PathBuf, pub to: PathBuf }   // beide vault-relativ
+pub struct PlannedRename { pub from: PathBuf, pub to: PathBuf }   // both vault-relative
 
 /// `FileSystemCapabilityChecker.assertAllCapabilities`
 pub fn assert_all_capabilities(vault_path: &Path) -> Result<()>;
@@ -2194,7 +2194,7 @@ pub struct Migrators;
 impl Migrators {
     pub fn needs_migration(vault_path: &Path) -> Result<bool>;
     pub fn plan(vault_path: &Path) -> Result<MigrationPlan>;
-    /// Migriert Schritt fuer Schritt bis Format 8. `progress` wird vor jedem Schritt gerufen.
+    /// Migrates step by step up to format 8. `progress` is called before every step.
     pub fn migrate(
         vault_path: &Path,
         passphrase: &str,
@@ -2204,7 +2204,7 @@ impl Migrators {
     ) -> Result<Vec<MigrationStep>>;
 }
 ```
-und die neuen Fehler:
+plus the new errors:
 ```rust
 // crates/cryptomator-core/src/error.rs
 #[error("the storage does not support {capability}: {path}")]
@@ -2214,9 +2214,9 @@ FileNameTooLong { path: PathBuf, needed: usize, allowed: usize },
 #[error("migration cannot continue: {0}")]
 MigrationBlocked(String),
 ```
-Alle drei kommen in `exit.rs::core_code` in die `GENERAL`-Gruppe, bis auf `MigrationBlocked`, das nach `WRONG_STATE` (5) geht: „der Vault ist so, wie er ist, nicht migrierbar" ist genau der Zustandsfehler.
+All three land in `exit.rs::core_code` in the `GENERAL` group, except `MigrationBlocked`, which goes to `WRONG_STATE` (5): "the vault cannot be migrated as it is" is exactly the state error.
 
-**Java-Vorlage.** `Migrators.determineVaultVersion` (haben wir schon als `determine_vault_version`), `Migration.isApplicable` (5→6, 6→7, 7→8), `Version6Migrator`, `Version8Migrator`, `FileSystemCapabilityChecker.assertAllCapabilities`.
+**Java template.** `Migrators.determineVaultVersion` (we already have it as `determine_vault_version`), `Migration.isApplicable` (5→6, 6→7, 7→8), `Version6Migrator`, `Version8Migrator`, `FileSystemCapabilityChecker.assertAllCapabilities`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -2260,7 +2260,7 @@ fn five_to_six_normalises_the_passphrase_and_keeps_the_key() {
     assert_eq!(before.raw(), after.raw(), "the masterkey itself is unchanged");
     assert!(access.load(&vault.join("masterkey.cryptomator"), nfd).is_err(),
             "the NFD form no longer opens the vault");
-    // Backup der alten Datei liegt daneben.
+    // A backup of the old file sits next to it.
     let backups: Vec<_> = std::fs::read_dir(&vault).unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -2281,10 +2281,10 @@ fn seven_to_eight_writes_a_vault_config_with_siv_ctrmac() {
     assert_eq!(config.alleged_cipher_combo().as_deref(), Some("SIV_CTRMAC"));
     assert_eq!(config.alleged_shortening_threshold(), Some(220));
     assert_eq!(config.key_id().unwrap().require_masterkey_file().unwrap(), "masterkey.cryptomator");
-    // Die Masterkey-Datei traegt jetzt 999 und oeffnet mit derselben Passphrase.
+    // The masterkey file now carries 999 and opens with the same passphrase.
     let raw = std::fs::read(vault.join("masterkey.cryptomator")).unwrap();
     assert_eq!(MasterkeyFileAccess::read_alleged_vault_version(&raw).unwrap(), 999);
-    // Und das Ganze ist ein Vault, den open_vault akzeptiert.
+    // And the whole thing is a vault that open_vault accepts.
     cryptomator_core::open_vault(&vault, &MasterkeyFileAccess::new(Vec::new()), &pass).unwrap();
 }
 
@@ -2314,15 +2314,15 @@ fn the_capability_check_passes_on_a_normal_directory_and_cleans_up() {
 }
 ```
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core --test migration --locked`
-Expected: FAIL, Modul `migration` fehlt.
+Expected: FAIL, module `migration` is missing.
 
 - [ ] **Step 3: `assert_all_capabilities`**
 
 ```rust
-/// `FileSystemCapabilityChecker.assertAllCapabilities`: erst lesen, dann schreiben.
+/// `FileSystemCapabilityChecker.assertAllCapabilities`: read first, then write.
 pub fn assert_all_capabilities(vault_path: &Path) -> Result<()> {
     std::fs::read_dir(vault_path).map_err(|_| CoreError::MissingCapability {
         path: vault_path.to_path_buf(), capability: "read access",
@@ -2334,47 +2334,47 @@ pub fn assert_all_capabilities(vault_path: &Path) -> Result<()> {
         std::fs::create_dir(&tmp)?;
         std::fs::remove_dir(&tmp)
     })();
-    let _ = std::fs::remove_dir_all(&check_dir);      // Java: deleteRecursivelySilently im finally
+    let _ = std::fs::remove_dir_all(&check_dir);      // Java: deleteRecursivelySilently in the finally
     result.map_err(|_| CoreError::MissingCapability {
         path: check_dir, capability: "write access",
     })?;
     Ok(())
 }
 ```
-Java benutzt `Files.createTempDirectory(checkDir, "write-access")`; ein fester Name reicht und macht den Test deterministisch, weil das Verzeichnis unmittelbar wieder verschwindet.
+Java uses `Files.createTempDirectory(checkDir, "write-access")`; a fixed name is enough and makes the test deterministic, because the directory disappears again immediately.
 
 - [ ] **Step 4: `v6.rs`**
 
 ```rust
-//! 5 -> 6, Port von `migration/v6/Version6Migrator.java`. Version 6 kodiert die Passphrase in
-//! Unicode NFC; der Schluessel selbst bleibt derselbe.
+//! 5 -> 6, port of `migration/v6/Version6Migrator.java`. Version 6 encodes the passphrase in
+//! Unicode NFC; the key itself stays the same.
 pub fn migrate(vault_path: &Path, passphrase: &str, rng: &mut dyn Rng) -> Result<()> {
     let masterkey_file = vault_path.join(MASTERKEY_FILENAME);
     let access = MasterkeyFileAccess::new(Vec::new());
-    let masterkey = access.load(&masterkey_file, passphrase)?;    // erst pruefen …
-    attempt_backup(&masterkey_file)?;                             // … dann sichern (Java-Reihenfolge)
+    let masterkey = access.load(&masterkey_file, passphrase)?;    // check first …
+    attempt_backup(&masterkey_file)?;                             // … then back up (Java order)
     let normalized: Zeroizing<String> = Zeroizing::new(passphrase.nfc().collect());
     access.persist(&masterkey, &masterkey_file, &normalized, 6, rng)
 }
 ```
-Die Reihenfolge „laden, dann Backup" ist Javas und wichtig: eine falsche Passphrase darf kein Backup und keine Änderung hinterlassen. `attempt_backup` ist derselbe Helfer, den `open_vault` benutzt (`.bkup`-Suffix aus SHA-256).
+The order "load, then back up" is Java's and it matters: a wrong passphrase must leave neither a backup nor a change behind. `attempt_backup` is the same helper that `open_vault` uses (`.bkup` suffix from SHA-256).
 
 - [ ] **Step 5: `v8.rs`**
 
 ```rust
-//! 7 -> 8, Port von `migration/v8/Version8Migrator.java`: die Masterkey-Datei wird in
-//! `masterkey.cryptomator` (nur noch KDF-Parameter) und `vault.cryptomator` (Format und
-//! vault-spezifische Metadaten) aufgeteilt.
+//! 7 -> 8, port of `migration/v8/Version8Migrator.java`: the masterkey file is split into
+//! `masterkey.cryptomator` (only KDF parameters now) and `vault.cryptomator` (format and
+//! vault-specific metadata).
 pub fn migrate(vault_path: &Path, passphrase: &str, rng: &mut dyn Rng) -> Result<()> {
     let masterkey_file = vault_path.join(MASTERKEY_FILENAME);
     let config_file = vault_path.join(VAULTCONFIG_FILENAME);
     let access = MasterkeyFileAccess::new(Vec::new());
     let masterkey = access.load(&masterkey_file, passphrase)?;
     attempt_backup(&masterkey_file)?;
-    // Java: SIV_CTRMAC und Threshold 220 fest -- Format 7 kannte nichts anderes.
+    // Java: SIV_CTRMAC and threshold 220 fixed -- format 7 knew nothing else.
     let config = VaultConfig::create_new(CipherCombo::SivCtrMac, 220);
     let token = config.to_token(DEFAULT_KEY_ID, masterkey.raw());
-    // CREATE_NEW: eine schon vorhandene vault.cryptomator ist ein Fehler, kein Ueberschreiben.
+    // CREATE_NEW: an already existing vault.cryptomator is an error, not something to overwrite.
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&config_file)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => CoreError::MigrationBlocked(format!(
@@ -2386,11 +2386,11 @@ pub fn migrate(vault_path: &Path, passphrase: &str, rng: &mut dyn Rng) -> Result
     access.persist(&masterkey, &masterkey_file, passphrase, DEFAULT_MASTERKEY_FILE_VERSION, rng)
 }
 ```
-`VaultConfig::create_new` setzt `vault_version = VAULT_VERSION` (8) und ein zufälliges `jti` – genau wie Javas `withJWTId(UUID.randomUUID())`. `DEFAULT_MASTERKEY_FILE_VERSION` ist 999, Javas `persist(…, 999)`.
+`VaultConfig::create_new` sets `vault_version = VAULT_VERSION` (8) and a random `jti` – exactly like Java's `withJWTId(UUID.randomUUID())`. `DEFAULT_MASTERKEY_FILE_VERSION` is 999, Java's `persist(…, 999)`.
 
-`CipherCombo::SivCtrMac` ist der Variantenname aus `crypto/cryptor.rs`; der Implementierende prüft ihn mit `grep -n "enum CipherCombo" -A 6 crates/cryptomator-core/src/crypto/cryptor.rs`.
+`CipherCombo::SivCtrMac` is the variant name from `crypto/cryptor.rs`; the implementer verifies it with `grep -n "enum CipherCombo" -A 6 crates/cryptomator-core/src/crypto/cryptor.rs`.
 
-- [ ] **Step 6: `mod.rs` – Plan und Schleife**
+- [ ] **Step 6: `mod.rs` – plan and loop**
 
 ```rust
 impl Migrators {
@@ -2411,7 +2411,7 @@ impl Migrators {
     ) -> Result<Vec<MigrationStep>> {
         assert_all_capabilities(vault_path)?;
         let mut done = Vec::new();
-        // Die Passphrase aendert sich in 5->6 (NFC); die folgenden Schritte brauchen die neue Form.
+        // The passphrase changes in 5->6 (NFC); the following steps need the new form.
         let mut current: Zeroizing<String> = Zeroizing::new(passphrase.to_string());
         loop {
             let version = determine_vault_version(vault_path)?;
@@ -2431,21 +2431,21 @@ impl Migrators {
     }
 }
 ```
-`MigrationStep::from_version` liefert für `0..=4` und `>= 8` `None`. Ein Vault mit Version 4 oder kleiner ist damit **kein Migrationsziel**; `plan()` gibt eine leere Schrittliste zurück und `migrate` tut nichts. Das Kommando in Task 12 fängt diesen Fall ab und meldet `MigrationBlocked("vault format 4 is older than this tool can migrate; use Cryptomator 1.4 or newer first")`. Java wirft dort `NoApplicableMigratorException`.
+`MigrationStep::from_version` returns `None` for `0..=4` and `>= 8`. A vault with version 4 or lower is therefore **not a migration target**; `plan()` returns an empty step list and `migrate` does nothing. The command in Task 12 catches this case and reports `MigrationBlocked("vault format 4 is older than this tool can migrate; use Cryptomator 1.4 or newer first")`. Java throws `NoApplicableMigratorException` there.
 
-**In diesem Task existiert `v7` noch nicht.** Der `SixToSeven`-Zweig lautet bis Task 11:
+**In this task `v7` does not exist yet.** Until Task 11 the `SixToSeven` branch reads:
 ```rust
 MigrationStep::SixToSeven => return Err(CoreError::MigrationBlocked(
     "the 6->7 migrator arrives with the next task".to_string())),
 ```
-Der Test `the_plan_lists_every_step_up_to_format_eight` läuft trotzdem (er migriert nicht), und `five_to_six_…`/`seven_to_eight_…` rufen die Migratoren direkt.
+The test `the_plan_lists_every_step_up_to_format_eight` runs anyway (it does not migrate), and `five_to_six_…`/`seven_to_eight_…` call the migrators directly.
 
 `lib.rs`: `pub mod migration;` plus `pub use migration::{MigrationPlan, MigrationStep, Migrators, PlannedRename};`.
 
-- [ ] **Step 7: Tests, Gate, Commit**
+- [ ] **Step 7: Tests, gate, commit**
 
 Run: `cargo test -p cryptomator-core --test migration --locked`
-Expected: 8 passed (die zwei aus Task 2 plus sechs neue; `stamp_legacy_v5` bleibt `#[ignore]`).
+Expected: 8 passed (the two from Task 2 plus six new ones; `stamp_legacy_v5` stays `#[ignore]`).
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -2458,12 +2458,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: `migration/v7.rs` – die Namensmigration 6→7
+### Task 11: `migration/v7.rs` – the 6→7 name migration
 
 **Files:**
 - Create: `crates/cryptomator-core/src/migration/v7.rs`
-- Modify: `crates/cryptomator-core/src/migration/mod.rs` (`pub mod v7;`, der `SixToSeven`-Zweig, `MigrationPlan::renames`)
-- Test: `crates/cryptomator-core/tests/migration.rs`, Unit-Tests in `v7.rs`
+- Modify: `crates/cryptomator-core/src/migration/mod.rs` (`pub mod v7;`, the `SixToSeven` branch, `MigrationPlan::renames`)
+- Test: `crates/cryptomator-core/tests/migration.rs`, unit tests in `v7.rs`
 
 **Interfaces:**
 - Consumes: `migration::{assert_all_capabilities, PlannedRename}` (Task 10), `crate::fs::capabilities::{determine_supported_ciphertext_file_name_length, max_cleartext_file_name_length}`, `crate::masterkey_file::MasterkeyFileAccess`, `crate::backup::attempt_backup`, `data_encoding::{BASE32, BASE64URL}`, `sha1::Sha1`.
@@ -2476,20 +2476,20 @@ pub const SHORTENING_THRESHOLD: usize = 220;
 pub const MAX_FILENAME_BUFFER_SIZE: u64 = 10 * 1024;
 pub const MIGRATION_ATTEMPTS: usize = 3;
 
-/// Ein einzelner Dateiname vor der Migration. Port von `migration/v7/FilePathMigration.java`.
+/// A single file name before the migration. Port of `migration/v7/FilePathMigration.java`.
 #[derive(Debug, Clone)]
 pub struct FilePathMigration { old_path: PathBuf, old_canonical_name: String }
 
 impl FilePathMigration {
-    /// `None`, wenn der Name schon migriert ist oder gar kein Cryptomator-Name.
+    /// `None` if the name is already migrated or is not a Cryptomator name at all.
     pub fn parse(vault_root: &Path, old_path: &Path) -> Result<Option<Self>>;
     pub fn old_path(&self) -> &Path;
-    pub fn is_directory(&self) -> bool;                       // beginnt mit "0"
-    pub fn is_symlink(&self) -> bool;                         // beginnt mit "1S"
+    pub fn is_directory(&self) -> bool;                       // starts with "0"
+    pub fn is_symlink(&self) -> bool;                         // starts with "1S"
     pub fn old_canonical_name_without_type_prefix(&self) -> &str;
-    pub fn decoded_ciphertext(&self) -> Result<Vec<u8>>;      // BASE32-Dekodierung
+    pub fn decoded_ciphertext(&self) -> Result<Vec<u8>>;      // BASE32 decoding
     pub fn new_inflated_name(&self) -> Result<String>;        // BASE64URL(…) + ".c9r"
-    pub fn new_deflated_name(&self) -> Result<String>;        // ggf. BASE64URL(SHA1(…)) + ".c9s"
+    pub fn new_deflated_name(&self) -> Result<String>;        // if needed BASE64URL(SHA1(…)) + ".c9s"
     pub fn target_path(&self, attempt_suffix: &str) -> Result<PathBuf>;
     pub fn migrate(&self) -> Result<PathBuf>;
 }
@@ -2499,19 +2499,19 @@ pub fn plan_renames(vault_root: &Path) -> Result<Vec<PlannedRename>>;
 pub fn migrate(vault_root: &Path, passphrase: &str, full_scan_allowed: bool, rng: &mut dyn Rng) -> Result<()>;
 ```
 
-**Java-Vorlage, wörtlich.** Die vier regulären Ausdrücke und Konstanten aus `FilePathMigration.java`:
+**Java template, verbatim.** The four regular expressions and constants from `FilePathMigration.java`:
 ```java
 OLD_SHORTENED_FILENAME_SUFFIX = ".lng";
 OLD_SHORTENED_FILENAME_PATTERN = "[A-Z2-7]{32}";
 OLD_CANONICAL_FILENAME_PATTERN = "(0|1S)?([A-Z2-7]{8})*[A-Z2-7=]{8}";
-BASE32 = BaseEncoding.base32();            // RFC 4648, Grossbuchstaben, '='-Padding
-BASE64 = BaseEncoding.base64Url();         // mit Padding
+BASE32 = BaseEncoding.base32();            // RFC 4648, uppercase, '=' padding
+BASE64 = BaseEncoding.base64Url();         // with padding
 SHORTENING_THRESHOLD = 220;
 MAX_FILENAME_BUFFER_SIZE = 10 * 1024;
 ```
-Beide Muster werden mit `find()` benutzt, **nicht** mit `matches()`: ein Name mit Konfliktsuffix wie `ABCDEFGH (1)` liefert die Gruppe `ABCDEFGH`. Ohne Regex-Crate bauen wir das von Hand nach – Step 3.
+Both patterns are used with `find()`, **not** with `matches()`: a name with a conflict suffix like `ABCDEFGH (1)` yields the group `ABCDEFGH`. Without a regex crate we rebuild that by hand – Step 3.
 
-- [ ] **Step 1: Failing Unit-Tests für die Namensarithmetik**
+- [ ] **Step 1: Failing unit tests for the name arithmetic**
 
 In `v7.rs`:
 
@@ -2531,15 +2531,15 @@ mod tests {
         assert_eq!(canonical("MFRGGZDFMZTWQ2LK (1)").as_deref(), Some("MFRGGZDFMZTWQ2LK"));
         assert_eq!(canonical("0MFRGGZDFMZTWQ2LK").as_deref(), Some("0MFRGGZDFMZTWQ2LK"));
         assert_eq!(canonical("1SMFRGGZDFMZTWQ2LK").as_deref(), Some("1SMFRGGZDFMZTWQ2LK"));
-        // Padding ist nur im letzten Block erlaubt.
+        // Padding is only allowed in the last block.
         assert_eq!(canonical("MFRGGZDFMZTWQ2L=").as_deref(), Some("MFRGGZDFMZTWQ2L="));
         assert_eq!(canonical("nope").as_deref(), None);
-        assert_eq!(canonical("SHORT").as_deref(), None);          // weniger als 8 Zeichen
+        assert_eq!(canonical("SHORT").as_deref(), None);          // fewer than 8 characters
     }
 
     #[test]
     fn base32_becomes_base64url_with_a_c9r_suffix() {
-        // BASE32("Hello!!!") -> die Bytes -> BASE64URL
+        // BASE32("Hello!!!") -> the bytes -> BASE64URL
         let m = migration("JBSWY3DPEHPK3PXP");
         assert_eq!(m.new_inflated_name().unwrap(), "SGVsbG8h3q2-7w==.c9r");
     }
@@ -2556,7 +2556,7 @@ mod tests {
 
     #[test]
     fn a_long_name_is_deflated_to_a_c9s_name() {
-        let long = migration(&"A".repeat(8 * 40));   // 320 BASE32-Zeichen -> 200 Bytes -> 268 base64
+        let long = migration(&"A".repeat(8 * 40));   // 320 BASE32 characters -> 200 bytes -> 268 base64
         let inflated = long.new_inflated_name().unwrap();
         assert!(inflated.len() > SHORTENING_THRESHOLD);
         let deflated = long.new_deflated_name().unwrap();
@@ -2579,37 +2579,37 @@ mod tests {
 }
 ```
 
-Die erwartete Zeichenkette `SGVsbG8h3q2-7w==.c9r` ist mit
+The expected string `SGVsbG8h3q2-7w==.c9r` is to be verified with
 `python3 -c "import base64;print(base64.urlsafe_b64encode(base64.b32decode('JBSWY3DPEHPK3PXP')).decode())"`
-gegenzuprüfen; weicht sie ab, wird die Konstante im Test korrigiert.
+; if it deviates, the constant in the test is corrected.
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core migration::v7 --locked`
-Expected: FAIL, Modul fehlt.
+Expected: FAIL, module missing.
 
-- [ ] **Step 3: `canonical` – die beiden Muster ohne Regex-Crate**
+- [ ] **Step 3: `canonical` – the two patterns without a regex crate**
 
 ```rust
 fn is_base32_char(c: char) -> bool { c.is_ascii_uppercase() && c != '0' && c != '1' || ('2'..='7').contains(&c) }
 
-/// Javas `OLD_CANONICAL_FILENAME_PATTERN.matcher(name).find()`: der laengste Praefix ab Position 0,
-/// der `(0|1S)?([A-Z2-7]{8})*[A-Z2-7=]{8}` erfuellt. Java sucht mit `find()` an *jeder* Position;
-/// bei echten v6-Namen steht der Treffer immer am Anfang (Konfliktsuffixe haengen hinten), und ein
-/// Treffer in der Mitte waere ein Name, den auch Java nur zufaellig richtig migriert. Wir suchen
-/// deshalb ab Position 0 und dokumentieren die Einschraenkung.
+/// Java's `OLD_CANONICAL_FILENAME_PATTERN.matcher(name).find()`: the longest prefix from position 0
+/// that satisfies `(0|1S)?([A-Z2-7]{8})*[A-Z2-7=]{8}`. Java searches with `find()` at *every*
+/// position; for real v6 names the match is always at the start (conflict suffixes hang off the
+/// end), and a match in the middle would be a name that Java too only migrates correctly by
+/// accident. So we search from position 0 and document the restriction.
 fn canonical(file_name: &str) -> Option<String> { … }
 ```
-Der Algorithmus: Präfix `1S` oder `0` abtrennen (in dieser Reihenfolge prüfen, `1S` zuerst – `1` allein ist kein BASE32-Zeichen, also gibt es keine Mehrdeutigkeit). Vom Rest so viele volle 8er-Blöcke aus `[A-Z2-7]` nehmen wie möglich, dann muss genau ein letzter 8er-Block aus `[A-Z2-7=]` folgen. Der Treffer ist Präfix + alle konsumierten Blöcke; ist keiner vorhanden, `None`. Der Kandidat muss zusätzlich mindestens einen Block haben (Javas `*` erlaubt null Wiederholungen, aber der Pflichtblock am Ende bleibt).
+The algorithm: split off the prefix `1S` or `0` (check in that order, `1S` first – `1` on its own is not a BASE32 character, so there is no ambiguity). From the rest take as many full 8-character blocks of `[A-Z2-7]` as possible, then exactly one final 8-character block of `[A-Z2-7=]` must follow. The match is prefix + all consumed blocks; if there is none, `None`. The candidate must additionally have at least one block (Java's `*` allows zero repetitions, but the mandatory block at the end stays).
 
-Achtung, ein Java-Detail mit Folgen: der letzte Block darf `=` **an jeder Stelle** enthalten (`[A-Z2-7=]{8}`), nicht nur am Ende. `BASE32.decode` weist solche Namen später ab und liefert `InvalidOldFilenameException`; wir spiegeln das mit `CoreError::InvalidArgument`.
+Careful, a Java detail with consequences: the last block may contain `=` **at any position** (`[A-Z2-7=]{8}`), not only at the end. `BASE32.decode` rejects such names later and yields `InvalidOldFilenameException`; we mirror that with `CoreError::InvalidArgument`.
 
 `FilePathMigration::parse`:
 ```rust
 pub fn parse(vault_root: &Path, old_path: &Path) -> Result<Option<Self>> {
     let name = old_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    // Schon migriert? BASE32 ist eine Teilmenge von BASE64URL, ein reiner Mustervergleich
-    // wuerde `.c9r`-Namen erneut migrieren.
+    // Already migrated? BASE32 is a subset of BASE64URL, a pure pattern match
+    // would migrate `.c9r` names a second time.
     if name.ends_with(CRYPTOMATOR_FILE_SUFFIX) || name.ends_with(DEFLATED_FILE_SUFFIX) {
         return Ok(None);
     }
@@ -2624,11 +2624,11 @@ pub fn parse(vault_root: &Path, old_path: &Path) -> Result<Option<Self>> {
     Ok(Some(Self { old_path: old_path.to_path_buf(), old_canonical_name: canonical_name }))
 }
 ```
-`find_32_base32_chars` ist Javas `[A-Z2-7]{32}`-`find()`: das erste Vorkommen von 32 aufeinanderfolgenden BASE32-Zeichen irgendwo im Namen (bei `.lng`-Namen mit Konfliktsuffix steht es am Anfang, aber `find()` an jeder Position ist hier billig und bleibt Java-treu).
+`find_32_base32_chars` is Java's `[A-Z2-7]{32}` `find()`: the first occurrence of 32 consecutive BASE32 characters anywhere in the name (for `.lng` names with a conflict suffix it sits at the start, but `find()` at every position is cheap here and stays faithful to Java).
 
-`inflate` liest `<vault>/m/<n[0..2]>/<n[2..4]>/<n>` mit Größenlimit `MAX_FILENAME_BUFFER_SIZE`; eine zu große oder fehlende Datei ergibt `CoreError::MigrationBlocked(format!("failed to read metadata file {}", path.display()))` — Javas `UninflatableFileException`, die die Visitors mit `SKIP` beantworten (Step 5).
+`inflate` reads `<vault>/m/<n[0..2]>/<n[2..4]>/<n>` with the size limit `MAX_FILENAME_BUFFER_SIZE`; a file that is too large or missing yields `CoreError::MigrationBlocked(format!("failed to read metadata file {}", path.display()))` — Java's `UninflatableFileException`, which the visitors answer with `SKIP` (Step 5).
 
-- [ ] **Step 4: `migrate()` einer einzelnen Datei**
+- [ ] **Step 4: `migrate()` of a single file**
 
 ```rust
 pub fn migrate(&self) -> Result<PathBuf> {
@@ -2659,7 +2659,7 @@ pub fn migrate(&self) -> Result<PathBuf> {
         "{} could not be migrated after {MIGRATION_ATTEMPTS} attempts", self.old_path.display())))
 }
 ```
-Genau wie Java: der Suffix wird **nach** dem Fehlschlag gesetzt, also sind die drei Versuche `""`, `"_1"`, `"_2"`. Der Suffix steht vor der Endung (`name_1.c9r`), damit der Konfliktauflöser aus M3 ihn später als „ (1)" wiedererkennt.
+Exactly like Java: the suffix is set **after** the failure, so the three attempts are `""`, `"_1"`, `"_2"`. The suffix goes before the extension (`name_1.c9r`), so that the conflict resolver from M3 later recognizes it as " (1)".
 
 `target_path`:
 ```rust
@@ -2676,27 +2676,27 @@ Ok(match (shortened, self.is_directory(), self.is_symlink()) {
 })
 ```
 
-- [ ] **Step 5: Der Vorlauf und die Migration des ganzen Vaults**
+- [ ] **Step 5: The pre-pass and the migration of the whole vault**
 
-`migrate(vault_root, passphrase, full_scan_allowed, rng)` folgt `Version7Migrator.migrate`:
+`migrate(vault_root, passphrase, full_scan_allowed, rng)` follows `Version7Migrator.migrate`:
 
 1. `masterkey = access.load(vault_root/masterkey.cryptomator, passphrase)?`
 2. `attempt_backup(&masterkey_file)?`
-3. `let filename_limit = determine_supported_ciphertext_file_name_length(vault_root)?;` — unser Helfer benutzt schon `subPathLength = 46`, `min = 28`, `max = 220`, also dieselben Argumente wie Javas `determineSupportedCiphertextFileNameLength(vaultRoot.resolve("c"), 46, 28, 220)`. `let path_limit = filename_limit + 48;`
+3. `let filename_limit = determine_supported_ciphertext_file_name_length(vault_root)?;` — our helper already uses `subPathLength = 46`, `min = 28`, `max = 220`, so the same arguments as Java's `determineSupportedCiphertextFileNameLength(vaultRoot.resolve("c"), 46, 28, 220)`. `let path_limit = filename_limit + 48;`
 4. `let full_scan = if filename_limit >= 220 { false } else { if !full_scan_allowed { return Err(CoreError::MigrationBlocked("this storage supports only {filename_limit} characters per name (220 required); a full scan of the vault is needed to tell whether migration is possible -- rerun with --yes".into())) } else { true } };`
-5. Vorlauf über `d/` mit Tiefenlimit 3, nur Dateien:
-   - Name endet auf `.icloud` → `CoreError::MigrationBlocked("migration impossible due to file: {name}")` (Javas `BLACKLISTED_NAMES`, „unsynced icloud content, user needs to download the vault first").
+5. Pre-pass over `d/` with depth limit 3, files only:
+   - name ends in `.icloud` → `CoreError::MigrationBlocked("migration impossible due to file: {name}")` (Java's `BLACKLISTED_NAMES`, "unsynced icloud content, user needs to download the vault first").
    - `total_files += 1`
-   - bei `full_scan`: `FilePathMigration::parse` und für den Zielpfad `max_name_length`/`max_path_length` fortschreiben; ein `MigrationBlocked` aus `inflate` wird hier **übersprungen** (Java: `LOG.warn("SKIP … because inflation failed")`), ein `InvalidArgument` aus dem BASE32-Dekoder ebenso.
-   - ohne `full_scan` sind die Werte fest `max_name = 220`, `max_path = 268` (Javas `PreMigrationVisitor`-Getter).
-6. `if max_path > path_limit { return Err(CoreError::FileNameTooLong { path: longest_path, needed: max_path, allowed: path_limit }) }`, danach dasselbe für `max_name > filename_limit`.
-7. Wenn `total_files > 0`: zweiter Walk über `d/` mit Tiefenlimit 3. **Pro Verzeichnis erst sammeln, dann anwenden** (Javas `MigratingVisitor`: `visitFile` sammelt, `postVisitDirectory` migriert) – sonst läuft man über die gerade erzeugten `.c9r`-Verzeichnisse. Ein `AlreadyExists` nach drei Versuchen wird geloggt und übersprungen, nicht geworfen (Javas `catch (FileAlreadyExistsException)` im Visitor); alle anderen Fehler brechen ab.
-8. `m/` rekursiv löschen (`std::fs::remove_dir_all`, `NotFound` ist ok — Javas `DeletingFileVisitor`).
+   - with `full_scan`: `FilePathMigration::parse` and advance `max_name_length`/`max_path_length` for the target path; a `MigrationBlocked` from `inflate` is **skipped** here (Java: `LOG.warn("SKIP … because inflation failed")`), and so is an `InvalidArgument` from the BASE32 decoder.
+   - without `full_scan` the values are fixed at `max_name = 220`, `max_path = 268` (Java's `PreMigrationVisitor` getters).
+6. `if max_path > path_limit { return Err(CoreError::FileNameTooLong { path: longest_path, needed: max_path, allowed: path_limit }) }`, then the same for `max_name > filename_limit`.
+7. If `total_files > 0`: a second walk over `d/` with depth limit 3. **Collect per directory first, then apply** (Java's `MigratingVisitor`: `visitFile` collects, `postVisitDirectory` migrates) – otherwise you walk over the `.c9r` directories you have just created. An `AlreadyExists` after three attempts is logged and skipped, not thrown (Java's `catch (FileAlreadyExistsException)` in the visitor); all other errors abort.
+8. Delete `m/` recursively (`std::fs::remove_dir_all`, `NotFound` is fine — Java's `DeletingFileVisitor`).
 9. `access.persist(&masterkey, &masterkey_file, passphrase, 7, rng)?`
 
-`plan_renames(vault_root)` ist derselbe erste Walk, sammelt aber `PlannedRename { from, to }` mit vault-relativen Pfaden aus `target_path("")` und schreibt nichts. Kollisionen (zwei Quellen auf dasselbe Ziel) werden **nicht** aufgelöst — der `--dry-run`-Text sagt dazu „collisions get a `_1`/`_2` suffix at migration time".
+`plan_renames(vault_root)` is the same first walk, but it collects `PlannedRename { from, to }` with vault-relative paths from `target_path("")` and writes nothing. Collisions (two sources onto the same target) are **not** resolved — the `--dry-run` text says "collisions get a `_1`/`_2` suffix at migration time" about that.
 
-- [ ] **Step 6: Integrationstest über den ganzen Weg**
+- [ ] **Step 6: Integration test over the whole path**
 
 In `crates/cryptomator-core/tests/migration.rs`:
 
@@ -2714,7 +2714,7 @@ fn six_to_seven_renames_every_node_and_drops_the_metadata_dir() {
 
     assert_eq!(cryptomator_core::determine_vault_version(&vault).unwrap(), 7);
     assert!(!vault.join("m").exists(), "the metadata directory is gone");
-    // Kein BASE32-Name mehr unter d/.
+    // No BASE32 name under d/ any more.
     let mut names = Vec::new();
     collect_names(&vault.join("d"), &mut names);
     assert!(names.iter().all(|n| n.ends_with(".c9r") || n.ends_with(".c9s")
@@ -2733,7 +2733,7 @@ fn the_whole_chain_from_five_to_eight_produces_a_readable_vault() {
         assert_eq!(cryptomator_core::determine_vault_version(&vault).unwrap(), 8, "{name}");
         assert!(!steps.is_empty(), "{name}");
 
-        // Der migrierte Vault laesst sich oeffnen und enthaelt genau das, was das Manifest sagt.
+        // The migrated vault can be opened and contains exactly what the manifest says.
         let opened = cryptomator_core::open_vault(
             &vault, &MasterkeyFileAccess::new(Vec::new()), &final_pass).unwrap();
         let fs = cryptomator_core::fs::CryptoFs::open(opened, Default::default()).unwrap();
@@ -2742,7 +2742,7 @@ fn the_whole_chain_from_five_to_eight_produces_a_readable_vault() {
             let cleartext = cryptomator_core::fs::CleartextPath::parse(path).unwrap();
             assert!(fs.metadata(&cleartext).is_ok(), "{name}: {path} is missing after migration");
         }
-        // Und die Health-Checks finden nichts.
+        // And the health checks find nothing.
         let opened = cryptomator_core::open_vault(
             &vault, &MasterkeyFileAccess::new(Vec::new()), &final_pass).unwrap();
         let ctx = cryptomator_core::CheckContext::new(opened);
@@ -2754,16 +2754,16 @@ fn the_whole_chain_from_five_to_eight_produces_a_readable_vault() {
 }
 ```
 
-`CleartextPath::parse` und `CryptoFs::metadata` sind aus M3; die genauen Namen stehen in `crates/cryptomator-core/tests/crypto_fs_fixtures.rs` und werden von dort übernommen. `collect_names` ist ein kleiner rekursiver Helfer in derselben Testdatei.
+`CleartextPath::parse` and `CryptoFs::metadata` are from M3; the exact names are in `crates/cryptomator-core/tests/crypto_fs_fixtures.rs` and are taken from there. `collect_names` is a small recursive helper in the same test file.
 
-- [ ] **Step 7: `mod.rs` verdrahten**
+- [ ] **Step 7: Wire up `mod.rs`**
 
-`pub mod v7;`, der `SixToSeven`-Zweig ruft `v7::migrate(vault_path, &current, full_scan_allowed, rng)?`, und `Migrators::plan` füllt `renames` mit `v7::plan_renames(vault_path)?`, wenn `steps` den Schritt `SixToSeven` enthält (sonst bleibt der Vektor leer).
+`pub mod v7;`, the `SixToSeven` branch calls `v7::migrate(vault_path, &current, full_scan_allowed, rng)?`, and `Migrators::plan` fills `renames` with `v7::plan_renames(vault_path)?` when `steps` contains the `SixToSeven` step (otherwise the vector stays empty).
 
-- [ ] **Step 8: Tests, Gate, Commit**
+- [ ] **Step 8: Tests, gate, commit**
 
 Run: `cargo test -p cryptomator-core --test migration --locked && cargo test -p cryptomator-core migration::v7 --locked`
-Expected: alle grün. Der Test `the_whole_chain_…` ist der teuerste im Repo (drei Vaults, je bis zu drei scrypt-Läufe); wenn er über 60 s braucht, prüft der Implementierende, ob das Release-Profil für `dev.package."*"` greift (`grep -n 'opt-level' Cargo.toml`), statt den Test zu kürzen.
+Expected: all green. The test `the_whole_chain_…` is the most expensive one in the repo (three vaults, up to three scrypt runs each); if it takes more than 60 s, the implementer checks whether the release profile for `dev.package."*"` takes effect (`grep -n 'opt-level' Cargo.toml`) instead of shortening the test.
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -2802,14 +2802,14 @@ pub struct MigrateArgs {
 }
 
 // crates/crypto/src/commands/mod.rs
-/// Wie `locked_vault`, aber `NEEDS_MIGRATION` ist erlaubt -- das ist ja der Anlass.
+/// Like `locked_vault`, but `NEEDS_MIGRATION` is allowed -- that is the very reason for it.
 pub fn migratable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)>;
 
 // crates/crypto/src/commands/migrate.rs
 pub fn run(ctx: &Ctx, args: MigrateArgs) -> anyhow::Result<u8>;
 ```
 
-- [ ] **Step 1: Failing CLI-Tests**
+- [ ] **Step 1: Failing CLI tests**
 
 `crates/crypto/tests/cli_migrate.rs`:
 
@@ -2842,7 +2842,7 @@ fn migrating_a_v7_vault_makes_it_a_format_8_vault() {
     assert_eq!(value["toVersion"], 8);
     assert_eq!(value["steps"], serde_json::json!(["7->8"]));
     assert!(path.join("vault.cryptomator").is_file());
-    // Danach ist der Vault ein ganz normaler: `crypto vault info` sagt LOCKED.
+    // After that the vault is a perfectly normal one: `crypto vault info` says LOCKED.
     fx.crypto(&["--json", "vault", "info", "legacy_v7"])
         .assert().success().stdout(predicate::str::contains("\"LOCKED\""));
 }
@@ -2861,8 +2861,8 @@ fn migrating_a_v5_vault_runs_all_three_steps_and_normalises_the_passphrase() {
         .assert().success().get_output().stdout.clone();
     let value: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(value["steps"], serde_json::json!(["5->6", "6->7", "7->8"]));
-    // Ab jetzt gilt die NFC-Form -- und das CLI normalisiert Eingaben ohnehin nach NFC, also
-    // funktionieren beide Schreibweisen beim Entsperren.
+    // From now on the NFC form applies -- and the CLI normalizes input to NFC anyway, so
+    // both spellings work when unlocking.
     fx.crypto(&["fs", "ls", "legacy_v5", "/"])
         .env("CRYPTO_PASSWORD", &nfc)
         .assert().success().stdout(predicate::str::contains("hello.txt"));
@@ -2906,7 +2906,7 @@ fn dry_run_lists_the_renames_and_changes_nothing() {
     let renames = value["renames"].as_array().unwrap();
     assert!(renames.len() >= 6, "{renames:#?}");
     assert!(renames[0]["to"].as_str().unwrap().contains(".c9"));
-    // Nichts angefasst -- auch kein Backup.
+    // Nothing touched -- not even a backup.
     assert_eq!(std::fs::read(path.join("masterkey.cryptomator")).unwrap(), before);
     assert!(path.join("m").is_dir());
     assert!(!path.join("vault.cryptomator").exists());
@@ -2945,9 +2945,9 @@ fn a_stored_password_follows_the_nfc_normalisation() {
 }
 ```
 
-Der letzte Test benutzt `Sandbox::{seed_keychain, crypto_keychain, fake_keychain_json, vault_id}` aus M6; die genaue Form von `fake_keychain_json` (Schlüsselname `passphrase` oder anders) ist mit `sed -n '150,170p' crates/crypto/tests/common/mod.rs` zu prüfen und die Zusicherung entsprechend zu schreiben.
+The last test uses `Sandbox::{seed_keychain, crypto_keychain, fake_keychain_json, vault_id}` from M6; the exact shape of `fake_keychain_json` (key name `passphrase` or something else) is to be checked with `sed -n '150,170p' crates/crypto/tests/common/mod.rs` and the assertion written accordingly.
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p crypto --test cli_migrate --locked`
 Expected: FAIL, `unrecognized subcommand 'migrate'`.
@@ -2955,9 +2955,9 @@ Expected: FAIL, `unrecognized subcommand 'migrate'`.
 - [ ] **Step 3: `migratable_vault`**
 
 ```rust
-/// Wie [`locked_vault`], aber `NEEDS_MIGRATION` ist zugelassen -- das ist der Zustand, den
-/// `crypto migrate` beheben soll. Der Laufzeitteil bleibt: ein Daemon, der den Vault bedient,
-/// haelt Dateien offen, und die Migration benennt sie alle um.
+/// Like [`locked_vault`], but `NEEDS_MIGRATION` is permitted -- that is the state
+/// `crypto migrate` is meant to fix. The runtime part stays: a daemon serving the vault
+/// holds files open, and the migration renames all of them.
 pub fn migratable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson, PathBuf)> {
     let settings = ctx.store.load()?;
     let index = resolve_vault_index(&settings, reference)?;
@@ -2976,7 +2976,7 @@ pub fn migratable_vault(ctx: &Ctx, reference: &str) -> Result<(VaultSettingsJson
 }
 ```
 
-- [ ] **Step 4: Das Kommando**
+- [ ] **Step 4: The command**
 
 ```rust
 pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
@@ -2997,16 +2997,16 @@ pub fn run(ctx: &Ctx, args: MigrateArgs) -> Result<u8> {
 }
 ```
 
-Danach in dieser Reihenfolge:
-1. Passwort holen (`read_passphrase_with_keychain` mit `keychain_source`, wie `health`).
-2. Bei `--dry-run`: `emit` mit `dryRun: true`, `renames` (aus `plan.renames`, jeweils `{from, to}`) und den Schritten, dann `Ok(exit::OK)` – **ohne** die Passphrase überhaupt zu prüfen? Nein: die Passphrase wird geprüft (`MasterkeyFileAccess::load` gegen `masterkey.cryptomator`), damit ein `--dry-run` mit falschem Passwort nicht suggeriert, die Migration werde klappen. Geschrieben wird dabei nichts – `load` ist reines Lesen. Das ist der Grund, warum `a_wrong_passphrase_…` und `dry_run_…` beide sauber sind.
-3. Bestätigung: ohne `--yes` und mit `std::io::stdin().is_terminal()` eine Frage auf stderr
+After that, in this order:
+1. Get the password (`read_passphrase_with_keychain` with `keychain_source`, like `health`).
+2. With `--dry-run`: `emit` with `dryRun: true`, `renames` (from `plan.renames`, each `{from, to}`) and the steps, then `Ok(exit::OK)` – **without** checking the passphrase at all? No: the passphrase is checked (`MasterkeyFileAccess::load` against `masterkey.cryptomator`), so that a `--dry-run` with a wrong password does not suggest that the migration will work. Nothing is written while doing so – `load` is pure reading. That is why `a_wrong_passphrase_…` and `dry_run_…` are both clean.
+3. Confirmation: without `--yes` and with `std::io::stdin().is_terminal()`, a question on stderr
    ```
    Vault "legacy_v6" is in format 6 and will be migrated to format 8 (steps: 6->7, 7->8).
    This rewrites file names in the vault and cannot be undone; make sure you have a backup.
    Continue? [y/N]
    ```
-   und eine Zeile von stdin lesen; alles außer `y`/`yes` (case-insensitiv) ist Abbruch mit Exit 0 und der Meldung `aborted`. Ohne Terminal und ohne `--yes`:
+   and read one line from stdin; anything other than `y`/`yes` (case-insensitive) aborts with exit 0 and the message `aborted`. Without a terminal and without `--yes`:
    ```rust
    return Err(AppError::InvalidValue {
        key: "--yes".to_string(),
@@ -3014,21 +3014,21 @@ Danach in dieser Reihenfolge:
    }.into());
    ```
 4. `Migrators::migrate(&path, &passphrase, /* full_scan_allowed = */ true, &mut |step| { if !ctx.out.json { eprintln!("migrating {} …", step.as_str()); } }, &mut OsRng)?`
-   `full_scan_allowed` ist `true`, sobald bestätigt wurde (oder `--yes` gegeben war): die Bestätigungsfrage oben ist unsere Fassung von Javas `REQUIRES_FULL_VAULT_DIR_SCAN`, und ein zweiter Dialog mitten in der Migration wäre für ein CLI unbrauchbar. Als Kommentar festhalten.
-5. Bei einer Kette, die `FiveToSix` enthielt: `update_keychain_entry_or_warn(ctx, &vault, &nfc_passphrase, &args.vault, "migration")`, damit ein gespeichertes Passwort der Normalisierung folgt (Ruling: derselbe Mechanismus wie `password change`; die NFC-Form berechnet das Kommando mit `unicode_normalization`). Enthielt die Kette keinen `5->6`-Schritt, bleibt die Keychain unangetastet.
-6. Ausgabe:
+   `full_scan_allowed` is `true` as soon as confirmation was given (or `--yes` was passed): the confirmation question above is our version of Java's `REQUIRES_FULL_VAULT_DIR_SCAN`, and a second dialog in the middle of the migration would be unusable for a CLI. Record as a comment.
+5. For a chain that contained `FiveToSix`: `update_keychain_entry_or_warn(ctx, &vault, &nfc_passphrase, &args.vault, "migration")`, so that a stored password follows the normalization (ruling: the same mechanism as `password change`; the command computes the NFC form with `unicode_normalization`). If the chain contained no `5->6` step, the keychain stays untouched.
+6. Output:
    ```json
    { "path": "/vaults/v", "fromVersion": 5, "toVersion": 8,
      "steps": ["5->6", "6->7", "7->8"], "dryRun": false, "keychainUpdated": true }
    ```
-   Menschenform: `migrated /vaults/v from format 5 to format 8 (5->6, 6->7, 7->8)`.
+   Human-readable form: `migrated /vaults/v from format 5 to format 8 (5->6, 6->7, 7->8)`.
 
-`cli.rs`: `Command::Migrate(MigrateArgs)` mit `/// Bring a vault of format 5, 6 or 7 up to format 8`.
+`cli.rs`: `Command::Migrate(MigrateArgs)` with `/// Bring a vault of format 5, 6 or 7 up to format 8`.
 `main.rs`: `Command::Migrate(args) => commands::migrate::run(&ctx, args),`.
 
-- [ ] **Step 5: Der Zustandsfehler an anderer Stelle prüfen**
+- [ ] **Step 5: Check the state error elsewhere**
 
-`crypto unlock`/`fs`/`health` auf einem Legacy-Vault müssen Exit **5** liefern und im Text auf `crypto migrate` verweisen. `determine_vault_state` liefert dafür schon `NEEDS_MIGRATION`, und `locked_vault` macht daraus `AppError::WrongState`. Nur der Hinweistext fehlt: in `AppError::WrongState`s `Display` (`crates/cryptomator-app/src/error.rs`) bleibt der Text unverändert; stattdessen bekommt `locked_vault` in `commands/mod.rs` einen Sonderfall:
+`crypto unlock`/`fs`/`health` on a legacy vault must return exit **5** and point at `crypto migrate` in the text. `determine_vault_state` already returns `NEEDS_MIGRATION` for that, and `locked_vault` turns it into `AppError::WrongState`. Only the hint text is missing: in `AppError::WrongState`'s `Display` (`crates/cryptomator-app/src/error.rs`) the text stays unchanged; instead `locked_vault` in `commands/mod.rs` gets a special case:
 
 ```rust
 if state == VaultState::NeedsMigration {
@@ -3039,7 +3039,7 @@ if state == VaultState::NeedsMigration {
 }
 ```
 
-Ein Test dafür in `cli_migrate.rs`:
+A test for it in `cli_migrate.rs`:
 ```rust
 #[test]
 fn a_legacy_vault_points_at_the_migrate_command() {
@@ -3053,7 +3053,7 @@ fn a_legacy_vault_points_at_the_migrate_command() {
 }
 ```
 
-- [ ] **Step 6: Tests, Gate, Commit**
+- [ ] **Step 6: Tests, gate, commit**
 
 Run: `cargo test -p crypto --test cli_migrate --locked`
 Expected: 8 passed.
@@ -3069,19 +3069,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 13: `recovery/restore.rs` und `crypto recovery-key restore`
+### Task 13: `recovery/restore.rs` and `crypto recovery-key restore`
 
 **Files:**
 - Create: `crates/cryptomator-core/src/recovery/restore.rs`
 - Modify: `crates/cryptomator-core/src/recovery/mod.rs`, `crates/cryptomator-core/src/lib.rs`, `crates/cryptomator-core/src/error.rs`, `crates/crypto/src/cli.rs`, `crates/crypto/src/commands/recovery.rs`, `crates/crypto/src/main.rs`
-- Test: `crates/cryptomator-core/tests/vault_lifecycle.rs` (Kern), `crates/crypto/tests/cli.rs` (CLI)
+- Test: `crates/cryptomator-core/tests/vault_lifecycle.rs` (core), `crates/crypto/tests/cli.rs` (CLI)
 
 **Interfaces:**
 - Consumes: `crate::vault::init::initialize`, `crate::masterkey_file::{MasterkeyFileAccess, DEFAULT_MASTERKEY_FILE_VERSION}`, `crate::recovery::key::decode_recovery_key`, `crate::recovery::words::WordEncoder`, `crate::crypto::{masterkey::Masterkey, cryptor::{CipherCombo, Cryptor}}`, `crate::constants::{MASTERKEY_FILENAME, VAULTCONFIG_FILENAME, DEFAULT_KEY_ID, DATA_DIR_NAME, CRYPTOMATOR_FILE_SUFFIX, DIR_FILE_NAME}`.
 - Produces:
 ```rust
-/// `common/recovery/RecoveryDirectory.java`: es wird erst in ein Temp-Verzeichnis geschrieben und
-/// dann in den Vault verschoben, damit ein halb geschriebener Restore den Vault nie beruehrt.
+/// `common/recovery/RecoveryDirectory.java`: everything is written into a temp directory first and
+/// then moved into the vault, so that a half-written restore never touches the vault.
 #[derive(Debug)]
 pub struct RecoveryDirectory { vault_path: PathBuf, temp: tempfile::TempDir }
 impl RecoveryDirectory {
@@ -3090,33 +3090,33 @@ impl RecoveryDirectory {
     pub fn move_recovered_file(&self, file_name: &str) -> std::io::Result<()>;   // REPLACE_EXISTING
 }
 
-/// `MasterkeyService.detect`: der erste regulaere `*.c9r`, der nicht `dir.c9r` heisst, wird mit
-/// beiden Schemata probiert -- in der Reihenfolge der Java-Enum `CryptorProvider.Scheme`:
-/// SIV_CTRMAC, dann SIV_GCM.
+/// `MasterkeyService.detect`: the first regular `*.c9r` that is not called `dir.c9r` is tried with
+/// both schemes -- in the order of the Java enum `CryptorProvider.Scheme`:
+/// SIV_CTRMAC, then SIV_GCM.
 pub fn detect_cipher_combo(masterkey: &Masterkey, vault_path: &Path) -> Option<CipherCombo>;
 
-/// RESTORE_MASTERKEY: Recovery-Key + neues Passwort -> `masterkey.cryptomator`.
+/// RESTORE_MASTERKEY: recovery key + new password -> `masterkey.cryptomator`.
 pub fn restore_masterkey(
     encoder: &WordEncoder, access: &MasterkeyFileAccess, vault_path: &Path,
     recovery_key: &str, new_passphrase: &str, rng: &mut dyn Rng,
 ) -> Result<()>;
 
-/// RESTORE_VAULT_CONFIG: vorhandene Masterkey-Datei + Vault-Passwort -> `vault.cryptomator`.
+/// RESTORE_VAULT_CONFIG: existing masterkey file + vault password -> `vault.cryptomator`.
 pub fn restore_config(
     access: &MasterkeyFileAccess, vault_path: &Path, passphrase: &str,
     cipher_combo: Option<CipherCombo>, shortening_threshold: u32, rng: &mut dyn Rng,
 ) -> Result<VaultConfig>;
 
-/// RESTORE_ALL: Recovery-Key + neues Passwort -> beide Dateien.
+/// RESTORE_ALL: recovery key + new password -> both files.
 pub fn restore_all(
     encoder: &WordEncoder, access: &MasterkeyFileAccess, vault_path: &Path,
     recovery_key: &str, new_passphrase: &str,
     cipher_combo: Option<CipherCombo>, shortening_threshold: u32, rng: &mut dyn Rng,
 ) -> Result<VaultConfig>;
 ```
-und `CoreError::CipherComboUndetectable(PathBuf)` (→ `WRONG_STATE`, Exit 5: der Vault gibt nicht genug her, um das zu entscheiden).
+plus `CoreError::CipherComboUndetectable(PathBuf)` (→ `WRONG_STATE`, exit 5: the vault does not give away enough to decide that).
 
-Grammatik:
+Grammar:
 ```rust
 #[derive(Args, Debug)]
 #[command(group = clap::ArgGroup::new("restore-what").required(true))]
@@ -3151,9 +3151,9 @@ pub struct RestoreArgs {
 }
 ```
 
-**Java-Vorlage.** `RecoveryKeyResetPasswordController.restorePassword` (RESTORE_ALL), `RecoveryKeyCreationController.restoreWithPassword` (RESTORE_VAULT_CONFIG), `ResetPasswordTask.call` (RESTORE_MASTERKEY = `newMasterkeyFileWithPassphrase`), `MasterkeyService.detect` + `determineScheme`, `CryptoFsInitializer.init`, `RecoveryDirectory`.
+**Java template.** `RecoveryKeyResetPasswordController.restorePassword` (RESTORE_ALL), `RecoveryKeyCreationController.restoreWithPassword` (RESTORE_VAULT_CONFIG), `ResetPasswordTask.call` (RESTORE_MASTERKEY = `newMasterkeyFileWithPassphrase`), `MasterkeyService.detect` + `determineScheme`, `CryptoFsInitializer.init`, `RecoveryDirectory`.
 
-- [ ] **Step 1: Failing Kern-Tests**
+- [ ] **Step 1: Failing core tests**
 
 In `crates/cryptomator-core/tests/vault_lifecycle.rs`:
 
@@ -3184,7 +3184,7 @@ fn restoring_the_config_reproduces_an_equivalent_vault_config() {
     ).unwrap();
     assert_eq!(config.cipher_combo, CipherCombo::SivGcm);
     assert_eq!(config.shortening_threshold, 220);
-    // Der Vault laesst sich wieder oeffnen und lesen -- die jti ist neu, alles andere gleich.
+    // The vault can be opened and read again -- the jti is new, everything else the same.
     let opened = open_vault(&vault, &MasterkeyFileAccess::new(Vec::new()), "test-password-123").unwrap();
     assert_eq!(cryptomator_core::read_vault_config(&vault).unwrap().header_value("kid").unwrap(), &before_id);
     let fs = cryptomator_core::fs::CryptoFs::open(opened, Default::default()).unwrap();
@@ -3238,7 +3238,7 @@ fn an_empty_vault_cannot_have_its_combo_detected() {
     std::fs::create_dir_all(vault.join("d")).unwrap();
     let key = Masterkey::generate(&mut OsRng);
     assert_eq!(cryptomator_core::recovery::restore::detect_cipher_combo(&key, &vault), None);
-    // restore_all meldet das als eigener Fehler, statt still SIV_GCM zu raten.
+    // restore_all reports this as its own error instead of silently guessing SIV_GCM.
     let encoder = WordEncoder::new();
     let recovery_key = cryptomator_core::recovery::create_recovery_key(&encoder, key.raw());
     let err = cryptomator_core::recovery::restore::restore_all(
@@ -3252,7 +3252,7 @@ fn an_empty_vault_cannot_have_its_combo_detected() {
 fn a_failed_restore_leaves_the_vault_untouched() {
     let (_tmp, vault) = common::copy_fixture("siv_gcm_basic");
     let before = std::fs::read(vault.join("vault.cryptomator")).unwrap();
-    // Ein Recovery-Key mit falscher Pruefsumme kommt gar nicht bis zum Schreiben.
+    // A recovery key with a wrong checksum never gets as far as writing.
     let err = cryptomator_core::recovery::restore::restore_all(
         &WordEncoder::new(), &MasterkeyFileAccess::new(Vec::new()), &vault,
         "not even words", "pw", None, 220, &mut OsRng,
@@ -3262,12 +3262,12 @@ fn a_failed_restore_leaves_the_vault_untouched() {
 }
 ```
 
-- [ ] **Step 2: Lauf – muss fehlschlagen**
+- [ ] **Step 2: Run – must fail**
 
 Run: `cargo test -p cryptomator-core --test vault_lifecycle --locked restore`
-Expected: FAIL, Modul `restore` fehlt.
+Expected: FAIL, module `restore` is missing.
 
-- [ ] **Step 3: `RecoveryDirectory` und `detect_cipher_combo`**
+- [ ] **Step 3: `RecoveryDirectory` and `detect_cipher_combo`**
 
 ```rust
 impl RecoveryDirectory {
@@ -3278,8 +3278,8 @@ impl RecoveryDirectory {
     pub fn path(&self) -> &Path { self.temp.path() }
     pub fn move_recovered_file(&self, file_name: &str) -> std::io::Result<()> {
         let (from, to) = (self.temp.path().join(file_name), self.vault_path.join(file_name));
-        // Javas Files.move(REPLACE_EXISTING). Das Temp-Verzeichnis liegt in $TMPDIR und damit oft
-        // auf einem anderen Dateisystem als der Vault -- rename schlaegt dann fehl.
+        // Java's Files.move(REPLACE_EXISTING). The temp directory lives in $TMPDIR and therefore
+        // often on a different file system than the vault -- rename then fails.
         match std::fs::rename(&from, &to) {
             Ok(()) => Ok(()),
             Err(_) => { std::fs::copy(&from, &to)?; std::fs::remove_file(&from) }
@@ -3287,12 +3287,12 @@ impl RecoveryDirectory {
     }
 }
 ```
-`TempDir` löscht sich beim Drop – das ist Javas `close()`/`deleteRecoveryDirectory`.
+`TempDir` deletes itself on drop – that is Java's `close()`/`deleteRecoveryDirectory`.
 
 ```rust
 pub fn detect_cipher_combo(masterkey: &Masterkey, vault_path: &Path) -> Option<CipherCombo> {
     let candidate = first_encrypted_file(&vault_path.join(DATA_DIR_NAME))?;
-    // Reihenfolge wie Javas `CryptorProvider.Scheme.values()`.
+    // Order as in Java's `CryptorProvider.Scheme.values()`.
     for combo in [CipherCombo::SivCtrMac, CipherCombo::SivGcm] {
         let cryptor = Cryptor::new(combo, masterkey);
         let size = cryptor.file_header_cryptor().header_size();
@@ -3304,13 +3304,13 @@ pub fn detect_cipher_combo(masterkey: &Masterkey, vault_path: &Path) -> Option<C
     None
 }
 ```
-`first_encrypted_file` läuft rekursiv über `d/` (sortiert, damit das Ergebnis reproduzierbar ist) und nimmt die erste **reguläre Datei**, deren Name auf `.c9r` endet und **nicht** `dir.c9r` ist. Javas Filter ist wortgleich (`p.toString().endsWith(".c9r")`, `!p.endsWith("dir.c9r")`, `Files::isRegularFile`) und schließt `dirid.c9r`, `symlink.c9r` und `contents.c9r` **nicht** aus – die sind ganz normale verschlüsselte Dateien mit Header, also funktioniert die Erkennung an ihnen genauso. Wörtlich übernehmen.
+`first_encrypted_file` walks recursively over `d/` (sorted, so that the result is reproducible) and takes the first **regular file** whose name ends in `.c9r` and is **not** `dir.c9r`. Java's filter is word for word the same (`p.toString().endsWith(".c9r")`, `!p.endsWith("dir.c9r")`, `Files::isRegularFile`) and does **not** exclude `dirid.c9r`, `symlink.c9r` and `contents.c9r` – those are perfectly ordinary encrypted files with a header, so detection works on them just as well. Adopt verbatim.
 
-- [ ] **Step 4: Die drei Restore-Funktionen**
+- [ ] **Step 4: The three restore functions**
 
 ```rust
 pub fn restore_masterkey(encoder, access, vault_path, recovery_key, new_passphrase, rng) -> Result<()> {
-    let raw = decode_recovery_key(encoder, recovery_key)?;       // erst pruefen, dann schreiben
+    let raw = decode_recovery_key(encoder, recovery_key)?;       // check first, then write
     let masterkey = Masterkey::from_raw(*raw);
     let target = vault_path.join(MASTERKEY_FILENAME);
     if target.exists() { crate::backup::attempt_backup(&target)?; }
@@ -3321,7 +3321,7 @@ pub fn restore_masterkey(encoder, access, vault_path, recovery_key, new_passphra
     Ok(())
 }
 ```
-Anders als `recovery::key::reset_password` (M2) liest das hier **nicht** die `vault.cryptomator`, um den Dateinamen zu erfahren: bei einem Restore kann sie fehlen. Der Name ist `masterkey.cryptomator` — derselbe, den Java in `RecoveryKeyFactory.newMasterkeyFileWithPassphrase` fest verdrahtet. Als Kommentar festhalten, damit die beiden Funktionen nicht später zusammengelegt werden.
+Unlike `recovery::key::reset_password` (M2), this does **not** read the `vault.cryptomator` to learn the file name: in a restore it may be missing. The name is `masterkey.cryptomator` — the same one Java hardwires in `RecoveryKeyFactory.newMasterkeyFileWithPassphrase`. Record as a comment so that the two functions are not merged later.
 
 ```rust
 pub fn restore_config(access, vault_path, passphrase, cipher_combo, shortening_threshold, rng)
@@ -3338,9 +3338,9 @@ pub fn restore_config(access, vault_path, passphrase, cipher_combo, shortening_t
 
 fn write_config_via_recovery_dir(vault_path, masterkey, combo, threshold, rng) -> Result<VaultConfig> {
     let dir = RecoveryDirectory::create(vault_path)?;
-    // `initialize` legt Config, Wurzelverzeichnis und dessen dirid.c9r an -- Javas
-    // CryptoFsInitializer.init. Uebernommen wird nur die Config; das Wurzelverzeichnis im
-    // Temp-Verzeichnis ist Abfall, das echte steht schon im Vault.
+    // `initialize` creates the config, the root directory and its dirid.c9r -- Java's
+    // CryptoFsInitializer.init. Only the config is taken over; the root directory in the
+    // temp directory is waste, the real one is already in the vault.
     let config = crate::vault::init::initialize(
         dir.path(), masterkey, combo, threshold, DEFAULT_KEY_ID, rng)?;
     let target = vault_path.join(VAULTCONFIG_FILENAME);
@@ -3354,8 +3354,8 @@ pub fn restore_all(encoder, access, vault_path, recovery_key, new_passphrase, ci
 {
     let raw = decode_recovery_key(encoder, recovery_key)?;
     let masterkey = Masterkey::from_raw(*raw);
-    // Die Erkennung braucht den Schluessel, aber noch keine geschriebene Datei -- deshalb hier,
-    // bevor irgendetwas den Vault beruehrt (Test `an_empty_vault_cannot_have_its_combo_detected`).
+    // Detection needs the key but not yet a written file -- hence here,
+    // before anything touches the vault (test `an_empty_vault_cannot_have_its_combo_detected`).
     let combo = match cipher_combo {
         Some(c) => c,
         None => detect_cipher_combo(&masterkey, vault_path)
@@ -3374,9 +3374,9 @@ pub fn restore_all(encoder, access, vault_path, recovery_key, new_passphrase, ci
     Ok(config)
 }
 ```
-`initialize` verlangt ein Verzeichnis und legt `d/<roothash>/dirid.c9r` an; das Temp-Verzeichnis erfüllt beides. Beide Dateien werden erst **nach** dem vollständigen Schreiben verschoben – das ist der Sinn der `RecoveryDirectory`, und der Test `a_failed_restore_leaves_the_vault_untouched` prüft genau das.
+`initialize` requires a directory and creates `d/<roothash>/dirid.c9r`; the temp directory satisfies both. Both files are moved only **after** they have been written completely – that is the point of the `RecoveryDirectory`, and the test `a_failed_restore_leaves_the_vault_untouched` checks exactly that.
 
-- [ ] **Step 5: Das Kommando**
+- [ ] **Step 5: The command**
 
 `cli.rs`: `RecoveryKeyCommand::Restore(RestoreArgs)`.
 `main.rs`: `RecoveryKeyCommand::Restore(args) => commands::recovery::restore(&ctx, args),`.
@@ -3384,12 +3384,12 @@ pub fn restore_all(encoder, access, vault_path, recovery_key, new_passphrase, ci
 `commands/recovery.rs`:
 ```rust
 pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
-    // Nicht `locked_vault`: ein Vault, dem die Config fehlt, ist VAULT_CONFIG_MISSING oder
-    // ALL_MISSING -- genau der Zustand, den dieses Kommando beheben soll.
+    // Not `locked_vault`: a vault whose config is missing is VAULT_CONFIG_MISSING or
+    // ALL_MISSING -- exactly the state this command is meant to fix.
     let (vault, path) = restorable_vault(ctx, &args.vault)?;
     let combo = match args.cipher_combo.as_str() {
         "auto" => None,
-        other => Some(other.parse::<CipherCombo>()?),       // wie `vault create --cipher-combo`
+        other => Some(other.parse::<CipherCombo>()?),       // like `vault create --cipher-combo`
     };
     let mut io = SystemIo;
     if args.config {
@@ -3409,7 +3409,7 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
                 message: "a recovery key is required; pass --recovery-key-stdin or \
                           --recovery-key-file".into() }.into());
         }
-        let recovery_key = read_recovery_key_from(&args, &mut io)?;   // wie reset_password_cmd
+        let recovery_key = read_recovery_key_from(&args, &mut io)?;   // like reset_password_cmd
         let new = read_new_passphrase(&PasswordArgs::from(&args.new_password),
             "New password: ", min_password_length(), &mut io)?;
         if args.masterkey {
@@ -3426,15 +3426,15 @@ pub fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<u8> {
     Ok(exit::OK)
 }
 ```
-`read_recovery_key_from` ist die vorhandene `read_recovery_key` aus `commands/recovery.rs`, deren Parameter von `&ResetPasswordArgs` auf zwei `Option`s umgestellt wird (`recovery_key_file: Option<&Path>`, `recovery_key_stdin: bool`), damit beide Kommandos sie teilen — der Rumpf bleibt unverändert.
+`read_recovery_key_from` is the existing `read_recovery_key` from `commands/recovery.rs`, whose parameter is changed from `&ResetPasswordArgs` to two `Option`s (`recovery_key_file: Option<&Path>`, `recovery_key_stdin: bool`), so that both commands share it — the body stays unchanged.
 
-`restorable_vault` steht in `commands/mod.rs` direkt neben `migratable_vault` und lässt `Locked`, `VaultConfigMissing` und `AllMissing` zu; `NeedsMigration` und `Missing` sind Exit 5 (bei `NeedsMigration` mit dem Hinweis auf `crypto migrate`).
+`restorable_vault` sits in `commands/mod.rs` right next to `migratable_vault` and permits `Locked`, `VaultConfigMissing` and `AllMissing`; `NeedsMigration` and `Missing` are exit 5 (for `NeedsMigration` with the pointer to `crypto migrate`).
 
-Ausgabe (JSON): `{ "path": "…", "restored": ["masterkey.cryptomator","vault.cryptomator"], "cipherCombo": "SIV_GCM", "shorteningThreshold": 220 }`; Menschenform `restored masterkey.cryptomator and vault.cryptomator in /vaults/v (SIV_GCM, shortening threshold 220)`.
+Output (JSON): `{ "path": "…", "restored": ["masterkey.cryptomator","vault.cryptomator"], "cipherCombo": "SIV_GCM", "shorteningThreshold": 220 }`; human-readable form `restored masterkey.cryptomator and vault.cryptomator in /vaults/v (SIV_GCM, shortening threshold 220)`.
 
-- [ ] **Step 6: CLI-Tests**
+- [ ] **Step 6: CLI tests**
 
-In `crates/crypto/tests/cli.rs` (neuer Abschnitt am Ende):
+In `crates/crypto/tests/cli.rs` (new section at the end):
 
 ```rust
 #[test]
@@ -3475,7 +3475,7 @@ fn recovery_key_restore_all_takes_the_key_from_stdin() {
     }
     fx.crypto(&["recovery-key", "restore", "siv_ctrmac_basic", "--all", "--recovery-key-stdin"])
         .write_stdin(key)
-        .env("CRYPTO_NEW_PASSWORD", "brand-new-pass")     // Name laut NewPasswordArgs pruefen!
+        .env("CRYPTO_NEW_PASSWORD", "brand-new-pass")     // check the name against NewPasswordArgs!
         .assert()
         .success();
     fx.crypto(&["fs", "cat", "siv_ctrmac_basic", "/hello.txt"])
@@ -3503,12 +3503,12 @@ fn restore_needs_exactly_one_of_masterkey_config_all() {
 }
 ```
 
-Wie das neue Passwort in einem Test ohne Terminal ankommt, entscheidet `NewPasswordArgs`: der Implementierende prüft mit `sed -n '50,80p' crates/cryptomator-app/src/password.rs`, welche Flagge bzw. Umgebungsvariable dort vorgesehen ist (in `recovery-key reset-password` wird sie in `crates/crypto/tests/cli.rs` schon benutzt – die Aufrufform von dort wörtlich übernehmen), und passt den Test entsprechend an, statt eine neue zu erfinden.
+How the new password reaches a test without a terminal is decided by `NewPasswordArgs`: the implementer checks with `sed -n '50,80p' crates/cryptomator-app/src/password.rs` which flag or environment variable is provided there (it is already used in `recovery-key reset-password` in `crates/crypto/tests/cli.rs` – take the call form from there verbatim) and adapts the test accordingly instead of inventing a new one.
 
-- [ ] **Step 7: Tests, Gate, Commit**
+- [ ] **Step 7: Tests, gate, commit**
 
 Run: `cargo test -p cryptomator-core --test vault_lifecycle --locked && cargo test -p crypto --test cli --locked restore`
-Expected: alle grün.
+Expected: all green.
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 
@@ -3521,21 +3521,21 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 14: Nachträge, Dokumentation, CI und Meilensteinabschluss
+### Task 14: Addenda, documentation, CI and milestone wrap-up
 
 **Files:**
 - Modify: `crates/crypto/tests/cli_daemon.rs`, `crates/crypto/src/output.rs`, `crates/crypto/tests/java_interop.rs`, `.github/workflows/ci.yml`, `README.md`, `CHANGELOG.md`, `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`
 
 **Interfaces:**
-- Consumes: alles aus den Tasks 1–13. Neuer Produktionscode entsteht nur in Step 2 (`output.rs` zieht auf `health::report::civil_utc` um).
+- Consumes: everything from Tasks 1–13. New production code arises only in Step 2 (`output.rs` moves over to `health::report::civil_utc`).
 
-- [ ] **Step 1: Nachtrag – der detachte Daemon schreibt sein Log**
+- [ ] **Step 1: Addendum – the detached daemon writes its log**
 
-`crates/crypto/tests/cli_daemon.rs` prüft den Loginhalt bisher nur für `--foreground` (Zeilen 273–281). Der detachte Pfad ist der Normalfall und ungeprüft. In `unlock_mounts_the_vault_and_lock_takes_it_down` nach dem `lock` ergänzen:
+`crates/crypto/tests/cli_daemon.rs` so far checks the log content only for `--foreground` (lines 273–281). The detached path is the normal case and unchecked. In `unlock_mounts_the_vault_and_lock_takes_it_down`, add after the `lock`:
 
 ```rust
-    // Der detachte Daemon schreibt in dieselbe Datei wie der Vordergrund-Daemon; sie bleibt nach
-    // dem Lock liegen, damit man einen fehlgeschlagenen Mount noch nachlesen kann.
+    // The detached daemon writes into the same file as the foreground daemon; it stays around
+    // after the lock, so that a failed mount can still be read up on.
     let log = std::fs::read_to_string(fx.state_file(".log")).expect("the detached daemon log");
     assert!(log.contains("INFO"), "the daemon installed its logger: {log:?}");
     assert!(log.contains("mounted at"), "the mount is in the log: {log:?}");
@@ -3543,12 +3543,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
     assert!(!log.contains("test-password"), "no passphrase ever reaches the log");
 ```
 
-Run: `cargo test -p crypto --test cli_daemon --locked unlock_mounts` (mit `CRYPTO_ENABLE_NULL_MOUNTER=1`, das `Sandbox::crypto_daemon` selbst setzt).
-Expected: PASS. Schlägt eine der drei Zeichenketten fehl, ist der tatsächliche Wortlaut aus dem Log zu übernehmen (die Meldungen stehen in `crates/cryptomator-app/src/daemon/server.rs`) – die Zusicherung wird angepasst, nicht der Daemon.
+Run: `cargo test -p crypto --test cli_daemon --locked unlock_mounts` (with `CRYPTO_ENABLE_NULL_MOUNTER=1`, which `Sandbox::crypto_daemon` sets itself).
+Expected: PASS. If one of the three strings fails, the actual wording from the log is to be adopted (the messages are in `crates/cryptomator-app/src/daemon/server.rs`) – the assertion is adapted, not the daemon.
 
-- [ ] **Step 2: Nachtrag – den doppelten Kalenderalgorithmus auflösen**
+- [ ] **Step 2: Addendum – resolve the duplicated calendar algorithm**
 
-`crates/crypto/src/output.rs::format_timestamp` und `cryptomator_core::health::report::civil_utc` (Task 7) rechnen dasselbe. `format_timestamp` wird auf den Core-Helfer umgestellt:
+`crates/crypto/src/output.rs::format_timestamp` and `cryptomator_core::health::report::civil_utc` (Task 7) compute the same thing. `format_timestamp` is switched over to the core helper:
 
 ```rust
 /// `YYYY-MM-DD HH:MM:SS` in UTC.
@@ -3557,11 +3557,11 @@ pub fn format_timestamp(time: SystemTime) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
 }
 ```
-Die vorhandenen Tests in `output.rs` bleiben unverändert und belegen, dass sich nichts am Ergebnis ändert.
+The existing tests in `output.rs` stay unchanged and prove that nothing about the result changes.
 
-- [ ] **Step 3: Nachtrag – README-Absatz neu umbrechen**
+- [ ] **Step 3: Addendum – re-wrap the README paragraph**
 
-`README.md` Zeilen 474–478 sind mitten im Satz umgebrochen (Zeile 477 ist 51 Zeichen lang und endet auf „and the flags are mutually"). Der Absatz wird auf ~100 Spalten neu gesetzt:
+`README.md` lines 474–478 are broken mid-sentence (line 477 is 51 characters long and ends with "and the flags are mutually"). The paragraph is re-set to ~100 columns:
 
 ```markdown
 `$CRYPTO_PASSWORD` deliberately outranks the implicit keychain step: it is a source a script sets on
@@ -3571,14 +3571,14 @@ from the list for one run and turns step 0 into exit `8` (there is no keychain t
 any other `--password-*` flag is a usage error.
 ```
 
-- [ ] **Step 4: Java-Interop für die migrierten Legacy-Vaults**
+- [ ] **Step 4: Java interop for the migrated legacy vaults**
 
-`crates/crypto/tests/java_interop.rs` bekommt einen Test, der die Kette schließt: Rust migriert, Java liest.
+`crates/crypto/tests/java_interop.rs` gets a test that closes the loop: Rust migrates, Java reads.
 
 ```rust
-/// Legacy-Vaults, die `crypto migrate` auf Format 8 gehoben hat, muessen sich mit dem echten
-/// cryptofs oeffnen lassen. Das ist der einzige Beleg dafuer, dass unsere Migratoren nicht nur
-/// unsere eigenen Leser zufriedenstellen.
+/// Legacy vaults that `crypto migrate` has lifted to format 8 must be openable with the real
+/// cryptofs. That is the only proof that our migrators satisfy more than
+/// just our own readers.
 #[test]
 #[ignore = "needs Java 21+ and Maven"]
 fn java_reads_vaults_migrated_from_legacy_formats() {
@@ -3595,37 +3595,37 @@ fn java_reads_vaults_migrated_from_legacy_formats() {
         cryptomator_core::migration::Migrators::migrate(
             &vault, &pass, true, &mut |_| {}, &mut cryptomator_core::OsRng).unwrap();
 
-        verify_with_java(&vault, &final_pass);      // vorhandener Helfer, prueft Exit 0 + Manifest
+        verify_with_java(&vault, &final_pass);      // existing helper, checks exit 0 + manifest
     }
 }
 ```
-Der Helfer `verify_with_java` existiert in dieser Datei bereits (er ruft `run_java_verify` und wertet Exit-Code und JSON-Ausgabe aus); seine genaue Signatur ist mit `grep -n "fn verify_with_java" -A 20 crates/crypto/tests/java_interop.rs` zu prüfen.
+The helper `verify_with_java` already exists in this file (it calls `run_java_verify` and evaluates the exit code and the JSON output); its exact signature is to be checked with `grep -n "fn verify_with_java" -A 20 crates/crypto/tests/java_interop.rs`.
 
-`crypto` braucht dafür `cryptomator-core` als Dev-Dependency – das ist schon so (die Datei benutzt `cryptomator_core::open_vault`).
+`crypto` needs `cryptomator-core` as a dev dependency for that – it already has it (the file uses `cryptomator_core::open_vault`).
 
 - [ ] **Step 5: CI**
 
-`.github/workflows/ci.yml`, Job `interop-java`: nichts hinzuzufügen außer einem Vorbau-Schritt, damit die drei Legacy-Artefakte einmal geladen werden und der Reaktor kompiliert, bevor die Tests laufen:
+`.github/workflows/ci.yml`, job `interop-java`: nothing to add except a pre-build step, so that the three legacy artifacts are fetched once and the reactor compiles before the tests run:
 
 ```yaml
       - name: prime the fixture-gen reactor (downloads legacy cryptofs)
         run: mvn -q -B -f tools/fixture-gen/pom.xml compile
       - run: cargo test -p crypto --test java_interop --locked -- --ignored
 ```
-`-B` (batch mode) unterdrückt die Fortschrittsbalken im Log. Der `cache: maven` der `setup-java`-Action ist schon gesetzt, die Artefakte werden also nur einmal geladen.
+`-B` (batch mode) suppresses the progress bars in the log. The `cache: maven` of the `setup-java` action is already set, so the artifacts are downloaded only once.
 
-Ein neuer Job ist **nicht** nötig: die Health- und Migrationstests laufen in `cargo test --workspace` mit, weil sie keine Java-Seite brauchen.
+A new job is **not** necessary: the health and migration tests run along in `cargo test --workspace`, because they need no Java side.
 
-- [ ] **Step 6: README – drei neue Abschnitte**
+- [ ] **Step 6: README – three new sections**
 
-Kommandotabelle (um Zeile 55) ergänzen:
+Extend the command table (around line 55):
 ```markdown
 | `health` | Checks a vault for structural damage, optionally repairs it | `crypto health Secret --fix` |
 | `migrate` | Brings a vault of format 5, 6 or 7 up to format 8 | `crypto migrate Old --yes` |
 | `recovery-key restore` | Rebuilds a lost masterkey file and/or vault config | `crypto recovery-key restore V --all --recovery-key-stdin` |
 ```
 
-Neuer Abschnitt `## Health checks` (nach „Mount-less access", vor „Password sources"):
+New section `## Health checks` (after "Mount-less access", before "Password sources"):
 
 ```markdown
 ## Health checks
@@ -3668,7 +3668,7 @@ The vault must be locked. `--json` prints one object with `findings` (or `before
 `--fix`), each carrying `check`, `severity`, `message`, `paths`, `fixable` and `fixed`.
 ```
 
-Neuer Abschnitt `## Migrating older vaults`:
+New section `## Migrating older vaults`:
 
 ```markdown
 ## Migrating older vaults
@@ -3698,7 +3698,7 @@ If the vault's password is stored in the keychain, the 5 → 6 step updates the 
 normalised form, so unlocking keeps working.
 ```
 
-Neuer Abschnitt `### Restoring a lost masterkey or vault config` unter „Recovery keys" (bzw. hinter dem `recovery-key validate`-Abschnitt):
+New section `### Restoring a lost masterkey or vault config` under "Recovery keys" (or after the `recovery-key validate` section):
 
 ```markdown
 ### `crypto recovery-key restore`
@@ -3726,37 +3726,37 @@ complete, so a restore that fails leaves the vault exactly as it was. An existin
 before it is replaced.
 ```
 
-Exit-Code-Tabelle: die Zeile für `11` ersetzt den Satz darunter.
+Exit code table: the row for `11` replaces the sentence below it.
 ```markdown
 | `11` | `crypto health` found at least one finding of the severity given by `--fail-on` (default `CRITICAL`) |
 ```
-Der Absatz „`11` (health findings) is reserved for M7 and is never returned today." wird **gelöscht**. In der Zeile für `5` wird „needs migration" um „(run `crypto migrate`)" ergänzt.
+The paragraph "`11` (health findings) is reserved for M7 and is never returned today." is **deleted**. In the row for `5`, "needs migration" is extended by "(run `crypto migrate`)".
 
-Abschnitt „Test fixtures": „eight reference vaults" → „twelve reference vaults" mit einem Satz zu `broken_health` und `legacy_v{5,6,7}` und den vier Generatorkommandos aus Task 2, Step 5.
+Section "Test fixtures": "eight reference vaults" → "twelve reference vaults" with a sentence about `broken_health` and `legacy_v{5,6,7}` and the four generator commands from Task 2, Step 5.
 
 - [ ] **Step 7: CHANGELOG**
 
-Neuer Abschnitt `### M7 – Health checks, restore and migration` nach `### M6 – Keychain`, gegliedert wie die vorherigen (Aufzählung der Lieferungen, `#### Decisions taken along the way` mit den elf Rulings dieses Plans, `#### Known limitations and follow-ups`). Die Limitierungen, die nachweislich bestehen:
+New section `### M7 – Health checks, restore and migration` after `### M6 – Keychain`, structured like the previous ones (list of deliverables, `#### Decisions taken along the way` with the eleven rulings of this plan, `#### Known limitations and follow-ups`). The limitations that demonstrably exist:
 
-- `INFO`-Befunde (`MissingDirIdBackup`, `LooseDirFile`) haben Fixes, aber `--fix-severity` kennt nur `WARN` und `CRITICAL` — sie lassen sich mit `crypto` nicht anwenden (Ruling 3).
-- Der Report-Zeitstempel ist UTC, nicht die Systemzeitzone (keine Zeitzonendatenbank ohne neue Abhängigkeit, Ruling 5).
-- `crypto health` läuft einfädig; Javas `ExecutorService`-Streaming gibt es nicht. Für sehr große Vaults heißt das: keine Zwischenausgabe, kein Abbrechen mitten im Lauf.
-- Die Migration ist an keinem echten Alt-Vault erprobt worden, nur an den erzeugten Fixtures; insbesondere ist der Zweig „Speicher unterstützt weniger als 220 Zeichen" (Javas `REQUIRES_FULL_VAULT_DIR_SCAN`) nie unter echten Bedingungen gelaufen — auf APFS und ext4 greift er nicht.
-- `FilePathMigration::parse` sucht das kanonische Namensmuster ab Position 0 statt wie Javas `find()` an jeder Position (Task 11, Step 3).
-- Alles aus M4/M5/M6, was dort offen blieb: macFUSE unverifiziert, `LinuxGioMounter` unverifiziert, ein von Cryptomator.app geschriebener Keychain-Eintrag ungeprüft, das Internet-Password vor dem AppleScript-Mount fehlt (→ M8).
+- `INFO` findings (`MissingDirIdBackup`, `LooseDirFile`) have fixes, but `--fix-severity` knows only `WARN` and `CRITICAL` — they cannot be applied with `crypto` (Ruling 3).
+- The report timestamp is UTC, not the system time zone (no time zone database without a new dependency, Ruling 5).
+- `crypto health` runs single-threaded; Java's `ExecutorService` streaming does not exist. For very large vaults that means: no intermediate output, no cancelling mid-run.
+- The migration has not been tried on a real old vault, only on the generated fixtures; in particular the branch "storage supports fewer than 220 characters" (Java's `REQUIRES_FULL_VAULT_DIR_SCAN`) has never run under real conditions — on APFS and ext4 it does not trigger.
+- `FilePathMigration::parse` looks for the canonical name pattern from position 0 instead of at every position like Java's `find()` (Task 11, Step 3).
+- Everything from M4/M5/M6 that stayed open there: macFUSE unverified, `LinuxGioMounter` unverified, a keychain entry written by Cryptomator.app unchecked, the internet password before the AppleScript mount missing (→ M8).
 
 - [ ] **Step 8: Spec**
 
 In `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`:
-- Meilensteintabelle: die M7-Zeile bekommt `✅` und eine Fußnote `[^m7-scope]`.
-- Neue Fußnote am Ende der Fußnotenliste, im Stil von `[^m6-scope]`: was geliefert wurde, die elf Rulings in Kurzform, was bewusst nicht umgesetzt wurde (die `INFO`-Fixes, das Streaming, Javas `find()`-Semantik) und was offen bleibt (M8).
-- Teststrategie Punkt 1: `gen-legacy-v7/v6/v5` sind da; ergänzen, dass 1.6.2 Format **6** schreibt und der v5-Vault durch Umstempeln der Masterkey-Datei entsteht, und dass die Legacy-Artefakte **nicht** in `~/.m2` liegen (Befund 8 präzisieren: „auf Maven Central verfügbar, lokal nicht vorhanden – der erste Generatorlauf braucht Netz").
-- Befund 9 („Lokale Umgebung"): unverändert.
-- Risiko 8 („Migration 6→7 ist der größte Einzelposten"): als erledigt markieren, mit einem Satz zum Ergebnis.
+- Milestone table: the M7 row gets `✅` and a footnote `[^m7-scope]`.
+- New footnote at the end of the footnote list, in the style of `[^m6-scope]`: what was delivered, the eleven rulings in short form, what was deliberately not implemented (the `INFO` fixes, the streaming, Java's `find()` semantics) and what stays open (M8).
+- Test strategy point 1: `gen-legacy-v7/v6/v5` are there; add that 1.6.2 writes format **6** and that the v5 vault comes about by stamping the masterkey file over, and that the legacy artifacts are **not** in `~/.m2` (make finding 8 more precise: "available on Maven Central, not present locally – the first generator run needs network").
+- Finding 9 ("Local environment"): unchanged.
+- Risk 8 ("migration 6→7 is the single biggest item"): mark as done, with one sentence about the outcome.
 
-- [ ] **Step 9: Manueller Abnahmelauf**
+- [ ] **Step 9: Manual acceptance run**
 
-Gegen eine echte Kopie, nicht gegen ein Fixture, damit die Kommandos einmal so laufen wie beim Nutzer:
+Against a real copy, not against a fixture, so that the commands run once the way they do for the user:
 
 ```bash
 cd $(mktemp -d)
@@ -3770,13 +3770,13 @@ CRYPTO_SETTINGS_PATH=$PWD/settings.json CRYPTO_PASSWORD=test-password-123 \
     cargo run -q -p crypto -- health Alt
 ls healthReport_Alt_*.log && head -8 healthReport_Alt_*.log
 ```
-Erwartet: `--dry-run` listet Umbenennungen und ändert nichts, `migrate --yes` meldet `6->7, 7->8`, `health` endet mit 0 und schreibt einen Report, dessen Kopf die drei Sternchenzeilen hat. **Im Report festhalten**, was tatsächlich ausgegeben wurde – das ist der einzige Beleg dafür, dass die drei Kommandos zusammen funktionieren.
+Expected: `--dry-run` lists renames and changes nothing, `migrate --yes` reports `6->7, 7->8`, `health` ends with 0 and writes a report whose head has the three asterisk lines. **Record in the report** what was actually printed – that is the only proof that the three commands work together.
 
-- [ ] **Step 10: Gate und Commit**
+- [ ] **Step 10: Gate and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Run: `cargo test -p crypto --test java_interop --locked -- --ignored` (braucht Java und Maven)
-Expected: beides grün; die Java-Läufe belegen, dass cryptofs 2.10.0 alle drei migrierten Vaults öffnet.
+Run: `cargo test -p crypto --test java_interop --locked -- --ignored` (needs Java and Maven)
+Expected: both green; the Java runs prove that cryptofs 2.10.0 opens all three migrated vaults.
 
 ```bash
 git add README.md CHANGELOG.md docs .github crates
@@ -3787,122 +3787,122 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Selbstprüfung
+## Self-check
 
-**1. Spec-Abdeckung M7.** Jede Zusage der Spec zu diesem Meilenstein hat einen Task:
+**1. Spec coverage for M7.** Every commitment the spec makes for this milestone has a task:
 
-| Spec-Stelle | Task |
+| Spec location | Task |
 |---|---|
 | `health/mod.rs`: Trait `HealthCheck`, `DiagnosticResult{severity, details, fix}` | 3 |
-| `health/dir_id.rs`: DirIdCheck, **8 Ergebnistypen**, Fixes | 4 (7 Typen + 3 Fixes), 5 (der 8. Fix) |
-| `health/dir_id.rs`: „Fixes inkl. LOST+FOUND-Adoption" | 5 |
+| `health/dir_id.rs`: DirIdCheck, **8 result types**, fixes | 4 (7 types + 3 fixes), 5 (the 8th fix) |
+| `health/dir_id.rs`: "fixes incl. LOST+FOUND adoption" | 5 |
 | `health/file_type.rs`: CiphertextFileTypeCheck | 6 |
-| `health/shortened.rs`: ShortenedNamesCheck, **6 Typen**, Fixes | 6 |
-| `health/report.rs`: „Report-Format wie `ReportWriter`" | 7 |
-| Grammatik `crypto health <VAULT> [--check …] [--report FILE\|--no-report] [--fail-on …]` | 8 |
-| Grammatik `crypto health … [--fix] [--fix-severity WARN\|CRITICAL]` | 9 |
-| Exit-Code **11** „Health-Befunde ≥ `--fail-on`" | 8 (Konstante + Auslöser), 14 (README) |
-| `migration/mod.rs`: Versionserkennung, `needs_migration`, `migrate(path, passphrase, progress)` | 10 |
-| `migration/v6.rs`: „5→6 (NFC-Passphrase, `unicode-normalization`)" | 10 |
-| `migration/v7.rs`: „Capability-Check, PreMigrationVisitor, `FilePathMigration` base32→base64url, `0`/`1S`-Präfixe, `.lng` aus `m/xx/yy/`, bis 3 `_n`-Versuche, `m/` löschen" | 11 |
-| `migration/v8.rs`: „JWT mit `SIV_CTRMAC`, Threshold 220, version 999" | 10 |
-| Grammatik `crypto migrate <VAULT> [--yes]` + Ruling `--dry-run` | 12 |
-| Exit-Code **5** „braucht Migration" | 12 (Step 5: Hinweistext an `locked_vault`) |
-| `recovery/restore.rs`: „`detect_scheme` (erster regulärer `.c9r`, beide Header-Varianten probieren), Restore masterkey/config/all über Temp-`RecoveryDirectory`" | 13 |
-| Grammatik `crypto recovery-key restore <VAULT> (--masterkey\|--config\|--all) [--cipher-combo …] [--shortening-threshold N]` | 13 |
-| Teststrategie 1: `gen-legacy-v7/v6/v5` (cryptofs 1.9.15/1.8.9/1.6.2), „`.lng`-Namen und NFD-Umlaut-Passphrase", „je < 200 KB" | 2 |
-| Teststrategie 1: `verify`-Harness auf migrierten Vaults | 14 (Step 4) |
-| Teststrategie 2: `migration.rs` | 10, 11 |
-| M7-Zeile „beschädigte Fixtures (Harness erzeugt: Orphan-Dir, fehlende dirid, Trailing Bytes …)" | 1 |
-| M7-Zeile „Legacy-Fixtures migrieren und in Java verifizieren" | 11 (Rust-Seite), 14 (Java-Seite) |
-| Befund 8 „Legacy-cryptofs auf Maven Central" | 2 (verifiziert: 1.9.15/1.8.9/1.6.2 antworten mit HTTP 200, liegen aber **nicht** in `~/.m2`) |
-| Verifikation „`crypto health` gegen absichtlich beschädigte Fixtures inkl. `--fix`; `crypto migrate` gegen Legacy-Fixtures" | 9, 12, 14 (Step 9) |
-| Fußnote `[^m6-scope]`: „Offen bleiben M7 … und M8" | 14 (Fußnote `[^m7-scope]`) |
-| Carry-over: Log des detachten Daemons prüfen | 14 (Step 1) |
-| Carry-over: README-Zeile ~475 neu umbrechen | 14 (Step 3) |
+| `health/shortened.rs`: ShortenedNamesCheck, **6 types**, fixes | 6 |
+| `health/report.rs`: "report format like `ReportWriter`" | 7 |
+| Grammar `crypto health <VAULT> [--check …] [--report FILE\|--no-report] [--fail-on …]` | 8 |
+| Grammar `crypto health … [--fix] [--fix-severity WARN\|CRITICAL]` | 9 |
+| Exit code **11** "health findings ≥ `--fail-on`" | 8 (constant + trigger), 14 (README) |
+| `migration/mod.rs`: version detection, `needs_migration`, `migrate(path, passphrase, progress)` | 10 |
+| `migration/v6.rs`: "5→6 (NFC passphrase, `unicode-normalization`)" | 10 |
+| `migration/v7.rs`: "capability check, PreMigrationVisitor, `FilePathMigration` base32→base64url, `0`/`1S` prefixes, `.lng` from `m/xx/yy/`, up to 3 `_n` attempts, delete `m/`" | 11 |
+| `migration/v8.rs`: "JWT with `SIV_CTRMAC`, threshold 220, version 999" | 10 |
+| Grammar `crypto migrate <VAULT> [--yes]` + Ruling `--dry-run` | 12 |
+| Exit code **5** "needs migration" | 12 (Step 5: hint text on `locked_vault`) |
+| `recovery/restore.rs`: "`detect_scheme` (first regular `.c9r`, try both header variants), restore masterkey/config/all via a temp `RecoveryDirectory`" | 13 |
+| Grammar `crypto recovery-key restore <VAULT> (--masterkey\|--config\|--all) [--cipher-combo …] [--shortening-threshold N]` | 13 |
+| Test strategy 1: `gen-legacy-v7/v6/v5` (cryptofs 1.9.15/1.8.9/1.6.2), "`.lng` names and an NFD umlaut passphrase", "< 200 KB each" | 2 |
+| Test strategy 1: `verify` harness on migrated vaults | 14 (Step 4) |
+| Test strategy 2: `migration.rs` | 10, 11 |
+| M7 row "damaged fixtures (harness-generated: orphan dir, missing dirid, trailing bytes …)" | 1 |
+| M7 row "migrate legacy fixtures and verify them in Java" | 11 (Rust side), 14 (Java side) |
+| Finding 8 "legacy cryptofs on Maven Central" | 2 (verified: 1.9.15/1.8.9/1.6.2 answer with HTTP 200, but are **not** in `~/.m2`) |
+| Verification "`crypto health` against intentionally damaged fixtures incl. `--fix`; `crypto migrate` against legacy fixtures" | 9, 12, 14 (Step 9) |
+| Footnote `[^m6-scope]`: "M7 … and M8 stay open" | 14 (footnote `[^m7-scope]`) |
+| Carry-over: check the detached daemon's log | 14 (Step 1) |
+| Carry-over: re-wrap README line ~475 | 14 (Step 3) |
 
-Nicht in M7 (Spec ordnet zu): Packaging, Manpages, Completions, `xtask`, die vollständige CI-Matrix und das Internet-Password vor dem AppleScript-Mount → **M8**. Windows ist nicht im Scope.
+Not in M7 (the spec assigns them elsewhere): packaging, man pages, completions, `xtask`, the full CI matrix and the internet password before the AppleScript mount → **M8**. Windows is not in scope.
 
-**Zwei Spec-Formulierungen, die dieser Plan bewusst anders auslegt.** Erstens nennt die Modultabelle für `recovery/restore.rs` ein `detect_scheme`; die Funktion heißt hier `detect_cipher_combo`, weil der Rust-Typ `CipherCombo` heißt und `Scheme` im Workspace nirgends vorkommt. Zweitens sagt die Modultabelle zu `health/mod.rs` `DiagnosticResult{severity, details, fix}`; die Controller-Vorgabe für diesen Meilenstein lautet `{severity, check, message, paths, fix}`, und die gilt — Javas `details()`-Map ist in `paths` und `message` aufgegangen, weil ihre Werte ausschließlich Pfade, Größen und Typen sind, die beide Felder schon tragen.
+**Two spec formulations this plan deliberately reads differently.** First, the module table names a `detect_scheme` for `recovery/restore.rs`; the function is called `detect_cipher_combo` here, because the Rust type is called `CipherCombo` and `Scheme` occurs nowhere in the workspace. Second, the module table says `DiagnosticResult{severity, details, fix}` for `health/mod.rs`; the controller specification for this milestone reads `{severity, check, message, paths, fix}`, and that is the one that applies — Java's `details()` map has been absorbed into `paths` and `message`, because its values are exclusively paths, sizes and types, which both fields already carry.
 
-**2. Platzhalter-Scan.** Kein „TBD", kein „implement later", kein „siehe Task N" ohne den Inhalt zu wiederholen. Vier Stellen enthalten bewusst keinen fertigen Rumpf, und jede sagt genau, was dort steht und wer sie ersetzt:
+**2. Placeholder scan.** No "TBD", no "implement later", no "see Task N" without repeating the content. Four places deliberately contain no finished body, and each says exactly what stands there and who replaces it:
 
-- Task 3, Step 3: `struct Placeholder` in `all_checks()` — Task 4 ersetzt die erste, Task 6 die beiden anderen Zeilen und löscht den Typ.
-- Task 8, Step 5: der `--fix`-Ablehnungsblock mit dem Marker `not implemented yet`, den Task 9, Step 3 per `grep` findet und ersetzt.
-- Task 10, Step 6: der `SixToSeven`-Zweig, der bis Task 11 `MigrationBlocked` liefert.
-- Task 2, Step 3: der absichtlich als Sackgasse ausgeschriebene Java-Versuch, den `versionMac` zu berechnen — er steht da, damit ihn niemand ein zweites Mal geht; der gangbare Weg ist Step 4.
+- Task 3, Step 3: `struct Placeholder` in `all_checks()` — Task 4 replaces the first line, Task 6 the other two, and deletes the type.
+- Task 8, Step 5: the `--fix` rejection block with the marker `not implemented yet`, which Task 9, Step 3 finds and replaces via `grep`.
+- Task 10, Step 6: the `SixToSeven` branch, which returns `MigrationBlocked` until Task 11.
+- Task 2, Step 3: the Java attempt at computing the `versionMac`, deliberately written out as a dead end — it is there so that nobody walks it a second time; the viable route is Step 4.
 
-Dazu sechs Stellen, an denen der Ausführende **nachsieht statt zu raten**, jeweils mit dem Prüfbefehl:
-- Task 5, Step 1 und Task 11, Step 6: die M3-Namen `CryptoFs::open`, `CryptoFsOptions`, `CleartextPath::parse`, `CryptoFs::metadata`, `DirEntry::name` — `grep -n "CryptoFs::\|CleartextPath::" crates/cryptomator-core/tests/crypto_fs_fixtures.rs`.
-- Task 6, Step 3: die Deklarationsreihenfolge von `CiphertextFileType` — `grep -n "enum CiphertextFileType" -A 6 crates/cryptomator-core/src/fs/ciphertext_path.rs`.
-- Task 8, Step 1: ob `Sandbox::add_fixture` den Vault-Pfad zurückgibt — `sed -n '160,190p' crates/crypto/tests/common/mod.rs`. **Zusätzlich zu prüfen:** ob `add_fixture` einen Legacy-Vault ohne `vault.cryptomator` überhaupt registriert (`vault add` geht über `assert_is_vault_directory`, das `DirStructure::MaybeLegacy` akzeptiert — es sollte also gehen). Tut es das nicht, registrieren die Tests in Task 12 den Vault stattdessen mit `crypto vault add <pfad>` und lösen ihn über den Pfad auf.
-- Task 10, Step 5: der Variantenname `CipherCombo::SivCtrMac` — `grep -n "enum CipherCombo" -A 6 crates/cryptomator-core/src/crypto/cryptor.rs`.
-- Task 12, Step 1: die Feldnamen von `Sandbox::fake_keychain_json` — `sed -n '150,170p' crates/crypto/tests/common/mod.rs`.
-- Task 13, Step 6: wie ein *neues* Passwort ohne Terminal in einen CLI-Test kommt — die Aufrufform aus dem vorhandenen `recovery-key reset-password`-Test in `crates/crypto/tests/cli.rs` wörtlich übernehmen.
+Plus six places where the implementer **looks it up instead of guessing**, each with the check command:
+- Task 5, Step 1 and Task 11, Step 6: the M3 names `CryptoFs::open`, `CryptoFsOptions`, `CleartextPath::parse`, `CryptoFs::metadata`, `DirEntry::name` — `grep -n "CryptoFs::\|CleartextPath::" crates/cryptomator-core/tests/crypto_fs_fixtures.rs`.
+- Task 6, Step 3: the declaration order of `CiphertextFileType` — `grep -n "enum CiphertextFileType" -A 6 crates/cryptomator-core/src/fs/ciphertext_path.rs`.
+- Task 8, Step 1: whether `Sandbox::add_fixture` returns the vault path — `sed -n '160,190p' crates/crypto/tests/common/mod.rs`. **Also to be checked:** whether `add_fixture` registers a legacy vault without a `vault.cryptomator` at all (`vault add` goes through `assert_is_vault_directory`, which accepts `DirStructure::MaybeLegacy` — so it should work). If it does not, the tests in Task 12 register the vault with `crypto vault add <path>` instead and resolve it via the path.
+- Task 10, Step 5: the variant name `CipherCombo::SivCtrMac` — `grep -n "enum CipherCombo" -A 6 crates/cryptomator-core/src/crypto/cryptor.rs`.
+- Task 12, Step 1: the field names of `Sandbox::fake_keychain_json` — `sed -n '150,170p' crates/crypto/tests/common/mod.rs`.
+- Task 13, Step 6: how a *new* password gets into a CLI test without a terminal — take the call form from the existing `recovery-key reset-password` test in `crates/crypto/tests/cli.rs` verbatim.
 
-Und zwei Zahlenkonstanten in Tests, die vor dem Committen gegenzurechnen sind, jeweils mit dem Befehl daneben: der Zeitstempel in Task 7, Step 1 (`date -u -r 1788534245 +%Y%m%d-%H%M%S`) und die BASE32/BASE64-Umrechnung in Task 11, Step 1 (`python3 -c "import base64;…"`).
+And two numeric constants in tests that are to be recomputed before committing, each with the command next to it: the timestamp in Task 7, Step 1 (`date -u -r 1788534245 +%Y%m%d-%H%M%S`) and the BASE32/BASE64 conversion in Task 11, Step 1 (`python3 -c "import base64;…"`).
 
-**3. Typkonsistenz über die Tasks hinweg.**
+**3. Type consistency across the tasks.**
 
-- `Severity`, `DiagnosticResult`, `Fix`, `HealthCheck`, `CheckContext`, `run_checks`, `checks_by_ids`, `all_checks`, `CHECK_IDS` (3) → 4, 5, 6, 7, 8, 9, 11 (der Health-Lauf am Ende der Migrationskette).
-- `CheckContext::{vault_path, cryptor, config, data_dir, resolve, relativize, rng}` (3) → jeder Check und jeder Fix in 4, 5, 6. `config.shortening_threshold` (Feld von `VaultConfig`, existiert) ist der einzige Konfigurationswert, den ein Fix braucht (Task 5).
-- `DIR_ID_CHECK_ID = "dirid"`, `TYPE_CHECK_ID = "type"`, `SHORTENED_CHECK_ID = "shortened"` (4, 6) sind identisch mit den Einträgen in `CHECK_IDS` (3) und mit dem, was `--check` annimmt (8) und was im JSON unter `check` steht (8).
-- `DIR_ID_CHECK_NAME = "Directory Check"`, `TYPE_CHECK_NAME = "Resource Type Check"`, `SHORTENED_CHECK_NAME = "Shortened Names Check"` (4, 6) sind die `name()`-Werte, die der Report in `Check %s` einsetzt (7, 8).
-- `AdoptOrphan { content_dir }` (5) wird ausschließlich in `dir_id.rs` erzeugt (5, Step 6) und nirgends sonst.
-- `render_report`, `report_file_name`, `write_report`, `civil_utc` (7) → 8 (Report schreiben), 9 (Report aus dem zweiten Lauf), 14 (`output::format_timestamp` zieht auf `civil_utc` um).
-- `exit::HEALTH_FINDINGS` (8) → 9 (derselbe Rückgabewert), 14 (README-Tabelle).
-- `MigrationStep`, `MigrationPlan`, `PlannedRename`, `Migrators::{plan, migrate, needs_migration}`, `assert_all_capabilities` (10) → 11 (`plan_renames` füllt `MigrationPlan::renames`), 12 (Kommando), 14 (Java-Interop).
-- `migration::v6::migrate(vault, passphrase, rng)`, `v8::migrate(vault, passphrase, rng)` (10) und `v7::migrate(vault, passphrase, full_scan_allowed, rng)` (11) — **v7 hat einen Parameter mehr**, weil nur dort eine Rückfrage nötig werden kann; `Migrators::migrate` reicht `full_scan_allowed` genau dorthin durch und ignoriert es für die anderen beiden.
-- `FilePathMigration::{parse, migrate, target_path, new_inflated_name, new_deflated_name}` und `plan_renames` (11) → 12 (`--dry-run` liest `MigrationPlan::renames`).
-- `migratable_vault` (12) und `restorable_vault` (13) stehen beide in `commands/mod.rs` neben `locked_vault`; alle drei geben `(VaultSettingsJson, PathBuf)` zurück und rufen `require_locked`. Sie unterscheiden sich **nur** in der Menge der zugelassenen `VaultState`-Werte: `Locked` / `Locked|NeedsMigration` / `Locked|VaultConfigMissing|AllMissing`.
-- `RecoveryDirectory::{create, path, move_recovered_file}`, `detect_cipher_combo`, `restore_masterkey`, `restore_config`, `restore_all` (13) → nur das Kommando in 13 und die Tests dort.
-- `CoreError::{MissingCapability, FileNameTooLong, MigrationBlocked}` (10) und `CoreError::CipherComboUndetectable` (13) müssen **beide** in `exit.rs::core_code` einsortiert werden; `core_code` ist absichtlich ohne `_`-Arm geschrieben, der Compiler erzwingt das also. Zuordnung: `MissingCapability` und `FileNameTooLong` → `GENERAL` (1), `MigrationBlocked` und `CipherComboUndetectable` → `WRONG_STATE` (5).
+- `Severity`, `DiagnosticResult`, `Fix`, `HealthCheck`, `CheckContext`, `run_checks`, `checks_by_ids`, `all_checks`, `CHECK_IDS` (3) → 4, 5, 6, 7, 8, 9, 11 (the health run at the end of the migration chain).
+- `CheckContext::{vault_path, cryptor, config, data_dir, resolve, relativize, rng}` (3) → every check and every fix in 4, 5, 6. `config.shortening_threshold` (a field of `VaultConfig`, exists) is the only configuration value a fix needs (Task 5).
+- `DIR_ID_CHECK_ID = "dirid"`, `TYPE_CHECK_ID = "type"`, `SHORTENED_CHECK_ID = "shortened"` (4, 6) are identical with the entries in `CHECK_IDS` (3) and with what `--check` accepts (8) and what appears in the JSON under `check` (8).
+- `DIR_ID_CHECK_NAME = "Directory Check"`, `TYPE_CHECK_NAME = "Resource Type Check"`, `SHORTENED_CHECK_NAME = "Shortened Names Check"` (4, 6) are the `name()` values that the report inserts into `Check %s` (7, 8).
+- `AdoptOrphan { content_dir }` (5) is created exclusively in `dir_id.rs` (5, Step 6) and nowhere else.
+- `render_report`, `report_file_name`, `write_report`, `civil_utc` (7) → 8 (write the report), 9 (report from the second run), 14 (`output::format_timestamp` moves over to `civil_utc`).
+- `exit::HEALTH_FINDINGS` (8) → 9 (the same return value), 14 (README table).
+- `MigrationStep`, `MigrationPlan`, `PlannedRename`, `Migrators::{plan, migrate, needs_migration}`, `assert_all_capabilities` (10) → 11 (`plan_renames` fills `MigrationPlan::renames`), 12 (command), 14 (Java interop).
+- `migration::v6::migrate(vault, passphrase, rng)`, `v8::migrate(vault, passphrase, rng)` (10) and `v7::migrate(vault, passphrase, full_scan_allowed, rng)` (11) — **v7 has one parameter more**, because only there can a query become necessary; `Migrators::migrate` passes `full_scan_allowed` straight through to it and ignores it for the other two.
+- `FilePathMigration::{parse, migrate, target_path, new_inflated_name, new_deflated_name}` and `plan_renames` (11) → 12 (`--dry-run` reads `MigrationPlan::renames`).
+- `migratable_vault` (12) and `restorable_vault` (13) both sit in `commands/mod.rs` next to `locked_vault`; all three return `(VaultSettingsJson, PathBuf)` and call `require_locked`. They differ **only** in the set of permitted `VaultState` values: `Locked` / `Locked|NeedsMigration` / `Locked|VaultConfigMissing|AllMissing`.
+- `RecoveryDirectory::{create, path, move_recovered_file}`, `detect_cipher_combo`, `restore_masterkey`, `restore_config`, `restore_all` (13) → only the command in 13 and the tests there.
+- `CoreError::{MissingCapability, FileNameTooLong, MigrationBlocked}` (10) and `CoreError::CipherComboUndetectable` (13) must **both** be sorted into `exit.rs::core_code`; `core_code` is deliberately written without a `_` arm, so the compiler enforces it. Assignment: `MissingCapability` and `FileNameTooLong` → `GENERAL` (1), `MigrationBlocked` and `CipherComboUndetectable` → `WRONG_STATE` (5).
 
-Namen, die in zwei Tasks unterschiedlich hießen und hier aufgelöst sind: `detect_scheme` (Spec) vs. `detect_cipher_combo` (verbindlich, Task 13); `deflate` in `fs/long_names.rs` (nimmt einen Pfad) vs. `deflate_name` im Shortened-Check (nimmt einen `&str`) — Task 6 zieht die gemeinsame Rechnung in `fs::long_names::deflate_str` heraus und lässt beide darauf zeigen, statt sie zweimal zu schreiben.
+Names that were called differently in two tasks and are resolved here: `detect_scheme` (spec) vs. `detect_cipher_combo` (binding, Task 13); `deflate` in `fs/long_names.rs` (takes a path) vs. `deflate_name` in the shortened check (takes a `&str`) — Task 6 pulls the shared arithmetic out into `fs::long_names::deflate_str` and points both at it instead of writing it twice.
 
-**4. Exit-Code-Zuordnung.**
+**4. Exit code assignment.**
 
-| Situation | Weg | Code |
+| Situation | Route | Code |
 |---|---|---|
-| Health-Befund ≥ `--fail-on` | Rückgabewert von `commands::health::run` | **11** |
+| health finding ≥ `--fail-on` | return value of `commands::health::run` | **11** |
 | `--check bogus`, `--fail-on INFO`, `--fix-severity GOOD` | `CoreError::InvalidArgument` | 2 |
-| `crypto migrate` ohne `--yes` und ohne Terminal | `AppError::InvalidValue { key: "--yes" }` | 2 |
+| `crypto migrate` without `--yes` and without a terminal | `AppError::InvalidValue { key: "--yes" }` | 2 |
 | `crypto recovery-key restore --config --recovery-key-stdin` | `AppError::InvalidValue` | 2 |
-| kein `--masterkey`/`--config`/`--all` oder mehrere | clap `ArgGroup` | 2 |
-| falsches Passwort bei `health`, `migrate`, `restore --config` | `CoreError::InvalidPassphrase` | 4 |
-| Recovery-Key mit falscher Prüfsumme | `CoreError::InvalidRecoveryKey` | 4 |
-| `health`/`migrate`/`restore` auf einem Vault, den ein Daemon bedient | `AppError::WrongState` über `require_locked` | 5 |
-| `health` auf einem Vault im Zustand `NEEDS_MIGRATION` | `AppError::WrongState` mit dem Hinweis auf `crypto migrate` | 5 |
-| Vault-Format < 5 | `CoreError::MigrationBlocked` | 5 |
-| `vault.cryptomator` existiert schon beim 7→8-Schritt | `CoreError::MigrationBlocked` | 5 |
-| Cipher-Combo nicht erkennbar und nicht angegeben | `CoreError::CipherComboUndetectable` | 5 |
-| Speicher kann keine 220-Zeichen-Namen und `--yes` fehlt | `CoreError::MigrationBlocked` | 5 |
-| Name nach der Migration zu lang für den Speicher | `CoreError::FileNameTooLong` | 1 |
-| Speicher nicht les- oder beschreibbar | `CoreError::MissingCapability` | 1 |
-| Hub-Vault bei `health`/`migrate`/`restore` | `CoreError::HubVaultUnsupported` | 9 |
-| `crypto migrate` auf einem Format-8-Vault | kein Fehler | **0** |
-| `crypto migrate` an der Bestätigungsfrage abgebrochen | kein Fehler | **0** |
-| `--fix` konnte einen Fix nicht anwenden | Warnung auf stderr, `fixed: false` im JSON | Code des zweiten Laufs |
-| Keychain lehnt das Nachziehen nach `5→6` ab | Warnung auf stderr | 0 |
+| none or several of `--masterkey`/`--config`/`--all` | clap `ArgGroup` | 2 |
+| wrong password for `health`, `migrate`, `restore --config` | `CoreError::InvalidPassphrase` | 4 |
+| recovery key with a wrong checksum | `CoreError::InvalidRecoveryKey` | 4 |
+| `health`/`migrate`/`restore` on a vault that a daemon is serving | `AppError::WrongState` via `require_locked` | 5 |
+| `health` on a vault in state `NEEDS_MIGRATION` | `AppError::WrongState` with the pointer to `crypto migrate` | 5 |
+| vault format < 5 | `CoreError::MigrationBlocked` | 5 |
+| `vault.cryptomator` already exists at the 7→8 step | `CoreError::MigrationBlocked` | 5 |
+| cipher combo not detectable and not given | `CoreError::CipherComboUndetectable` | 5 |
+| storage cannot do 220-character names and `--yes` is missing | `CoreError::MigrationBlocked` | 5 |
+| name too long for the storage after the migration | `CoreError::FileNameTooLong` | 1 |
+| storage not readable or writable | `CoreError::MissingCapability` | 1 |
+| hub vault with `health`/`migrate`/`restore` | `CoreError::HubVaultUnsupported` | 9 |
+| `crypto migrate` on a format 8 vault | no error | **0** |
+| `crypto migrate` aborted at the confirmation prompt | no error | **0** |
+| `--fix` could not apply a fix | warning on stderr, `fixed: false` in the JSON | code of the second run |
+| keychain refuses the update after `5→6` | warning on stderr | 0 |
 
-Die letzten beiden Zeilen folgen Ruling 5 aus M6: was **nach** der eigentlichen Leistung passiert, wird zur Warnung, nicht zum Exit-Code — der Vault ist migriert, ein Exit ≠ 0 würde ein Skript zu einem falschen Rollback verleiten.
+The last two rows follow Ruling 5 from M6: what happens **after** the actual work becomes a warning, not an exit code — the vault is migrated, and an exit ≠ 0 would tempt a script into a wrong rollback.
 
-## Ausführung
+## Execution
 
-`superpowers:subagent-driven-development` mit Opus-5-Subagenten, ein frischer Subagent je Task, Review zwischen den Tasks; Reihenfolge **1 → 14**.
+`superpowers:subagent-driven-development` with Opus 5 subagents, a fresh subagent per task, review between the tasks; order **1 → 14**.
 
-**Abhängigkeiten.** Task 1 liefert das Fixture, ohne das die Tasks 4, 6, 8 und 9 nichts zu prüfen haben. Task 2 liefert die Legacy-Fixtures für 10, 11, 12 und 14. Task 3 ist das Fundament für 4–9. Task 5 braucht 4 (der Fix wird dort angehängt), Task 6 braucht 3 (es entfernt die letzten Placeholder), Task 7 ist unabhängig von 4–6 und könnte parallel laufen, Task 8 braucht 3, 6 und 7, Task 9 braucht 8. Task 10 braucht nur 2, Task 11 braucht 10, Task 12 braucht 11. Task 13 braucht nichts aus 3–12 und ist die einzige echte Parallelisierungsmöglichkeit: **Task 13 darf jederzeit nach Task 2 laufen.** Task 14 setzt auf allem auf.
+**Dependencies.** Task 1 delivers the fixture without which Tasks 4, 6, 8 and 9 have nothing to check. Task 2 delivers the legacy fixtures for 10, 11, 12 and 14. Task 3 is the foundation for 4–9. Task 5 needs 4 (the fix is attached there), Task 6 needs 3 (it removes the last placeholders), Task 7 is independent of 4–6 and could run in parallel, Task 8 needs 3, 6 and 7, Task 9 needs 8. Task 10 needs only 2, Task 11 needs 10, Task 12 needs 11. Task 13 needs nothing from 3–12 and is the only real opportunity for parallelism: **Task 13 may run at any time after Task 2.** Task 14 builds on everything.
 
-**Zwei Tasks brauchen Netz.** Task 2 lädt cryptofs 1.9.15, 1.8.9 und 1.6.2 von Maven Central nach `~/.m2` (geprüft: alle drei antworten mit HTTP 200, keine liegt lokal vor). Task 14, Step 10 braucht dieselben Artefakte plus cryptofs 2.10.0 (das liegt lokal). Ohne Netz sind beide zu vertagen; sie sind **nicht** durch andere Versionen zu ersetzen und **nicht** zu überspringen — ohne Legacy-Fixtures sind die Migratoren unbelegt.
+**Two tasks need network.** Task 2 downloads cryptofs 1.9.15, 1.8.9 and 1.6.2 from Maven Central into `~/.m2` (checked: all three answer with HTTP 200, none is present locally). Task 14, Step 10 needs the same artifacts plus cryptofs 2.10.0 (that one is local). Without network both are to be deferred; they are **not** to be replaced by other versions and **not** to be skipped — without legacy fixtures the migrators are unproven.
 
-**Drei Tasks fassen `tests/fixtures/` an, und nur diese drei:** Task 1 (`broken_health`), Task 2 (`legacy_v7`, `legacy_v6`, `legacy_v5` plus der `#[ignore]`-Stempelschritt) und — lesend — alle anderen. Ein Subagent, der in einem anderen Task eine Datei unter `tests/fixtures/` schreibt, hat einen Fehler gemacht; der Review zwischen den Tasks prüft das mit `git status --porcelain tests/fixtures/`.
+**Three tasks touch `tests/fixtures/`, and only these three:** Task 1 (`broken_health`), Task 2 (`legacy_v7`, `legacy_v6`, `legacy_v5` plus the `#[ignore]` stamping step) and — read-only — all the others. A subagent that writes a file under `tests/fixtures/` in any other task has made a mistake; the review between the tasks checks that with `git status --porcelain tests/fixtures/`.
 
-**Was im Report jedes Tasks stehen muss.** Neben dem üblichen Gate:
-- Task 1 und 2: die `du -sh`-Ausgabe der neuen Fixtures (Grenze 200 KB je Vault) und der `git status --porcelain tests/fixtures/`-Auszug.
-- Task 2: ob Maven die drei Legacy-Artefakte laden konnte, und der Beleg aus Step 6, dass `legacy_v6`/`legacy_v5` BASE32-Namen und ein `m/` haben.
-- Task 5: die Ausgabe von `crypto fs ls <vault> /LOST+FOUND` bzw. der Testausgabe, die zeigt, welchen Namen die adoptierte Datei bekommen hat.
-- Task 9: der `--fix`-Lauf im Klartext (before/after), damit die Zusammenfassungszeilen einmal von einem Menschen gelesen worden sind.
-- Task 11: die Laufzeit von `the_whole_chain_from_five_to_eight_produces_a_readable_vault`.
-- Task 14: die Ausgabe des manuellen Abnahmelaufs aus Step 9 und das Ergebnis von `cargo test -p crypto --test java_interop -- --ignored`.
+**What must be in each task's report.** Besides the usual gate:
+- Tasks 1 and 2: the `du -sh` output of the new fixtures (limit 200 KB per vault) and the `git status --porcelain tests/fixtures/` excerpt.
+- Task 2: whether Maven could download the three legacy artifacts, and the evidence from Step 6 that `legacy_v6`/`legacy_v5` have BASE32 names and an `m/`.
+- Task 5: the output of `crypto fs ls <vault> /LOST+FOUND`, or of the test output, showing which name the adopted file got.
+- Task 9: the `--fix` run in plain text (before/after), so that the summary lines have been read by a human once.
+- Task 11: the runtime of `the_whole_chain_from_five_to_eight_produces_a_readable_vault`.
+- Task 14: the output of the manual acceptance run from Step 9 and the result of `cargo test -p crypto --test java_interop -- --ignored`.
 
-**Was nicht passieren darf.** Kein Task setzt `CRYPTO_E2E_KEYCHAIN=1`, ruft `security` auf oder mountet etwas — M7 berührt weder Keychain-Dialoge noch FUSE. Der einzige Keychain-Kontakt ist der Fake in Task 12. Kein Task ändert `~/.m2` von Hand oder schreibt in den Desktop-Checkout.
+**What must not happen.** No task sets `CRYPTO_E2E_KEYCHAIN=1`, calls `security` or mounts anything — M7 touches neither keychain dialogs nor FUSE. The only keychain contact is the fake in Task 12. No task changes `~/.m2` by hand or writes into the desktop checkout.
