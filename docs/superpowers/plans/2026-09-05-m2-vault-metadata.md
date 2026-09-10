@@ -1,66 +1,66 @@
-# M2: Vault-Metadaten – settings.json, Vault-Verwaltung, Passwort und Recovery – Implementation Plan
+# M2: Vault metadata – settings.json, vault management, password and recovery – Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `crypto` kann Vaults anlegen, registrieren, auflisten, beschreiben und konfigurieren, Passwörter ändern und Recovery-Keys anzeigen/nutzen – schemakompatibel zur `settings.json` der Cryptomator-Desktop-App; von `crypto` erzeugte Vaults werden von der echten Java-Bibliothek (cryptofs 2.10.0) geöffnet.
+**Goal:** `crypto` can create, register, list, describe and configure vaults, change passwords and show/use recovery keys – schema-compatible with the `settings.json` of the Cryptomator desktop app; vaults created by `crypto` can be opened by the real Java library (cryptofs 2.10.0).
 
-**Architecture:** `cryptomator-core` erhält das Modul `vault/` (Zustandserkennung mit Backup-Restore, Readme-Generator, Vault-Initialisierung, Öffnen mit Verifikation und Backups, Passwortwechsel). `cryptomator-app` erhält `settings/` (serde-Modell mit `flatten` für unbekannte Felder, Legacy-Migration, Store mit atomarem Schreiben, Vault-Referenzauflösung, ID/Name-Regeln), `password.rs` (Passwortquellen, NFC, Mindestlänge) und `mounters.rs` (Aliase ↔ Java-Klassennamen). Das Binary `crypto` bekommt die Kommandos `vault create/add/remove/list/info/set`, `config get/set`, `password change`, `recovery-key show/reset-password` mit `--json`-Ausgabe und festen Exit-Codes. Der Java-Fixture-Generator bekommt einen `verify`-Modus, der Rust-erzeugte Vaults mit cryptofs öffnet.
+**Architecture:** `cryptomator-core` gains the module `vault/` (state detection with backup restore, readme generator, vault initialization, opening with verification and backups, password change). `cryptomator-app` gains `settings/` (serde model with `flatten` for unknown fields, legacy migration, store with atomic writes, vault reference resolution, ID/name rules), `password.rs` (password sources, NFC, minimum length) and `mounters.rs` (aliases ↔ Java class names). The `crypto` binary gains the commands `vault create/add/remove/list/info/set`, `config get/set`, `password change`, `recovery-key show/reset-password` with `--json` output and fixed exit codes. The Java fixture generator gains a `verify` mode that opens Rust-created vaults with cryptofs.
 
-**Tech Stack:** Rust stable ≥ 1.85; bestehende Crates aus M1; neu: `rpassword` 7.5, `unicode-normalization` 0.1, `serde`/`serde_json` (preserve_order) in `cryptomator-app`, `data-encoding`, `zeroize`, `thiserror`; Tests mit `tempfile`, `assert_cmd`, `predicates`. Java 21+/Maven für den Interop-Test.
+**Tech Stack:** Rust stable ≥ 1.85; existing crates from M1; new: `rpassword` 7.5, `unicode-normalization` 0.1, `serde`/`serde_json` (preserve_order) in `cryptomator-app`, `data-encoding`, `zeroize`, `thiserror`; tests with `tempfile`, `assert_cmd`, `predicates`. Java 21+/Maven for the interop test.
 
-**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (Abschnitte `cryptomator-app`, `cryptomator-core` → `vault/*`, Kommandogrammatur, Exit-Codes, Meilenstein M2)
+**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (sections `cryptomator-app`, `cryptomator-core` → `vault/*`, command grammar, exit codes, milestone M2)
 
 ## Global Constraints
 
-- Arbeitsverzeichnis `/Users/rfoerthe/work/cryptomator-cli`, Branch `feature/m2-vault-metadata` (von `main@1071afa`).
-- Lizenz AGPL-3.0-only; `#![forbid(unsafe_code)]` in core und app; kein `unwrap()` auf Eingabedaten in Library-Code (Tests dürfen).
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` vor jedem Commit sauber; Commit-Nachricht endet mit `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
-- settings.json: Pfade macOS `~/Library/Application Support/Cryptomator/settings.json`; Linux `~/.config/Cryptomator/settings.json`, dann `~/.Cryptomator/settings.json`; Override `CRYPTO_SETTINGS_PATH` (mehrere Pfade mit `:` getrennt) und `--settings PATH`. Gespeichert wird immer in den ersten Pfad, atomar (`settings.json.tmp` → rename). Unbekannte Felder bleiben beim Zurückschreiben erhalten. Java-Defaults: `port` 42427, `useKeychain` true, `keychainProvider` macOS `org.cryptomator.macos.keychain.MacSystemKeychainAccess` / Linux `org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess`, Vault: `revealAfterMount` true, `autoLockIdleSeconds` 1800, `actionAfterUnlock` `ASK`, `maxCleartextFilenameLength` -1, `mountFlags` `""`, `port` 42427. Legacy-Felder `preferredVolumeImpl`, `winDriveLetter`, `useCustomMountPath`/`usesIndividualMountPath`, `customMountPath`/`individualMountPath` werden gelesen und migriert, nie geschrieben.
-- Abweichung von Java (bewusst): eine unparsebare settings.json wird NICHT stillschweigend durch Defaults ersetzt, sondern führt zu einem Fehler (Exit 1) – die Desktop-App würde sie beim nächsten Speichern überschreiben.
-- Vault-ID = base64url von 9 Zufallsbytes (12 Zeichen); `mountName`-Normalisierung wie `VaultSettings.normalizeDisplayName`.
-- Vault anlegen wie `CreateNewVaultPasswordController.createVault`: Verzeichnis anlegen (muss neu sein), `masterkey.cryptomator` (Version 999, N=32768), `vault.cryptomator` (`kid` `masterkeyfile:masterkey.cryptomator`, SIV_GCM, Threshold 36..220, Default 220), Root-Content-Dir + `dirid.c9r`, `WELCOME.rtf` im Vault, `IMPORTANT.rtf` daneben. Readme-Texte exakt aus `strings.properties` (Englisch), RTF-Escaping wie `ReadmeGenerator`.
-- Passphrasen werden NFC-normalisiert (wie `SecurePasswordField`); neue Passwörter mindestens 8 Zeichen (`CRYPTO_MIN_PW_LENGTH` überschreibt); Reihenfolge der Quellen `--password-stdin` (eine Zeile) → `--password-file` (≤ 5000 Bytes, ein abschließendes Newline entfernt) → `--password-env VAR` → `CRYPTO_PASSWORD` → TTY-Prompt (nur wenn stdin ein Terminal ist).
-- Exit-Codes: 0 ok, 1 allgemein, 2 Usage, 3 Vault nicht gefunden/mehrdeutig, 4 Passwort/Recovery-Key ungültig, 5 falscher Vault-Zustand, 9 Hub-Vault, 12 kein Vault-Verzeichnis.
-- Passwörter, Recovery-Keys und Masterkeys erscheinen nie in Fehlermeldungen oder Logs; `Zeroizing` für alle Secret-Strings.
-- Hub-Vaults (`kid` beginnt mit `hub+`) werden bei `vault info` als Typ `hub` angezeigt und von allen anderen Operationen mit Exit 9 abgelehnt.
+- Working directory `/Users/rfoerthe/work/cryptomator-cli`, branch `feature/m2-vault-metadata` (from `main@1071afa`).
+- License AGPL-3.0-only; `#![forbid(unsafe_code)]` in core and app; no `unwrap()` on input data in library code (tests may).
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` clean before every commit; commit message ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- settings.json: paths macOS `~/Library/Application Support/Cryptomator/settings.json`; Linux `~/.config/Cryptomator/settings.json`, then `~/.Cryptomator/settings.json`; override `CRYPTO_SETTINGS_PATH` (several paths separated by `:`) and `--settings PATH`. Saving always goes to the first path, atomically (`settings.json.tmp` → rename). Unknown fields are preserved when writing back. Java defaults: `port` 42427, `useKeychain` true, `keychainProvider` macOS `org.cryptomator.macos.keychain.MacSystemKeychainAccess` / Linux `org.cryptomator.linux.keychain.GnomeKeyringKeychainAccess`, vault: `revealAfterMount` true, `autoLockIdleSeconds` 1800, `actionAfterUnlock` `ASK`, `maxCleartextFilenameLength` -1, `mountFlags` `""`, `port` 42427. Legacy fields `preferredVolumeImpl`, `winDriveLetter`, `useCustomMountPath`/`usesIndividualMountPath`, `customMountPath`/`individualMountPath` are read and migrated, never written.
+- Deviation from Java (deliberate): an unparsable settings.json is NOT silently replaced by defaults but leads to an error (exit 1) – the desktop app would overwrite it on the next save.
+- Vault ID = base64url of 9 random bytes (12 characters); `mountName` normalization like `VaultSettings.normalizeDisplayName`.
+- Create a vault like `CreateNewVaultPasswordController.createVault`: create the directory (must be new), `masterkey.cryptomator` (version 999, N=32768), `vault.cryptomator` (`kid` `masterkeyfile:masterkey.cryptomator`, SIV_GCM, threshold 36..220, default 220), root content dir + `dirid.c9r`, `WELCOME.rtf` inside the vault, `IMPORTANT.rtf` next to it. Readme texts exactly from `strings.properties` (English), RTF escaping like `ReadmeGenerator`.
+- Passphrases are NFC-normalized (like `SecurePasswordField`); new passwords at least 8 characters (`CRYPTO_MIN_PW_LENGTH` overrides); order of sources `--password-stdin` (one line) → `--password-file` (≤ 5000 bytes, one trailing newline stripped) → `--password-env VAR` → `CRYPTO_PASSWORD` → TTY prompt (only if stdin is a terminal).
+- Exit codes: 0 ok, 1 general, 2 usage, 3 vault not found/ambiguous, 4 password/recovery key invalid, 5 wrong vault state, 9 hub vault, 12 not a vault directory.
+- Passwords, recovery keys and masterkeys never appear in error messages or logs; `Zeroizing` for all secret strings.
+- Hub vaults (`kid` starts with `hub+`) are shown with type `hub` by `vault info` and rejected by all other operations with exit 9.
 
 ---
 
-## Dateistruktur
+## File structure
 
 ```
 crates/cryptomator-core/src/error.rs            + NotAVaultReason, NotAVaultDirectory, ContentRootMissing, NeedsMigration
 crates/cryptomator-core/src/vault/mod.rs
 crates/cryptomator-core/src/vault/state.rs      DirStructure, VaultState, determine_vault_state, assert_is_vault_directory, restore_if_backup_present
-crates/cryptomator-core/src/vault/readme.rs     RTF-Readmes (Port ReadmeGenerator)
+crates/cryptomator-core/src/vault/readme.rs     RTF readmes (port of ReadmeGenerator)
 crates/cryptomator-core/src/vault/open.rs       read_vault_config, open_vault, root_content_dir, OpenedVault
 crates/cryptomator-core/src/vault/init.rs       initialize, write_root_file, create_vault, CreateVaultOptions
 crates/cryptomator-core/src/vault/password.rs   change_password
-crates/cryptomator-core/tests/vault_lifecycle.rs create → open → change password → open (Integrationstest)
+crates/cryptomator-core/tests/vault_lifecycle.rs create → open → change password → open (integration test)
 crates/cryptomator-app/Cargo.toml               + serde, serde_json, data-encoding, zeroize, thiserror, rpassword, unicode-normalization, tempfile(dev)
 crates/cryptomator-app/src/lib.rs
 crates/cryptomator-app/src/error.rs             AppError
 crates/cryptomator-app/src/settings/mod.rs
-crates/cryptomator-app/src/settings/model.rs    SettingsJson, VaultSettingsJson, WhenUnlocked, Defaults, Legacy-Migration
+crates/cryptomator-app/src/settings/model.rs    SettingsJson, VaultSettingsJson, WhenUnlocked, defaults, legacy migration
 crates/cryptomator-app/src/settings/ids.rs      generate_id, normalize_display_name
 crates/cryptomator-app/src/settings/vault_ref.rs resolve_vault
-crates/cryptomator-app/src/settings/store.rs    SettingsStore (Pfade, load, save, update)
+crates/cryptomator-app/src/settings/store.rs    SettingsStore (paths, load, save, update)
 crates/cryptomator-app/src/password.rs          PasswordArgs, read_passphrase, read_new_passphrase
-crates/cryptomator-app/src/mounters.rs          Alias ↔ Java-Klassenname
-crates/crypto/src/cli.rs                        Grammatik (erweitert)
-crates/crypto/src/exit.rs                       Exit-Codes + Fehler-Mapping
+crates/cryptomator-app/src/mounters.rs          alias ↔ Java class name
+crates/crypto/src/cli.rs                        grammar (extended)
+crates/crypto/src/exit.rs                       exit codes + error mapping
 crates/crypto/src/output.rs                     human/json
 crates/crypto/src/commands/{mod,vault,config,password,recovery}.rs
-crates/crypto/tests/cli.rs                      assert_cmd-Tests (erweitert)
-crates/crypto/tests/java_interop.rs             #[ignore]-Test: Rust-Vault mit cryptofs öffnen
-tools/fixture-gen/…/Gen.java                    + verify-Modus; pom.xml parametrisiert
-.github/workflows/ci.yml                        + Job interop-java
-README.md, CHANGELOG.md, Spec                   aktualisiert
+crates/crypto/tests/cli.rs                      assert_cmd tests (extended)
+crates/crypto/tests/java_interop.rs             #[ignore] test: open a Rust vault with cryptofs
+tools/fixture-gen/…/Gen.java                    + verify mode; pom.xml parameterized
+.github/workflows/ci.yml                        + job interop-java
+README.md, CHANGELOG.md, spec                   updated
 ```
 
 ---
 
-### Task 1: Vault-Zustandserkennung mit Backup-Restore (`vault/state.rs`)
+### Task 1: Vault state detection with backup restore (`vault/state.rs`)
 
 **Files:**
 - Modify: `crates/cryptomator-core/src/error.rs`, `crates/cryptomator-core/src/lib.rs`
@@ -68,12 +68,12 @@ README.md, CHANGELOG.md, Spec                   aktualisiert
 
 **Interfaces:**
 - Consumes: `constants::{DATA_DIR_NAME, VAULTCONFIG_FILENAME, MASTERKEY_FILENAME, BACKUP_SUFFIX, VAULT_VERSION}`, `MasterkeyFileAccess::read_alleged_vault_version`, `UnverifiedVaultConfig::{decode, alleged_vault_version}`.
-- Produces: `CoreError::NotAVaultDirectory { path: PathBuf, reason: NotAVaultReason }`, `CoreError::ContentRootMissing(PathBuf)`, `CoreError::NeedsMigration(PathBuf)`; `NotAVaultReason::{MissingDataDir, DataNotADirectory, MissingVaultConfig, VaultConfigAccessDenied, UnsupportedStructure}` mit `as_str()` (Java-Namen); `DirStructure::{Vault, MaybeLegacy, Unrelated}`; `check_dir_structure(&Path) -> Result<DirStructure>`; `assert_is_vault_directory(&Path) -> Result<()>`; `restore_if_backup_present(vault_path: &Path, file_prefix: &str) -> Option<PathBuf>`; `VaultState::{Missing, VaultConfigMissing, AllMissing, NeedsMigration, Locked}` mit `as_str()` (`MISSING`, `VAULT_CONFIG_MISSING`, `ALL_MISSING`, `NEEDS_MIGRATION`, `LOCKED`); `determine_vault_state(&Path) -> Result<VaultState>`; `determine_vault_version(&Path) -> Result<u32>`; `needs_migration(&Path) -> Result<bool>`.
+- Produces: `CoreError::NotAVaultDirectory { path: PathBuf, reason: NotAVaultReason }`, `CoreError::ContentRootMissing(PathBuf)`, `CoreError::NeedsMigration(PathBuf)`; `NotAVaultReason::{MissingDataDir, DataNotADirectory, MissingVaultConfig, VaultConfigAccessDenied, UnsupportedStructure}` with `as_str()` (Java names); `DirStructure::{Vault, MaybeLegacy, Unrelated}`; `check_dir_structure(&Path) -> Result<DirStructure>`; `assert_is_vault_directory(&Path) -> Result<()>`; `restore_if_backup_present(vault_path: &Path, file_prefix: &str) -> Option<PathBuf>`; `VaultState::{Missing, VaultConfigMissing, AllMissing, NeedsMigration, Locked}` with `as_str()` (`MISSING`, `VAULT_CONFIG_MISSING`, `ALL_MISSING`, `NEEDS_MIGRATION`, `LOCKED`); `determine_vault_state(&Path) -> Result<VaultState>`; `determine_vault_version(&Path) -> Result<u32>`; `needs_migration(&Path) -> Result<bool>`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/vault/state.rs
+// at the end of crates/cryptomator-core/src/vault/state.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,14 +189,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-core -- vault::state`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
-In `crates/cryptomator-core/src/error.rs` ergänzen (vor `Io`):
+Add to `crates/cryptomator-core/src/error.rs` (before `Io`):
 
 ```rust
     #[error("not a vault directory: {path} ({reason})")]
@@ -207,7 +207,7 @@ In `crates/cryptomator-core/src/error.rs` ergänzen (vor `Io`):
     NeedsMigration(std::path::PathBuf),
 ```
 
-und nach dem Enum:
+and after the enum:
 
 ```rust
 /// Why a directory is not usable as a vault (`common/vaults/NotAVaultDirectoryException.Reason`).
@@ -415,14 +415,14 @@ pub fn determine_vault_state(path_to_vault: &Path) -> Result<VaultState> {
 }
 ```
 
-In `lib.rs`: `pub mod vault;` und `pub use error::NotAVaultReason;` sowie `pub use vault::state::{assert_is_vault_directory, check_dir_structure, determine_vault_state, determine_vault_version, needs_migration, restore_if_backup_present, DirStructure, VaultState};`.
+In `lib.rs`: `pub mod vault;` and `pub use error::NotAVaultReason;` as well as `pub use vault::state::{assert_is_vault_directory, check_dir_structure, determine_vault_state, determine_vault_version, needs_migration, restore_if_backup_present, DirStructure, VaultState};`.
 
-Hinweis: `data_dir_without_any_key_file_is_all_missing` erwartet `ALL_MISSING`, obwohl ein leeres `d/` ohne Dateien in Java `UNRELATED → MISSING` liefert und erst danach die Backup-Prüfung greift – genau diese Reihenfolge implementiert `determine_vault_state` (Struktur `Missing`, dann Restore, dann `AllMissing`). Java verhält sich identisch.
+Note: `data_dir_without_any_key_file_is_all_missing` expects `ALL_MISSING`, even though an empty `d/` without files yields `UNRELATED → MISSING` in Java and the backup check only kicks in afterwards – exactly that order is what `determine_vault_state` implements (structure `Missing`, then restore, then `AllMissing`). Java behaves identically.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-core -- vault::state`
-Expected: PASS (11 Tests)
+Expected: PASS (11 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -435,7 +435,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: RTF-Readme-Generator (`vault/readme.rs`)
+### Task 2: RTF readme generator (`vault/readme.rs`)
 
 **Files:**
 - Create: `crates/cryptomator-core/src/vault/readme.rs`
@@ -444,10 +444,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `STORAGE_LOCATION_README_FILE_NAME = "IMPORTANT.rtf"`, `ACCESS_LOCATION_README_FILE_NAME = "WELCOME.rtf"`, `storage_location_readme_rtf() -> String`, `access_location_readme_rtf() -> String`, `create_document(paragraphs: &[String]) -> String`, `escape_non_ascii(&str) -> String` (alle Ausgaben reines ASCII).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/vault/readme.rs
+// at the end of crates/cryptomator-core/src/vault/readme.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,12 +492,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-core -- vault::readme`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/vault/readme.rs
@@ -579,12 +579,12 @@ pub fn escape_non_ascii(input: &str) -> String {
 }
 ```
 
-`vault/mod.rs`: `pub mod readme;` ergänzen.
+`vault/mod.rs`: add `pub mod readme;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-core -- vault::readme`
-Expected: PASS (4 Tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -597,7 +597,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Vault öffnen mit Verifikation und Backups (`vault/open.rs`)
+### Task 3: Open a vault with verification and backups (`vault/open.rs`)
 
 **Files:**
 - Create: `crates/cryptomator-core/src/vault/open.rs`
@@ -607,10 +607,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `UnverifiedVaultConfig::{decode, key_id, verify}`, `KeyId::require_masterkey_file`, `MasterkeyFileAccess::load`, `Cryptor::new`, `FileNameCryptor::hash_directory_id`, `attempt_backup`, `constants::{ROOT_DIR_ID, DATA_DIR_NAME, VAULTCONFIG_FILENAME, VAULT_VERSION}`.
 - Produces: `OpenedVault { pub path: PathBuf, pub config: VaultConfig, pub masterkey: Masterkey, pub cryptor: Cryptor }` (Debug redigiert); `read_vault_config(vault_path: &Path) -> Result<UnverifiedVaultConfig>`; `root_content_dir(vault_path: &Path, cryptor: &Cryptor) -> PathBuf`; `open_vault(vault_path: &Path, access: &MasterkeyFileAccess, passphrase: &str) -> Result<OpenedVault>`; `open_vault_with_key(vault_path: &Path, masterkey: Masterkey) -> Result<OpenedVault>`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/vault/open.rs
+// at the end of crates/cryptomator-core/src/vault/open.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,12 +712,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-core -- vault::open`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/vault/open.rs
@@ -788,10 +788,10 @@ fn open_with_key(vault_path: &Path, unverified: UnverifiedVaultConfig, masterkey
 
 `vault/mod.rs`: `pub mod open;`. `lib.rs`: `pub use vault::open::{open_vault, open_vault_with_key, read_vault_config, root_content_dir, OpenedVault};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-core -- vault::open`
-Expected: PASS (6 Tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -804,7 +804,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Vault anlegen (`vault/init.rs`)
+### Task 4: Create a vault (`vault/init.rs`)
 
 **Files:**
 - Create: `crates/cryptomator-core/src/vault/init.rs`
@@ -814,10 +814,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `VaultConfig::{create_new, to_token}`, `Cryptor`, `encrypt_all`, `decrypt_all`, `root_content_dir`, `open_vault`, `MasterkeyFileAccess::persist`, `Masterkey::generate`, `readme::*`, `constants::{DEFAULT_KEY_ID, DIR_ID_BACKUP_FILE_NAME, CRYPTOMATOR_FILE_SUFFIX, MASTERKEY_FILENAME, VAULTCONFIG_FILENAME, ROOT_DIR_ID}`, `masterkey_file::DEFAULT_MASTERKEY_FILE_VERSION`.
 - Produces: `MIN_SHORTENING_THRESHOLD = 36`, `MAX_SHORTENING_THRESHOLD = 220`, `DEFAULT_SHORTENING_THRESHOLD = 220`; `CreateVaultOptions { cipher_combo: CipherCombo, shortening_threshold: u32, write_readme_files: bool }` (Default: SivGcm/220/true); `initialize(vault_path: &Path, masterkey: &Masterkey, cipher_combo: CipherCombo, shortening_threshold: u32, key_id: &str, rng: &mut dyn Rng) -> Result<VaultConfig>`; `write_root_file(vault_path: &Path, cryptor: &Cryptor, cleartext_name: &str, content: &[u8], shortening_threshold: u32, rng: &mut dyn Rng) -> Result<PathBuf>`; `create_vault(vault_path: &Path, passphrase: &str, options: &CreateVaultOptions, access: &MasterkeyFileAccess, rng: &mut dyn Rng) -> Result<Masterkey>`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-core/src/vault/init.rs
+// at the end of crates/cryptomator-core/src/vault/init.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,12 +906,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-core -- vault::init`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/vault/init.rs
@@ -1008,12 +1008,12 @@ pub fn create_vault(vault_path: &Path, passphrase: &str, options: &CreateVaultOp
 }
 ```
 
-`vault/mod.rs`: `pub mod init;`. `lib.rs`: `pub use vault::init::{create_vault, initialize, write_root_file, CreateVaultOptions, DEFAULT_SHORTENING_THRESHOLD, MAX_SHORTENING_THRESHOLD, MIN_SHORTENING_THRESHOLD};` und `pub use vault::readme::{access_location_readme_rtf, storage_location_readme_rtf, ACCESS_LOCATION_README_FILE_NAME, STORAGE_LOCATION_README_FILE_NAME};`.
+`vault/mod.rs`: `pub mod init;`. `lib.rs`: `pub use vault::init::{create_vault, initialize, write_root_file, CreateVaultOptions, DEFAULT_SHORTENING_THRESHOLD, MAX_SHORTENING_THRESHOLD, MIN_SHORTENING_THRESHOLD};` and `pub use vault::readme::{access_location_readme_rtf, storage_location_readme_rtf, ACCESS_LOCATION_README_FILE_NAME, STORAGE_LOCATION_README_FILE_NAME};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-core -- vault::init`
-Expected: PASS (5 Tests; die scrypt-Aufrufe mit N=32768 kosten je ~0,2 s)
+Expected: PASS (5 tests; the scrypt calls with N=32768 cost ~0.2 s each)
 
 - [ ] **Step 5: Commit**
 
@@ -1026,7 +1026,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Passwort ändern (`vault/password.rs`) und Lebenszyklus-Integrationstest
+### Task 5: Change password (`vault/password.rs`) and lifecycle integration test
 
 **Files:**
 - Create: `crates/cryptomator-core/src/vault/password.rs`, `crates/cryptomator-core/tests/vault_lifecycle.rs`
@@ -1034,9 +1034,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `MasterkeyFileAccess::change_passphrase`, `attempt_backup`, `BackupOutcome`, `read_vault_config`, `KeyId::require_masterkey_file`.
-- Produces: `change_password(vault_path: &Path, access: &MasterkeyFileAccess, old_passphrase: &str, new_passphrase: &str, rng: &mut dyn Rng) -> Result<PathBuf>` (liefert den Pfad der Backup-Datei; Hub-Vaults → `HubVaultUnsupported`; falsches altes Passwort → `InvalidPassphrase`, nichts geschrieben).
+- Produces: `change_password(vault_path: &Path, access: &MasterkeyFileAccess, old_passphrase: &str, new_passphrase: &str, rng: &mut dyn Rng) -> Result<PathBuf>` (returns the path of the backup file; hub vaults → `HubVaultUnsupported`; wrong old password → `InvalidPassphrase`, nothing written).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
 // crates/cryptomator-core/tests/vault_lifecycle.rs
@@ -1080,12 +1080,12 @@ fn wrong_old_password_changes_nothing() {
 }
 ```
 
-- [ ] **Step 2: Test laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run test, confirm failure**
 
 Run: `cargo test -p cryptomator-core --test vault_lifecycle`
-Expected: FAIL (`change_password` fehlt)
+Expected: FAIL (`change_password` missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-core/src/vault/password.rs
@@ -1119,12 +1119,12 @@ pub fn change_password(vault_path: &Path, access: &MasterkeyFileAccess, old_pass
 
 `vault/mod.rs`: `pub mod password;`. `lib.rs`: `pub use vault::password::change_password;`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-core --test vault_lifecycle`
-Expected: PASS (2 Tests)
+Expected: PASS (2 tests)
 
-- [ ] **Step 5: Gesamtlauf und Commit**
+- [ ] **Step 5: Full run and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 Expected: PASS
@@ -1138,7 +1138,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 6: settings.json-Modell (`cryptomator-app`: `error.rs`, `settings/model.rs`)
+### Task 6: settings.json model (`cryptomator-app`: `error.rs`, `settings/model.rs`)
 
 **Files:**
 - Modify: `crates/cryptomator-app/Cargo.toml`, `crates/cryptomator-app/src/lib.rs`, `Cargo.toml` (Workspace-Dependencies `rpassword`, `unicode-normalization`)
@@ -1146,18 +1146,18 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `cryptomator_core::CoreError`.
-- Produces: `AppError` (Varianten siehe Code); `WhenUnlocked::{Ignore, Reveal, Ask}` (`as_str`, `parse`, serde `IGNORE|REVEAL|ASK`, unbekannt → `Ask`); `VaultSettingsJson` (Felder wie Java, `extra: serde_json::Map`), `VaultSettingsJson::new(id: String, path: &Path) -> Self`, `migrate_legacy(&mut self)`; `SettingsJson` (Felder `directories`, `written_by_version`, `use_keychain`, `keychain_provider`, `mount_service`, `port`, `debug_mode`, `extra`), `SettingsJson::parse(&[u8]) -> Result<Self, serde_json::Error>` (inkl. Migration), `to_json_pretty(&self) -> String`, `migrate_legacy(&mut self)`, `Default`; Konstanten `DEFAULT_PORT = 42427`, `DEFAULT_AUTOLOCK_IDLE_SECONDS = 1800`, `DEFAULT_MAX_CLEARTEXT_FILENAME_LENGTH = -1`, `default_keychain_provider() -> String`.
+- Produces: `AppError` (variants see code); `WhenUnlocked::{Ignore, Reveal, Ask}` (`as_str`, `parse`, serde `IGNORE|REVEAL|ASK`, unknown → `Ask`); `VaultSettingsJson` (fields as in Java, `extra: serde_json::Map`), `VaultSettingsJson::new(id: String, path: &Path) -> Self`, `migrate_legacy(&mut self)`; `SettingsJson` (fields `directories`, `written_by_version`, `use_keychain`, `keychain_provider`, `mount_service`, `port`, `debug_mode`, `extra`), `SettingsJson::parse(&[u8]) -> Result<Self, serde_json::Error>` (incl. migration), `to_json_pretty(&self) -> String`, `migrate_legacy(&mut self)`, `Default`; constants `DEFAULT_PORT = 42427`, `DEFAULT_AUTOLOCK_IDLE_SECONDS = 1800`, `DEFAULT_MAX_CLEARTEXT_FILENAME_LENGTH = -1`, `default_keychain_provider() -> String`.
 
-- [ ] **Step 1: Dependencies eintragen**
+- [ ] **Step 1: Add dependencies**
 
-Workspace `Cargo.toml` unter `[workspace.dependencies]` ergänzen:
+Add to the workspace `Cargo.toml` under `[workspace.dependencies]`:
 
 ```toml
 rpassword = "7.5"
 unicode-normalization = "0.1"
 ```
 
-`crates/cryptomator-app/Cargo.toml` ersetzen durch:
+Replace `crates/cryptomator-app/Cargo.toml` with:
 
 ```toml
 [package]
@@ -1187,10 +1187,10 @@ security-framework = "3.7"
 tempfile.workspace = true
 ```
 
-- [ ] **Step 2: Fehlschlagende Tests schreiben**
+- [ ] **Step 2: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-app/src/settings/model.rs
+// at the end of crates/cryptomator-app/src/settings/model.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,12 +1362,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 3: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-app`
-Expected: FAIL (Module fehlen)
+Expected: FAIL (modules missing)
 
-- [ ] **Step 4: Implementieren**
+- [ ] **Step 4: Implement**
 
 ```rust
 // crates/cryptomator-app/src/error.rs
@@ -1676,10 +1676,10 @@ pub mod settings;
 pub use error::{AppError, Result};
 ```
 
-- [ ] **Step 5: Tests laufen lassen**
+- [ ] **Step 5: Run tests**
 
 Run: `cargo test -p cryptomator-app`
-Expected: PASS (9 Tests). Falls `"[]"` in `malformed_input_is_an_error` NICHT fehlschlägt (serde akzeptiert kein Array für ein Struct – es muss fehlschlagen), Test unverändert lassen und die Implementierung prüfen.
+Expected: PASS (9 tests). If `"[]"` in `malformed_input_is_an_error` does NOT fail (serde does not accept an array for a struct – it must fail), leave the test unchanged and check the implementation.
 
 - [ ] **Step 6: Commit**
 
@@ -1692,7 +1692,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Vault-IDs, Anzeigenamen und Referenzauflösung (`settings/ids.rs`, `settings/vault_ref.rs`)
+### Task 7: Vault IDs, display names and reference resolution (`settings/ids.rs`, `settings/vault_ref.rs`)
 
 **Files:**
 - Create: `crates/cryptomator-app/src/settings/ids.rs`, `crates/cryptomator-app/src/settings/vault_ref.rs`
@@ -1702,10 +1702,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `cryptomator_core::Rng`, `SettingsJson`, `VaultSettingsJson`, `AppError`.
 - Produces: `generate_id(rng: &mut dyn Rng) -> String` (12 Zeichen base64url); `normalize_display_name(&str) -> String`; `impl VaultSettingsJson { pub fn mount_name(&self) -> String; pub fn path_buf(&self) -> Option<PathBuf> }`; `resolve_vault_index(settings: &SettingsJson, reference: &str) -> Result<usize>`; `resolve_vault<'a>(settings: &'a SettingsJson, reference: &str) -> Result<&'a VaultSettingsJson>`; `normalize_vault_path(path: &Path) -> PathBuf` (absolut + kanonisch, falls existent).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-app/src/settings/ids.rs
+// at the end of crates/cryptomator-app/src/settings/ids.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,7 +1748,7 @@ mod tests {
 ```
 
 ```rust
-// am Ende von crates/cryptomator-app/src/settings/vault_ref.rs
+// at the end of crates/cryptomator-app/src/settings/vault_ref.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1804,12 +1804,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-app -- settings::ids settings::vault_ref`
-Expected: FAIL (Module fehlen)
+Expected: FAIL (modules missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-app/src/settings/ids.rs
@@ -1942,12 +1942,12 @@ pub fn resolve_vault<'a>(settings: &'a SettingsJson, reference: &str) -> Result<
 }
 ```
 
-`settings/mod.rs` ergänzen: `pub mod ids; pub mod vault_ref;` und `pub use ids::{generate_id, normalize_display_name}; pub use vault_ref::{normalize_vault_path, resolve_vault, resolve_vault_index};`.
+Extend `settings/mod.rs`: `pub mod ids; pub mod vault_ref;` and `pub use ids::{generate_id, normalize_display_name}; pub use vault_ref::{normalize_vault_path, resolve_vault, resolve_vault_index};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-app -- settings::ids settings::vault_ref`
-Expected: PASS (6 Tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1960,7 +1960,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Settings-Store – Pfade, Laden, atomares Speichern (`settings/store.rs`)
+### Task 8: Settings store – paths, loading, atomic saving (`settings/store.rs`)
 
 **Files:**
 - Create: `crates/cryptomator-app/src/settings/store.rs`
@@ -1970,10 +1970,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `SettingsJson::{parse, to_json_pretty}`, `AppError`.
 - Produces: `SETTINGS_PATH_ENV = "CRYPTO_SETTINGS_PATH"`; `default_settings_candidates(home: &Path) -> Vec<PathBuf>`; `candidates_from_env_value(&str) -> Vec<PathBuf>`; `SettingsStore::with_paths(Vec<PathBuf>) -> Result<Self>`, `SettingsStore::from_env_or_default() -> Result<Self>`, `SettingsStore::at(path: PathBuf) -> Self`, `preferred_path(&self) -> &Path`, `candidates(&self) -> &[PathBuf]`, `load(&self) -> Result<SettingsJson>`, `save(&self, &mut SettingsJson) -> Result<()>`, `update<T>(&self, f: impl FnOnce(&mut SettingsJson) -> Result<T>) -> Result<T>`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-app/src/settings/store.rs
+// at the end of crates/cryptomator-app/src/settings/store.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2060,12 +2060,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-app -- settings::store`
-Expected: FAIL (Modul fehlt)
+Expected: FAIL (module missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-app/src/settings/store.rs
@@ -2169,12 +2169,12 @@ impl SettingsStore {
 }
 ```
 
-`settings/mod.rs` ergänzen: `pub mod store;` und `pub use store::{candidates_from_env_value, default_settings_candidates, SettingsStore, SETTINGS_PATH_ENV};`.
+Extend `settings/mod.rs`: `pub mod store;` and `pub use store::{candidates_from_env_value, default_settings_candidates, SettingsStore, SETTINGS_PATH_ENV};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-app -- settings::store`
-Expected: PASS (6 Tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2187,7 +2187,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: Passwortquellen (`password.rs`) und Mounter-Aliase (`mounters.rs`)
+### Task 9: Password sources (`password.rs`) and mounter aliases (`mounters.rs`)
 
 **Files:**
 - Create: `crates/cryptomator-app/src/password.rs`, `crates/cryptomator-app/src/mounters.rs`
@@ -2195,12 +2195,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `AppError`.
-- Produces: `PasswordArgs` (clap `Args`: `--password-stdin`, `--password-file FILE`, `--password-env VAR`, gegenseitig ausschließend, Gruppe `password-source`); `NewPasswordArgs` (clap `Args`: `--new-password-stdin`, `--new-password-file FILE`, `--new-password-env VAR`, Gruppe `new-password-source`) mit `impl From<&NewPasswordArgs> for PasswordArgs`; `trait PasswordIo { fn read_stdin_line(&mut self) -> io::Result<Option<String>>; fn env(&self, name: &str) -> Option<String>; fn prompt(&mut self, prompt: &str) -> io::Result<Option<String>>; }`; `SystemIo` (stdin, `std::env`, `rpassword` nur bei Terminal); `normalize_passphrase(&str) -> Zeroizing<String>` (NFC); `read_passphrase(args: &PasswordArgs, prompt: &str, io: &mut dyn PasswordIo) -> Result<Zeroizing<String>>`; `read_new_passphrase(args: &PasswordArgs, prompt: &str, min_len: usize, io: &mut dyn PasswordIo) -> Result<Zeroizing<String>>`; `min_password_length() -> usize`; Konstanten `PASSWORD_ENV = "CRYPTO_PASSWORD"`, `MIN_PW_LENGTH_ENV = "CRYPTO_MIN_PW_LENGTH"`, `DEFAULT_MIN_PW_LENGTH = 8`, `MAX_PASSWORD_FILE_BYTES = 5000`. `mounters::{MOUNTER_ALIASES, resolve_mounter(input: &str) -> Result<String>, alias_for(class_name: &str) -> Option<&'static str>}`.
+- Produces: `PasswordArgs` (clap `Args`: `--password-stdin`, `--password-file FILE`, `--password-env VAR`, mutually exclusive, group `password-source`); `NewPasswordArgs` (clap `Args`: `--new-password-stdin`, `--new-password-file FILE`, `--new-password-env VAR`, group `new-password-source`) with `impl From<&NewPasswordArgs> for PasswordArgs`; `trait PasswordIo { fn read_stdin_line(&mut self) -> io::Result<Option<String>>; fn env(&self, name: &str) -> Option<String>; fn prompt(&mut self, prompt: &str) -> io::Result<Option<String>>; }`; `SystemIo` (stdin, `std::env`, `rpassword` only when on a terminal); `normalize_passphrase(&str) -> Zeroizing<String>` (NFC); `read_passphrase(args: &PasswordArgs, prompt: &str, io: &mut dyn PasswordIo) -> Result<Zeroizing<String>>`; `read_new_passphrase(args: &PasswordArgs, prompt: &str, min_len: usize, io: &mut dyn PasswordIo) -> Result<Zeroizing<String>>`; `min_password_length() -> usize`; constants `PASSWORD_ENV = "CRYPTO_PASSWORD"`, `MIN_PW_LENGTH_ENV = "CRYPTO_MIN_PW_LENGTH"`, `DEFAULT_MIN_PW_LENGTH = 8`, `MAX_PASSWORD_FILE_BYTES = 5000`. `mounters::{MOUNTER_ALIASES, resolve_mounter(input: &str) -> Result<String>, alias_for(class_name: &str) -> Option<&'static str>}`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// am Ende von crates/cryptomator-app/src/password.rs
+// at the end of crates/cryptomator-app/src/password.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2292,7 +2292,7 @@ mod tests {
 ```
 
 ```rust
-// am Ende von crates/cryptomator-app/src/mounters.rs
+// at the end of crates/cryptomator-app/src/mounters.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2311,12 +2311,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p cryptomator-app -- password mounters`
-Expected: FAIL (Module fehlen)
+Expected: FAIL (modules missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
 ```rust
 // crates/cryptomator-app/src/password.rs
@@ -2498,14 +2498,14 @@ pub fn alias_for(class_name: &str) -> Option<&'static str> {
 }
 ```
 
-`lib.rs` ergänzen: `pub mod mounters; pub mod password;` und `pub use password::{min_password_length, normalize_passphrase, read_new_passphrase, read_passphrase, NewPasswordArgs, PasswordArgs, PasswordIo, SystemIo};` sowie `pub use mounters::{alias_for, resolve_mounter};`.
+Extend `lib.rs`: `pub mod mounters; pub mod password;` and `pub use password::{min_password_length, normalize_passphrase, read_new_passphrase, read_passphrase, NewPasswordArgs, PasswordArgs, PasswordIo, SystemIo};` as well as `pub use mounters::{alias_for, resolve_mounter};`.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p cryptomator-app -- password mounters`
-Expected: PASS (7 Tests)
+Expected: PASS (7 tests)
 
-- [ ] **Step 5: Gesamtlauf und Commit**
+- [ ] **Step 5: Full run and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 Expected: PASS
@@ -2519,7 +2519,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 10: CLI-Grundgerüst und `vault create/add/remove/list/info`
+### Task 10: CLI scaffolding and `vault create/add/remove/list/info`
 
 **Files:**
 - Modify: `crates/crypto/Cargo.toml`, `crates/crypto/src/cli.rs`, `crates/crypto/src/main.rs`, `crates/crypto/tests/cli.rs`
@@ -2527,15 +2527,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `cryptomator_app::{SettingsStore, SettingsJson, VaultSettingsJson, generate_id, normalize_vault_path, resolve_vault_index, read_new_passphrase, min_password_length, PasswordArgs, SystemIo, AppError}`, `cryptomator_core::{create_vault, CreateVaultOptions, CipherCombo, MasterkeyFileAccess, OsRng, assert_is_vault_directory, determine_vault_state, read_vault_config, KeyId, recovery::{create_recovery_key, WordEncoder}}`.
-- Produces: `exit::{OK, GENERAL, USAGE, VAULT_NOT_FOUND, INVALID_PASSPHRASE, WRONG_STATE, HUB_VAULT, NOT_A_VAULT, code_for(&anyhow::Error) -> u8}`; `Output { json: bool }` mit `emit(&self, value: serde_json::Value, human: impl FnOnce() -> String) -> anyhow::Result<()>`; `commands::Ctx { store: SettingsStore, out: Output }`; `commands::vault::{create, add, remove, list, info, vault_json(&VaultSettingsJson) -> serde_json::Value, key_loader_scheme(&Path) -> Option<String>}`; `cli::{Cli, Command, VaultCommand, CreateArgs, AddArgs}` (RecoveryKey-Validate bleibt).
+- Produces: `exit::{OK, GENERAL, USAGE, VAULT_NOT_FOUND, INVALID_PASSPHRASE, WRONG_STATE, HUB_VAULT, NOT_A_VAULT, code_for(&anyhow::Error) -> u8}`; `Output { json: bool }` with `emit(&self, value: serde_json::Value, human: impl FnOnce() -> String) -> anyhow::Result<()>`; `commands::Ctx { store: SettingsStore, out: Output }`; `commands::vault::{create, add, remove, list, info, vault_json(&VaultSettingsJson) -> serde_json::Value, key_loader_scheme(&Path) -> Option<String>}`; `cli::{Cli, Command, VaultCommand, CreateArgs, AddArgs}` (recovery-key validate stays).
 
 - [ ] **Step 1: Dependencies**
 
-`crates/crypto/Cargo.toml` `[dependencies]` ergänzen: `serde_json.workspace = true`. `[dev-dependencies]` ergänzen: `tempfile.workspace = true`, `serde_json.workspace = true`.
+Extend `crates/crypto/Cargo.toml` `[dependencies]`: `serde_json.workspace = true`. Extend `[dev-dependencies]`: `tempfile.workspace = true`, `serde_json.workspace = true`.
 
-- [ ] **Step 2: Fehlschlagende Tests schreiben**
+- [ ] **Step 2: Write failing tests**
 
-`crates/crypto/tests/cli.rs` – die bestehenden Tests bleiben; folgendes anhängen:
+`crates/crypto/tests/cli.rs` – the existing tests stay; append the following:
 
 ```rust
 use std::path::{Path, PathBuf};
@@ -2670,12 +2670,12 @@ fn vault_info_detects_hub_vaults() {
 }
 ```
 
-- [ ] **Step 3: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 3: Run tests, confirm failure**
 
 Run: `cargo test -p crypto`
-Expected: FAIL (Subcommand `vault` unbekannt)
+Expected: FAIL (subcommand `vault` unknown)
 
-- [ ] **Step 4: Implementieren**
+- [ ] **Step 4: Implement**
 
 ```rust
 // crates/crypto/src/exit.rs
@@ -2925,7 +2925,7 @@ pub fn info(ctx: &Ctx, reference: &str) -> Result<u8> {
 }
 ```
 
-`vault_json` benutzt `UnverifiedVaultConfig::alleged_cipher_combo()`, das es noch nicht gibt: in `crates/cryptomator-core/src/vault_config.rs` ergänzen (neben `alleged_shortening_threshold`):
+`vault_json` uses `UnverifiedVaultConfig::alleged_cipher_combo()`, which does not exist yet: add it to `crates/cryptomator-core/src/vault_config.rs` (next to `alleged_shortening_threshold`):
 
 ```rust
     pub fn alleged_cipher_combo(&self) -> Option<String> {
@@ -3102,14 +3102,14 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
 }
 ```
 
-Hinweis zu `vault_info_detects_hub_vaults`: der eingebettete Token hat Header `{"kid":"hub+https://hub.example.com/api/vaults/1","alg":"HS256","typ":"JWT"}`; `vault add` prüft nur die Verzeichnisstruktur, `info` liest die Config unverifiziert – deshalb genügt eine beliebige Signatur.
+Note on `vault_info_detects_hub_vaults`: the embedded token has the header `{"kid":"hub+https://hub.example.com/api/vaults/1","alg":"HS256","typ":"JWT"}`; `vault add` only checks the directory structure, `info` reads the config unverified – so any signature will do.
 
-- [ ] **Step 5: Tests laufen lassen**
+- [ ] **Step 5: Run tests**
 
 Run: `cargo test -p crypto`
-Expected: PASS (10 Tests: 5 bestehende + 5 neue). `vault_create_*`-Tests dauern wegen scrypt je ~0,5 s.
+Expected: PASS (10 tests: 5 existing + 5 new). The `vault_create_*` tests take ~0.5 s each because of scrypt.
 
-- [ ] **Step 6: Gate und Commit**
+- [ ] **Step 6: Gate and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 Expected: PASS
@@ -3123,20 +3123,20 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: `vault set` und `config get/set`
+### Task 11: `vault set` and `config get/set`
 
 **Files:**
 - Modify: `crates/crypto/src/cli.rs`, `crates/crypto/src/main.rs`, `crates/crypto/src/commands/mod.rs`, `crates/crypto/tests/cli.rs`
-- Create: `crates/crypto/src/commands/config.rs`; `commands/vault.rs` erhält `set`
+- Create: `crates/crypto/src/commands/config.rs`; `commands/vault.rs` gains `set`
 
 **Interfaces:**
 - Consumes: `resolve_mounter`, `alias_for`, `WhenUnlocked::parse`, `resolve_vault_index`, `SettingsStore::update`, `vault_json`.
-- Produces: `cli::SetArgs`, `cli::ConfigCommand::{Get { key: Option<String> }, Set { key: String, value: String }}`; `commands::vault::set(&Ctx, SetArgs) -> Result<u8>`; `commands::config::{get, set}`; Konfigurationsschlüssel `mountService`, `port`, `useKeychain`, `keychainProvider`, `debugMode`.
+- Produces: `cli::SetArgs`, `cli::ConfigCommand::{Get { key: Option<String> }, Set { key: String, value: String }}`; `commands::vault::set(&Ctx, SetArgs) -> Result<u8>`; `commands::config::{get, set}`; configuration keys `mountService`, `port`, `useKeychain`, `keychainProvider`, `debugMode`.
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// an crates/crypto/tests/cli.rs anhängen
+// append to crates/crypto/tests/cli.rs
 #[test]
 fn vault_set_updates_settings() {
     let sb = Sandbox::new();
@@ -3199,14 +3199,14 @@ fn config_get_and_set() {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p crypto -- vault_set config_get`
-Expected: FAIL (Subcommands fehlen)
+Expected: FAIL (subcommands missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
-In `cli.rs`: `VaultCommand` um `/// Change per-vault settings\n Set(SetArgs)` erweitern, `Command` um `/// Global settings (settings.json)\n Config { #[command(subcommand)] command: ConfigCommand }`, und ergänzen:
+In `cli.rs`: extend `VaultCommand` with `/// Change per-vault settings\n Set(SetArgs)`, `Command` with `/// Global settings (settings.json)\n Config { #[command(subcommand)] command: ConfigCommand }`, and add:
 
 ```rust
 #[derive(Args, Debug)]
@@ -3266,7 +3266,7 @@ pub enum ConfigCommand {
 }
 ```
 
-In `commands/vault.rs` ergänzen:
+Add to `commands/vault.rs`:
 
 ```rust
 use crate::cli::SetArgs;
@@ -3413,7 +3413,7 @@ pub fn set(ctx: &Ctx, key: &str, value: &str) -> Result<u8> {
 }
 ```
 
-`commands/mod.rs`: `pub mod config;`. In `main.rs` `run`: `VaultCommand::Set(args) => commands::vault::set(&ctx, args)` und
+`commands/mod.rs`: `pub mod config;`. In `main.rs` `run`: `VaultCommand::Set(args) => commands::vault::set(&ctx, args)` and
 
 ```rust
         Command::Config { command } => match command {
@@ -3422,14 +3422,14 @@ pub fn set(ctx: &Ctx, key: &str, value: &str) -> Result<u8> {
         },
 ```
 
-(`use cli::ConfigCommand;` ergänzen.)
+(add `use cli::ConfigCommand;`.)
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p crypto`
-Expected: PASS (12 Tests)
+Expected: PASS (12 tests)
 
-- [ ] **Step 5: Gate und Commit**
+- [ ] **Step 5: Gate and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 Expected: PASS
@@ -3451,12 +3451,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `change_password`, `open_vault`, `read_vault_config`, `determine_vault_state`, `VaultState`, `recovery::{create_recovery_key, decode_recovery_key, reset_password, WordEncoder}`, `Masterkey::from_raw`, `read_passphrase`, `read_new_passphrase`, `NewPasswordArgs`, `PasswordArgs`, `SystemIo`.
-- Produces: `cli::PasswordCommand::Change(ChangePasswordArgs)`, `cli::RecoveryKeyCommand::{Show(ShowArgs), ResetPassword(ResetPasswordArgs), Validate(ValidateArgs)}`; `commands::password::change`, `commands::recovery::{show, reset_password}`; Hilfsfunktion `commands::locked_vault_path(&Ctx, reference: &str) -> Result<PathBuf>` (löst auf, verlangt Zustand `LOCKED`, sonst `WrongState`).
+- Produces: `cli::PasswordCommand::Change(ChangePasswordArgs)`, `cli::RecoveryKeyCommand::{Show(ShowArgs), ResetPassword(ResetPasswordArgs), Validate(ValidateArgs)}`; `commands::password::change`, `commands::recovery::{show, reset_password}`; helper function `commands::locked_vault_path(&Ctx, reference: &str) -> Result<PathBuf>` (resolves it, requires state `LOCKED`, otherwise `WrongState`).
 
-- [ ] **Step 1: Fehlschlagende Tests schreiben**
+- [ ] **Step 1: Write failing tests**
 
 ```rust
-// an crates/crypto/tests/cli.rs anhängen
+// append to crates/crypto/tests/cli.rs
 #[test]
 fn password_change_and_recovery_key_flows() {
     let sb = Sandbox::new();
@@ -3508,14 +3508,14 @@ fn password_and_recovery_commands_refuse_hub_and_missing_vaults() {
 }
 ```
 
-- [ ] **Step 2: Tests laufen lassen, Fehlschlag bestätigen**
+- [ ] **Step 2: Run tests, confirm failure**
 
 Run: `cargo test -p crypto -- password_change password_and_recovery`
-Expected: FAIL (Subcommands fehlen)
+Expected: FAIL (subcommands missing)
 
-- [ ] **Step 3: Implementieren**
+- [ ] **Step 3: Implement**
 
-`cli.rs`: `Command` um `/// Change or forget vault passwords\n Password { #[command(subcommand)] command: PasswordCommand }` erweitern; `RecoveryKeyCommand` erweitern; neue Structs:
+`cli.rs`: extend `Command` with `/// Change or forget vault passwords\n Password { #[command(subcommand)] command: PasswordCommand }`; extend `RecoveryKeyCommand`; new structs:
 
 ```rust
 #[derive(Subcommand, Debug)]
@@ -3568,7 +3568,7 @@ pub struct ResetPasswordArgs {
 }
 ```
 
-(`use cryptomator_app::{NewPasswordArgs, PasswordArgs};`). Achtung: `required = true` auf `recovery_key_stdin` zusammen mit der Gruppe bedeutet „genau eine Quelle“; clap meldet bei `--recovery-key-file` ohne `--recovery-key-stdin` einen Fehler. Deshalb stattdessen die Gruppe als erforderlich markieren: `#[command(group = clap::ArgGroup::new("recovery-key-source").required(true))]` auf `ResetPasswordArgs` und bei beiden Feldern nur `group = "recovery-key-source"` (kein `required`).
+(`use cryptomator_app::{NewPasswordArgs, PasswordArgs};`). Note: `required = true` on `recovery_key_stdin` together with the group means "exactly one source"; clap reports an error for `--recovery-key-file` without `--recovery-key-stdin`. Mark the group as required instead: `#[command(group = clap::ArgGroup::new("recovery-key-source").required(true))]` on `ResetPasswordArgs` and on both fields only `group = "recovery-key-source"` (no `required`).
 
 ```rust
 // crates/crypto/src/commands/mod.rs
@@ -3674,25 +3674,25 @@ pub fn reset_password_cmd(ctx: &Ctx, args: ResetPasswordArgs) -> Result<u8> {
 }
 ```
 
-`VAULT_VERSION` in `cryptomator-core/src/lib.rs` re-exportieren (`pub use constants::VAULT_VERSION;`), falls noch nicht geschehen. `main.rs` `run` ergänzen:
+Re-export `VAULT_VERSION` in `cryptomator-core/src/lib.rs` (`pub use constants::VAULT_VERSION;`) if not already done. Extend `main.rs` `run`:
 
 ```rust
         Command::Password { command: PasswordCommand::Change(args) } => commands::password::change(&ctx, args),
         Command::RecoveryKey { command } => match command {
             RecoveryKeyCommand::Show(args) => commands::recovery::show(&ctx, args),
             RecoveryKeyCommand::ResetPassword(args) => commands::recovery::reset_password_cmd(&ctx, args),
-            RecoveryKeyCommand::Validate(args) => { /* bestehender Code */ }
+            RecoveryKeyCommand::Validate(args) => { /* existing code */ }
         },
 ```
 
-Die Fehlermeldung „invalid passphrase“ stammt aus `CoreError::InvalidPassphrase` (Display); `error: {err:#}` gibt sie auf stderr aus.
+The error message "invalid passphrase" comes from `CoreError::InvalidPassphrase` (Display); `error: {err:#}` prints it to stderr.
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test -p crypto`
-Expected: PASS (14 Tests)
+Expected: PASS (14 tests)
 
-- [ ] **Step 5: Gate und Commit**
+- [ ] **Step 5: Gate and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 Expected: PASS
@@ -3706,16 +3706,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 13: Java-Verifikation Rust-erzeugter Vaults, CI-Job und Dokumentation
+### Task 13: Java verification of Rust-created vaults, CI job and documentation
 
 **Files:**
 - Modify: `tools/fixture-gen/src/main/java/org/cryptomator/cli/fixtures/Gen.java`, `tools/fixture-gen/pom.xml`, `tools/fixture-gen/README.md`, `.github/workflows/ci.yml`, `README.md`, `CHANGELOG.md`, `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`
 - Create: `crates/crypto/tests/java_interop.rs`
 
 **Interfaces:**
-- Produces: `Gen verify <vaultDir> <passphrase>` (öffnet den Vault mit cryptofs 2.10.0, druckt das Manifest-JSON des Klartextbaums auf stdout, Exit 0; Exit 3 bei Fehler); POM-Properties `fixture.cmd` (Default `gen`), `fixture.arg1` (Default Fixture-Verzeichnis), `fixture.arg2` (Default leer); Rust-Test `java_interop` (`#[ignore]`, läuft mit `--ignored`), CI-Job `interop-java`.
+- Produces: `Gen verify <vaultDir> <passphrase>` (opens the vault with cryptofs 2.10.0, prints the manifest JSON of the cleartext tree to stdout, exit 0; exit 3 on error); POM properties `fixture.cmd` (default `gen`), `fixture.arg1` (default fixture directory), `fixture.arg2` (default empty); Rust test `java_interop` (`#[ignore]`, runs with `--ignored`), CI job `interop-java`.
 
-- [ ] **Step 1: Java `verify`-Modus**
+- [ ] **Step 1: Java `verify` mode**
 
 `Gen.main` ersetzen:
 
@@ -3765,9 +3765,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
     }
 ```
 
-`walk`/`sha256` bleiben unverändert (sie lesen Dateien bereits vollständig; der zusätzliche `readAllBytes` ist bewusst redundant und dokumentiert die Absicht).
+`walk`/`sha256` stay unchanged (they already read files completely; the additional `readAllBytes` is deliberately redundant and documents the intent).
 
-`pom.xml`: in `<properties>` ergänzen
+`pom.xml`: add to `<properties>`
 
 ```xml
     <fixture.cmd>gen</fixture.cmd>
@@ -3775,7 +3775,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
     <fixture.arg2></fixture.arg2>
 ```
 
-und die `<arguments>` des exec-Plugins auf
+and change the `<arguments>` of the exec plugin to
 
 ```xml
             <argument>${exec.mainClass}</argument>
@@ -3784,12 +3784,12 @@ und die `<arguments>` des exec-Plugins auf
             <argument>${fixture.arg2}</argument>
 ```
 
-ändern (die bisherige Property `fixtures.out` entfällt; README anpassen: `mvn -q -f tools/fixture-gen/pom.xml compile exec:exec` erzeugt weiterhin die Fixtures; `mvn -q -f tools/fixture-gen/pom.xml compile exec:exec -Dfixture.cmd=verify -Dfixture.arg1=/path/to/vault -Dfixture.arg2=<passphrase>` verifiziert einen Vault).
+(the previous property `fixtures.out` goes away; adjust the README: `mvn -q -f tools/fixture-gen/pom.xml compile exec:exec` still generates the fixtures; `mvn -q -f tools/fixture-gen/pom.xml compile exec:exec -Dfixture.cmd=verify -Dfixture.arg1=/path/to/vault -Dfixture.arg2=<passphrase>` verifies a vault).
 
 Run: `mvn -q -f tools/fixture-gen/pom.xml compile exec:exec -Dfixture.cmd=verify -Dfixture.arg1=$(pwd)/tests/fixtures/siv_gcm_basic -Dfixture.arg2=test-password-123`
-Expected: JSON-Array mit `/docs`, `/docs/notes.md`, `/hello.txt`; Exit 0. Mit falschem Passwort: Stacktrace, Exit 3.
+Expected: JSON array with `/docs`, `/docs/notes.md`, `/hello.txt`; exit 0. With a wrong password: stacktrace, exit 3.
 
-- [ ] **Step 2: Rust-Interop-Test**
+- [ ] **Step 2: Rust interop test**
 
 ```rust
 // crates/crypto/tests/java_interop.rs
@@ -3842,11 +3842,11 @@ fn java_opens_vaults_created_by_crypto() {
 ```
 
 Run: `cargo test -p crypto --test java_interop -- --ignored`
-Expected: PASS (1 Test, ~30 s inkl. Maven)
+Expected: PASS (1 test, ~30 s incl. Maven)
 
-- [ ] **Step 3: CI-Job**
+- [ ] **Step 3: CI job**
 
-An `.github/workflows/ci.yml` anhängen (gleiche Einrückung wie `test`):
+Append to `.github/workflows/ci.yml` (same indentation as `test`):
 
 ```yaml
   interop-java:
@@ -3863,15 +3863,15 @@ An `.github/workflows/ci.yml` anhängen (gleiche Einrückung wie `test`):
       - run: cargo test -p crypto --test java_interop --locked -- --ignored
 ```
 
-- [ ] **Step 4: Dokumentation**
+- [ ] **Step 4: Documentation**
 
-`README.md` – Abschnitt „Commands“ um die M2-Kommandos erweitern (je eine Zeile mit Beispiel: `vault create`, `vault add`, `vault list`, `vault info`, `vault set`, `vault remove`, `config get|set`, `password change`, `recovery-key show|reset-password|validate`), Abschnitt „Password sources“ (Reihenfolge aus den Global Constraints) und „Settings file“ (Pfade, `--settings`, `CRYPTO_SETTINGS_PATH`, Hinweis: settings.json wird mit der Desktop-App geteilt; die App vor `vault add/remove` schließen).
+`README.md` – extend the "Commands" section with the M2 commands (one line each with an example: `vault create`, `vault add`, `vault list`, `vault info`, `vault set`, `vault remove`, `config get|set`, `password change`, `recovery-key show|reset-password|validate`), section "Password sources" (order from the Global Constraints) and "Settings file" (paths, `--settings`, `CRYPTO_SETTINGS_PATH`, note: settings.json is shared with the desktop app; close the app before `vault add/remove`).
 
-`CHANGELOG.md` – Abschnitt `## M2 – vault metadata` mit den Kommandos und der bewussten Abweichung (korrupte settings.json → Fehler statt Reset).
+`CHANGELOG.md` – section `## M2 – vault metadata` with the commands and the deliberate deviation (corrupt settings.json → error instead of reset).
 
-Spec – in der Tabelle „Phasen und Meilensteine“ M2 als erledigt markieren und unter `cryptomator-app` → `settings/store.rs` den Satz „Eine unparsebare settings.json führt zu einem Fehler (Abweichung von Java, das sie stillschweigend ersetzt)“ ergänzen.
+Spec – mark M2 as done in the "Phases and milestones" table and add the sentence "An unparsable settings.json leads to an error (deviation from Java, which silently replaces it)" under `cryptomator-app` → `settings/store.rs`.
 
-- [ ] **Step 5: Gate und Commit**
+- [ ] **Step 5: Gate and commit**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo test -p crypto --test java_interop --locked -- --ignored`
 Expected: PASS
@@ -3885,13 +3885,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Selbstprüfung
+## Self-check
 
-- **Spec-Abdeckung M2:** Settings-Modell/Store (6, 8), Vault-Refs + IDs (7), Zustandserkennung + bkup-Restore (1), `vault create/add/remove/list/info` (10), `vault set` + `config` (11), `password change` (5, 12), `recovery-key show/reset-password` (12), Readme-Erzeugung (2, 4), Meilenstein „Java verify akzeptiert Rust-Vaults, beide Combos“ (13), Settings-Roundtrip (6, 8). „Desktop-App öffnet CLI-Vault“ ist ein manueller Schritt (siehe Verifikation im Abschlussbericht).
-- **Typkonsistenz:** `read_vault_config` (3) liefert `UnverifiedVaultConfig` mit `key_id()`, `alleged_*()`, `verify()` (M1); `KeyId::require_masterkey_file()` (M1) in 3, 5, 12; `VaultSettingsJson::{new, path_buf, mount_name}` (6, 7) in 10, 11; `resolve_vault_index` (7) in 10–12; `SettingsStore::{at, from_env_or_default, load, update}` (8) in 10–12; `PasswordArgs`/`NewPasswordArgs`/`read_passphrase`/`read_new_passphrase`/`SystemIo`/`PasswordIo` (9) in 10, 12; `create_vault`/`CreateVaultOptions` (4) in 10, 13; `change_password` (5) in 12; `reset_password(encoder, access, path, key, new, rng)` (M1, Fix-Welle) in 12; `alleged_cipher_combo()` wird in 10 zu `vault_config.rs` hinzugefügt; `VAULT_VERSION`-Re-Export in 12.
-- **Platzhalter:** keine.
-- **Exit-Code-Mapping:** `NoPasswordSource` → 2 (Usage), `PasswordTooShort/Mismatch` → 4, `VaultAlreadyAdded` → 5, `NotAVaultDirectory` → 12, `HubVaultUnsupported` → 9, `WrongState` → 5, `VaultNotFound/Ambiguous` → 3; die Tests in 10–12 prüfen genau diese Codes.
+- **Spec coverage M2:** settings model/store (6, 8), vault refs + IDs (7), state detection + bkup restore (1), `vault create/add/remove/list/info` (10), `vault set` + `config` (11), `password change` (5, 12), `recovery-key show/reset-password` (12), readme generation (2, 4), milestone "Java verify accepts Rust vaults, both combos" (13), settings roundtrip (6, 8). "Desktop app opens CLI vault" is a manual step (see verification in the final report).
+- **Type consistency:** `read_vault_config` (3) returns `UnverifiedVaultConfig` with `key_id()`, `alleged_*()`, `verify()` (M1); `KeyId::require_masterkey_file()` (M1) in 3, 5, 12; `VaultSettingsJson::{new, path_buf, mount_name}` (6, 7) in 10, 11; `resolve_vault_index` (7) in 10–12; `SettingsStore::{at, from_env_or_default, load, update}` (8) in 10–12; `PasswordArgs`/`NewPasswordArgs`/`read_passphrase`/`read_new_passphrase`/`SystemIo`/`PasswordIo` (9) in 10, 12; `create_vault`/`CreateVaultOptions` (4) in 10, 13; `change_password` (5) in 12; `reset_password(encoder, access, path, key, new, rng)` (M1, fix wave) in 12; `alleged_cipher_combo()` is added to `vault_config.rs` in 10; `VAULT_VERSION` re-export in 12.
+- **Placeholders:** none.
+- **Exit code mapping:** `NoPasswordSource` → 2 (usage), `PasswordTooShort/Mismatch` → 4, `VaultAlreadyAdded` → 5, `NotAVaultDirectory` → 12, `HubVaultUnsupported` → 9, `WrongState` → 5, `VaultNotFound/Ambiguous` → 3; the tests in 10–12 check exactly these codes.
 
-## Ausführung
+## Execution
 
-`superpowers:subagent-driven-development` mit Opus-5-Subagenten wie in M1; Task 13 benötigt Java + Maven (lokal vorhanden).
+`superpowers:subagent-driven-development` with Opus 5 subagents as in M1; task 13 needs Java + Maven (available locally).

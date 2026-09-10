@@ -1,28 +1,28 @@
-# Spike A: FUSE-T / macFUSE über dlopen + fuser::Session::from_fd
+# Spike A: FUSE-T / macFUSE via dlopen + fuser::Session::from_fd
 
-> **Nachtrag (M4):** Option 1 der Konsequenz unten wurde umgesetzt und bewiesen —
-> `docs/superpowers/spikes/2026-09-06-spike-c-fuse-t-linux-abi.md` (**Spike C**) mountet FUSE-T
-> erfolgreich mit `KernelAbi::Linux` aus dem Fork `vendor/fuser`. Der Schalter ist eine
-> Laufzeit-Entscheidung (`Config::abi`) statt eines Features, damit ein Binary macFUSE und FUSE-T
-> bedient. macFUSE bleibt unverifiziert (nach wie vor nicht installiert). Das
-> Ergebnis „NO-GO“ unten gilt also für **unverändertes** fuser 0.18 und ist mit dem Fork überholt.
+> **Addendum (M4):** option 1 of the consequence below has been implemented and proven —
+> `docs/superpowers/spikes/2026-09-06-spike-c-fuse-t-linux-abi.md` (**spike C**) mounts FUSE-T
+> successfully with `KernelAbi::Linux` from the fork `vendor/fuser`. The switch is a
+> run-time decision (`Config::abi`) instead of a feature, so that one binary serves macFUSE and FUSE-T.
+> macFUSE remains unverified (still not installed). The
+> "NO-GO" result below therefore applies to **unmodified** fuser 0.18 and is superseded by the fork.
 
-Frage: Liefert `fuse_mount_compat25` aus `libfuse-t.dylib` einen fd, über den fuser 0.18 das Kernel-FUSE-Protokoll sprechen kann?
+Question: does `fuse_mount_compat25` from `libfuse-t.dylib` yield an fd over which fuser 0.18 can speak the kernel FUSE protocol?
 
 Setup: `cargo run -p cryptomator-mount --example spike_macos_dlopen -- <fuse-t|macfuse> /tmp/spike-mnt`
 
-Umgebung: macOS 26.6.2 (Build 25G83), Apple Silicon, Rust-Workspace `crypto`, fuser 0.18.0 (`macos-no-mount`), libloading 0.9.
+Environment: macOS 26.6.2 (build 25G83), Apple Silicon, Rust workspace `crypto`, fuser 0.18.0 (`macos-no-mount`), libloading 0.9.
 
-| Backend | Installiert (Version) | fuse_mount fd | Handshake | cat hello.txt | umount | Ergebnis |
+| Backend | Installed (version) | fuse_mount fd | Handshake | cat hello.txt | umount | Result |
 |---|---|---|---|---|---|---|
-| FUSE-T | ja (1.2.7, `/usr/local/lib/libfuse-t.dylib` → `libfuse-t-1.2.7.dylib`) | ok (fd = 4) | ok (`proto=7.19`, von FUSE-T als `client=libfuse3` erkannt) | fehler (Mount erscheint nie in der mount-Tabelle) | entfällt (nie gemountet) | **NO-GO** |
-| macFUSE | nein (`/usr/local/lib/libfuse.2.dylib` fehlt) | — | — | — | — | **BLOCKED** |
+| FUSE-T | yes (1.2.7, `/usr/local/lib/libfuse-t.dylib` → `libfuse-t-1.2.7.dylib`) | ok (fd = 4) | ok (`proto=7.19`, recognised by FUSE-T as `client=libfuse3`) | fails (the mount never appears in the mount table) | not applicable (never mounted) | **NO-GO** |
+| macFUSE | no (`/usr/local/lib/libfuse.2.dylib` missing) | — | — | — | — | **BLOCKED** |
 
-## Beobachtungen
+## Observations
 
 ### macFUSE — BLOCKED
 
-macFUSE ist nicht installiert; der Spike bricht wie vorgesehen ab:
+macFUSE is not installed; the spike aborts as intended:
 
 ```
 $ ./target/debug/examples/spike_macos_dlopen macfuse /tmp/spike-mnt-macfuse
@@ -30,20 +30,20 @@ $ ./target/debug/examples/spike_macos_dlopen macfuse /tmp/spike-mnt-macfuse
 EXIT=2
 ```
 
-Nachzuholen, sobald macFUSE installiert ist (Installation ist eine Nutzerentscheidung, Kext/System-Extension war für diesen Spike out of scope):
+To be made up as soon as macFUSE is installed (installing it is a user decision, kext/system extension was out of scope for this spike):
 
 ```bash
-# macFUSE installieren (Nutzerentscheidung, erfordert System-Extension-Freigabe)
+# install macFUSE (user decision, requires system extension approval)
 brew install --cask macfuse
 mkdir -p /tmp/spike-mnt
 cargo run -p cryptomator-mount --example spike_macos_dlopen -- macfuse /tmp/spike-mnt
-# zweite Shell:
+# second shell:
 cat /tmp/spike-mnt/hello.txt; umount /tmp/spike-mnt
 ```
 
-### FUSE-T — NO-GO, aber nicht am Transportweg
+### FUSE-T — NO-GO, but not because of the transport
 
-Der dlopen-Pfad selbst funktioniert vollständig:
+The dlopen path itself works completely:
 
 ```
 $ ./target/debug/examples/spike_macos_dlopen fuse-t /tmp/spike-mnt
@@ -52,15 +52,15 @@ spike failed: Invalid request
 EXIT=1
 ```
 
-Reproduzierbar über alle Läufe. Im Detail (mit einem temporären Diagnose-Beispiel und aktiviertem `log`-Logger ermittelt, nicht eingecheckt):
+Reproducible across all runs. In detail (determined with a temporary diagnostic example and the `log` logger enabled, not committed):
 
-1. `fuse_mount_compat25` liefert einen gültigen fd (`fd = 4`).
-2. `Session::from_fd` schließt den Handshake **erfolgreich** ab. FUSE-T bestätigt das in seinem eigenen Log (`~/Library/Logs/fuse-t/fuse-t.log`):
+1. `fuse_mount_compat25` returns a valid fd (`fd = 4`).
+2. `Session::from_fd` completes the handshake **successfully**. FUSE-T confirms this in its own log (`~/Library/Logs/fuse-t/fuse-t.log`):
    `fuse session negotiated profile=v3 client=libfuse3 proto=7.19 max_write=16777216 flags=0xe0000001`
-3. FUSE-T startet seinen NFS-Server (`Server version 1.2.7 running at 127.0.0.1:52100`) und schickt echte Kernel-FUSE-Requests über den fd, die fuser korrekt zustellt: `STATFS`, `GETATTR` (jeweils zweimal auf Inode 1).
-4. Direkt nach der `GETATTR`-Antwort bricht FUSE-T die Verbindung ab (`Connection closed`); der fd liefert EOF. fuser meldet das als `Short read of FUSE request header (0 < 40)` und daraus resultierend `Invalid request` — die Fehlermeldung ist also irreführend, es ist ein **EOF**, kein Parse-Fehler auf unserer Seite.
+3. FUSE-T starts its NFS server (`Server version 1.2.7 running at 127.0.0.1:52100`) and sends real kernel FUSE requests over the fd, which fuser delivers correctly: `STATFS`, `GETATTR` (twice each on inode 1).
+4. Right after the `GETATTR` reply FUSE-T tears down the connection (`Connection closed`); the fd returns EOF. fuser reports that as `Short read of FUSE request header (0 < 40)` and, following from it, `Invalid request` — so the error message is misleading, it is an **EOF**, not a parse error on our side.
 
-Der eigentliche Grund steht in FUSE-Ts Debug-Log — FUSE-T dekodiert unsere `GETATTR`-Antwort falsch:
+The actual reason is in FUSE-T's debug log — FUSE-T decodes our `GETATTR` reply incorrectly:
 
 ```
 Getattr reply: {136 0 6}, {AttrValid:1 AttrValidNsec:0 Dummy:0 Attr:{Ino:1 Size:0 Blocks:1
@@ -68,11 +68,11 @@ Getattr reply: {136 0 6}, {AttrValid:1 AttrValidNsec:0 Dummy:0 Attr:{Ino:1 Size:
   Mode:0 Nlink:0 Uid:0 Gid:16877 Rdev:1 Flags:20 Blksize:501 Padding:0}}
 ```
 
-Gesendet hatte der Spike `mode=0o40755 (=16877)`, `nlink=1`, `uid=501`, `gid=20`, `rdev=0`, `flags=0`, `blksize=512`. Die Werte landen um genau drei `u32`-Felder verschoben in FUSE-Ts Struktur.
+What the spike had sent was `mode=0o40755 (=16877)`, `nlink=1`, `uid=501`, `gid=20`, `rdev=0`, `flags=0`, `blksize=512`. The values land in FUSE-T's struct shifted by exactly three `u32` fields.
 
-**Root Cause: `fuse_attr`-Layout-Mismatch.** fuser aktiviert unter `#[cfg(target_os = "macos")]` die macFUSE-Variante von `fuse_attr` (`src/ll/fuse_abi.rs`) mit den Zusatzfeldern `crtime: u64`, `crtimensec: u32` und `flags: u32` **vor** `blksize` — insgesamt 104 Bytes. FUSE-T liest dagegen das **Linux**-Layout (88 Bytes, ohne `crtime`/`crtimensec`, `blksize` vor `flags`), passend dazu, dass es unseren Client als `libfuse3` erkennt. Rechnet man unseren Puffer gegen die Linux-Offsets, stimmen alle beobachtbaren Felder exakt:
+**Root cause: a `fuse_attr` layout mismatch.** Under `#[cfg(target_os = "macos")]` fuser activates the macFUSE variant of `fuse_attr` (`src/ll/fuse_abi.rs`) with the additional fields `crtime: u64`, `crtimensec: u32` and `flags: u32` **before** `blksize` — 104 bytes in total. FUSE-T, in contrast, reads the **Linux** layout (88 bytes, without `crtime`/`crtimensec`, `blksize` before `flags`), consistent with the fact that it recognises our client as `libfuse3`. Interpreting our buffer against the Linux offsets, every observable field matches exactly:
 
-| FUSE-T-Feld | Linux-Offset | Wert an diesem Offset in fusers macOS-Layout | von FUSE-T gemeldet |
+| FUSE-T field | Linux offset | Value at that offset in fuser's macOS layout | Reported by FUSE-T |
 |---|---|---|---|
 | Mode | 60 | `mtimensec` = 0 | 0 |
 | Nlink | 64 | `ctimensec` = 0 | 0 |
@@ -82,31 +82,31 @@ Gesendet hatte der Spike `mode=0o40755 (=16877)`, `nlink=1`, `uid=501`, `gid=20`
 | Blksize | 80 | `uid` = 501 | 501 |
 | Flags | 84 | `gid` = 20 | 20 |
 
-Weil `Mode` dadurch als `0` ankommt, ist die Root-Inode für FUSE-T weder Verzeichnis noch sonst ein gültiger Typ — FUSE-T bricht den Mount ab. In der mount-Tabelle erscheint nie etwas, `cat`/`umount` sind entsprechend nicht durchführbar.
+Because `Mode` therefore arrives as `0`, the root inode is for FUSE-T neither a directory nor any other valid type — FUSE-T aborts the mount. Nothing ever appears in the mount table, so `cat`/`umount` cannot be carried out.
 
-Ausgeschlossene Nebenursachen (jeweils einzeln getestet):
+Secondary causes ruled out (each tested individually):
 
-- **Nicht** die ausgehandelte Minor-Version: FUSE-T bietet 7.23 an; INIT-Antworten mit Minor 19/23 und Länge 40/80 Bytes führen alle zu identischem, sauberem Nachrichtenfluss.
-- **Nicht** `statfs`: Auch mit realistischen Werten statt fusers Default (0 Blöcke) bricht FUSE-T an derselben Stelle ab.
-- **Nicht** der Mountpoint: `/tmp/spike-mnt` und `$HOME/spike-mnt` verhalten sich gleich.
-- **Nicht** die Sandbox der Entwicklungsumgebung: identisches Ergebnis mit deaktivierter Sandbox.
-- **Nicht** fehlende Mount-Rechte: ein manueller `mount -t nfs` als normaler Nutzer scheitert mit `Connection refused` (also erlaubt), nicht mit `Operation not permitted`.
-- **Anmerkung zum Brief:** die vorgegebene Option `-o backend=smb` ist auf diesem System ohnehin unbrauchbar — FUSE-T 1.2.7 liefert nur den NFS-Helper (`/Library/Application Support/fuse-t/bin/go-nfsv4`), kein SMB-Backend. Mit `backend=smb` scheitert schon FUSE-Ts eigener Mount-Aufruf (`mount -t smbfs …`, `exit status 64`). Der Spike-Code behält die Option laut Brief bei; die Diagnose oben wurde zusätzlich mit dem Default-Backend (NFS) durchgeführt, das weiter kommt (`STATFS`+`GETATTR` statt nur `GETATTR`) und den Root Cause offenlegt.
+- **Not** the negotiated minor version: FUSE-T offers 7.23; INIT replies with minor 19/23 and a length of 40/80 bytes all lead to an identical, clean message flow.
+- **Not** `statfs`: even with realistic values instead of fuser's default (0 blocks), FUSE-T aborts at the same point.
+- **Not** the mount point: `/tmp/spike-mnt` and `$HOME/spike-mnt` behave the same.
+- **Not** the development environment's sandbox: identical result with the sandbox disabled.
+- **Not** missing mount permissions: a manual `mount -t nfs` as a normal user fails with `Connection refused` (that is, permitted), not with `Operation not permitted`.
+- **Note on the brief:** the prescribed option `-o backend=smb` is unusable on this system anyway — FUSE-T 1.2.7 ships only the NFS helper (`/Library/Application Support/fuse-t/bin/go-nfsv4`), no SMB backend. With `backend=smb` even FUSE-T's own mount call fails (`mount -t smbfs …`, `exit status 64`). The spike code keeps the option as the brief specifies; the diagnosis above was additionally carried out with the default backend (NFS), which gets further (`STATFS`+`GETATTR` instead of just `GETATTR`) and exposes the root cause.
 
-## Konsequenz für M4
+## Consequence for M4
 
-**Lowlevel-/ABI-Anpassung für FUSE-T einplanen — der reine dlopen-Pfad mit unverändertem fuser 0.18 reicht nicht.**
+**Plan in a lowlevel/ABI adaptation for FUSE-T — the plain dlopen path with an unmodified fuser 0.18 is not enough.**
 
-Wichtige Nuance für die Planung: Transport und Handshake sind *nicht* das Problem. `dlopen` → `fuse_mount_compat25` → `fuser::Session::from_fd` funktioniert, und über den fd fließt echtes Kernel-FUSE-Protokoll in beide Richtungen. Das Hindernis ist ausschließlich das **Struct-ABI der Antworten**: FUSE-T erwartet die Linux-Varianten, fuser erzeugt unter macOS die macFUSE-Varianten. Optionen:
+An important nuance for the planning: transport and handshake are *not* the problem. `dlopen` → `fuse_mount_compat25` → `fuser::Session::from_fd` works, and real kernel FUSE protocol flows over the fd in both directions. The obstacle is exclusively the **struct ABI of the replies**: FUSE-T expects the Linux variants, fuser produces the macFUSE variants under macOS. Options:
 
-1. **fuser mit Linux-ABI unter macOS** (bevorzugt, kleinster Eingriff): Fork/Patch, der die `#[cfg(target_os = "macos")]`-Felder in `fuse_abi.rs` abschaltbar macht, damit `Session::from_fd` gegen FUSE-T das Linux-Layout schreibt. Betrifft mindestens `fuse_attr`; die übrigen `#[cfg(target_os = "macos")]`-Strukturen sind vor der Umsetzung durchzusehen. Upstream-tauglich als Feature-Flag (z. B. `abi-linux`).
-2. **Eigenes `fuse_lowlevel_ops`-FFI-Backend** für FUSE-T, wie in der Spec als Fallback vorgesehen — deutlich mehr Aufwand, dafür unabhängig von fusers ABI-Entscheidungen.
-3. **macFUSE-Pfad** bleibt vom Root Cause unberührt und ist mit fuser wie geplant plausibel (macFUSE nutzt genau das ABI, das fuser unter macOS erzeugt) — **noch nicht verifiziert**, da macFUSE nicht installiert ist. Das ist der nächste Spike-Schritt, sobald der Nutzer macFUSE installiert.
+1. **fuser with the Linux ABI under macOS** (preferred, smallest intervention): a fork/patch that makes the `#[cfg(target_os = "macos")]` fields in `fuse_abi.rs` switchable, so that `Session::from_fd` writes the Linux layout when talking to FUSE-T. This affects `fuse_attr` at least; the remaining `#[cfg(target_os = "macos")]` structs have to be reviewed before the implementation. Suitable for upstream as a feature flag (e.g. `abi-linux`).
+2. **Our own `fuse_lowlevel_ops` FFI backend** for FUSE-T, as foreseen in the spec as a fallback — considerably more work, but independent of fuser's ABI decisions.
+3. **The macFUSE path** is untouched by the root cause and is plausible with fuser as planned (macFUSE uses exactly the ABI that fuser produces under macOS) — **not verified yet**, since macFUSE is not installed. That is the next spike step, as soon as the user installs macFUSE.
 
-## Reproduktion
+## Reproduction
 
 ```bash
 mkdir -p /tmp/spike-mnt
 cargo run -p cryptomator-mount --example spike_macos_dlopen -- fuse-t /tmp/spike-mnt
-tail -f ~/Library/Logs/fuse-t/fuse-t.log   # FUSE-Ts Sicht; mit -o debug deutlich gesprächiger
+tail -f ~/Library/Logs/fuse-t/fuse-t.log   # FUSE-T's view; considerably more talkative with -o debug
 ```

@@ -2,44 +2,44 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `crypto unlock <VAULT>` mountet einen Vault per FUSE (Linux libfuse3/`fusermount3`, macOS FUSE-T; macFUSE-Pfad implementiert, aber unverifiziert) in einem Hintergrund-Daemon; `crypto lock|status|stats|events|mounters` sprechen über einen Unix-Socket mit dem Daemon. Dateien, die über den Mount geschrieben werden, liest cryptofs (Java) unverändert.
+**Goal:** `crypto unlock <VAULT>` mounts a vault via FUSE (Linux libfuse3/`fusermount3`, macOS FUSE-T; macFUSE path implemented but unverified) in a background daemon; `crypto lock|status|stats|events|mounters` talk to the daemon over a Unix socket. Files written through the mount are read unchanged by cryptofs (Java).
 
-**Architecture:** Drei Schichten. (1) `cryptomator-mount`: `MountService`/`MountBuilder`/`Mount`-API (Port der `integrations-api`), Flag-Parser, Name-Transcoder, ein von fuser unabhängiger, testbarer Operationskern `fuse/ops.rs` über `Arc<CryptoFs>` (Inode-/Handle-Tabellen, Errno-Mapping) und der dünne `impl fuser::Filesystem` in `fuse/adapter.rs`; Provider für Linux (`fuser::Session::new`, pure-rust/fusermount3), FUSE-T und macFUSE (dlopen `fuse_mount_compat25` → `Session::from_fd`). (2) `cryptomator-app`: State-Dir, `cli.json`, Vault-Registry (UNLOCKED/STALE_MOUNT), `Mounter` (Port von `Mounter.SettledMounter`), Daemon-Protokoll/-Client/-Server (std-Threads + `UnixListener`, kein tokio). (3) `crypto`: `unlock` (Passwort + scrypt im Elternprozess, Namenslängen-Probe, Daemon spawnen, Ready abwarten), `lock`, `status`, `stats`, `events`, `mounters`, verstecktes `__daemon`. fuser 0.18.0 wird als `vendor/fuser` mit einem **Laufzeit-ABI-Schalter** (`KernelAbi::{Native, Linux}`) gepatcht, weil FUSE-T die Linux-Struct-Layouts erwartet (Spike A).
+**Architecture:** Three layers. (1) `cryptomator-mount`: `MountService`/`MountBuilder`/`Mount` API (port of `integrations-api`), flag parser, name transcoder, a fuser-independent, testable operation core `fuse/ops.rs` over `Arc<CryptoFs>` (inode/handle tables, errno mapping) and the thin `impl fuser::Filesystem` in `fuse/adapter.rs`; providers for Linux (`fuser::Session::new`, pure-rust/fusermount3), FUSE-T and macFUSE (dlopen `fuse_mount_compat25` → `Session::from_fd`). (2) `cryptomator-app`: state dir, `cli.json`, vault registry (UNLOCKED/STALE_MOUNT), `Mounter` (port of `Mounter.SettledMounter`), daemon protocol/client/server (std threads + `UnixListener`, no tokio). (3) `crypto`: `unlock` (password + scrypt in the parent process, name length probe, spawn the daemon, wait for ready), `lock`, `status`, `stats`, `events`, `mounters`, hidden `__daemon`. fuser 0.18.0 is patched as `vendor/fuser` with a **runtime ABI switch** (`KernelAbi::{Native, Linux}`), because FUSE-T expects the Linux struct layouts (Spike A).
 
-**Tech Stack:** Rust stable ≥ 1.85; `fuser` 0.18.0 (vendored, MIT, `[patch.crates-io]`), `libloading` 0.9, `nix` 0.31 (features `process`, `signal`, `user`, `fs`), `libc` 0.2 (nur im Binary für `setsid`), `signal-hook` 0.3, `log` 0.4 (+ eigener Datei-Logger), `serde`/`serde_json`, `data-encoding`; Tests mit `tempfile`, `assert_cmd`. Java 21+/Maven für Interop.
+**Tech Stack:** Rust stable ≥ 1.85; `fuser` 0.18.0 (vendored, MIT, `[patch.crates-io]`), `libloading` 0.9, `nix` 0.31 (features `process`, `signal`, `user`, `fs`), `libc` 0.2 (only in the binary, for `setsid`), `signal-hook` 0.3, `log` 0.4 (+ our own file logger), `serde`/`serde_json`, `data-encoding`; tests with `tempfile`, `assert_cmd`. Java 21+/Maven for interop.
 
-**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (Abschnitte `cryptomator-mount`, `cryptomator-app` → `cli_config.rs`, `state_dir.rs`, `registry.rs`, `mounting/mounter.rs`, `daemon/*`, Kommandogrammatur `unlock/lock/status/stats/events/mounters/__daemon`, Daemon-Design, Exit-Codes, Meilenstein M4, Spike A)
+**Spec:** `docs/superpowers/specs/2026-09-04-crypto-cli-design.md` (sections `cryptomator-mount`, `cryptomator-app` → `cli_config.rs`, `state_dir.rs`, `registry.rs`, `mounting/mounter.rs`, `daemon/*`, command grammar `unlock/lock/status/stats/events/mounters/__daemon`, daemon design, exit codes, milestone M4, Spike A)
 
 ## Global Constraints
 
-- Arbeitsverzeichnis `/Users/rfoerthe/work/cryptomator-cli`, Branch `feature/m4-fuse-daemon` (von `main@dd5c038`).
-- Lizenz AGPL-3.0-only; `vendor/fuser` behält seine MIT-`LICENSE` und einen `README-VENDORED.md` mit der Patch-Liste. `#![forbid(unsafe_code)]` bleibt in `cryptomator-core` und `cryptomator-app`; `cryptomator-mount` (dlopen/FFI) und das Binary (`pre_exec`) dürfen `unsafe` mit `// SAFETY:`-Kommentar. Kein `unwrap()`/`expect()` auf Eingabedaten in Library-/Binary-Code (Tests dürfen). MSRV 1.85 (keine `io::ErrorKind`-Varianten jünger als 1.85).
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` vor jedem Commit sauber; Commit-Nachricht endet mit `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. Nach Dependency-Änderungen einmal `cargo build` ohne `--locked`, `Cargo.lock` committen.
-- `tests/fixtures/` read-only; nichts unter `~/.m2` oder im Desktop-Checkout ändern; **keine** FUSE-Software installieren (FUSE-T 1.2.7 ist installiert: `/usr/local/lib/libfuse-t.dylib`; macFUSE ist NICHT installiert; `fusermount3` fehlt auf dem Mac). Tests dürfen nur unter `CRYPTO_E2E_MOUNT=1` (und `#[ignore]`) wirklich mounten; alle anderen Tests laufen ohne FUSE, ohne Root, ohne Netzwerk.
-- Java-Parität (Desktop 1.19 / fuse-nio-adapter 6.0.1 / integrations-api 1.9): Klassennamen `org.cryptomator.frontend.fuse.mount.{LinuxFuseMountProvider,MacFuseMountProvider,FuseTMountProvider}`; Capabilities exakt wie Java (Linux `{MOUNT_FLAGS, MOUNT_TO_EXISTING_DIR}`; macFUSE `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, MOUNT_TO_SYSTEM_CHOSEN_PATH, VOLUME_ID, VOLUME_NAME}`; FUSE-T `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, VOLUME_NAME}`); Default-Flags Linux `-oauto_unmount -ouid=<uid> -ogid=<gid> -oattr_timeout=5`, macFUSE `-ouid=<uid> -ogid=<gid> -oatomic_o_trunc -oauto_xattr -oauto_cache -onoappledouble -odefault_permissions`, FUSE-T `-ononamedattr -orwsize=262144 -ouid=<uid> -ogid=<gid>` (**ohne** `-obackend=smb`, Spike A); `-ononamedattr` wird bei FUSE-T immer angehängt; Flag-Parsing wie `AbstractMountBuilder.setMountFlags` (Split an `\s+-`, Set-Semantik); `-r` bei read-only, `-ovolname=<name>` bei VOLUME_NAME; `-obackend=fskit` bei macFUSE abgelehnt; Mount-Point-Policy wie `Mounter.prepareMountPoint`; Service-Wahl `vault.mountService` → `settings.mountService` → erster unterstützter in Prioritätsreihenfolge (macOS `[MacFuse(100), FuseT(90)]`, Linux `[LinuxFuse(100)]`); macFUSE und FUSE-T schließen sich gegenseitig aus (`CONFLICTING_MOUNT_SERVICES`); Unmount Linux `fusermount3 -u -- <name>` (cwd = Parent), forced `-uz`; macOS `umount -- <p>` / `umount -f -- <p>`; `uid`/`gid`/`attr_timeout`/`entry_timeout` werden vom Adapter interpretiert (Java: libfuse-High-Level), `attr_timeout` Default 1 s wenn nicht gesetzt; Verzeichnislisting liefert `.`/`..`; `chown` no-op (Java), `chmod` no-op mit Erfolg (Ruling, s. u.); xattr → `ENOTSUP`; `rmdir` löscht auf macOS zuerst `._*`/`.DS_Store`-Kinder (Java `deleteAppleDoubleFiles`); Namen FUSE-seitig NFD (macOS) ↔ Vault NFC.
-- Daemon-Design (Spec, mit Abweichungen per Ruling): Elternprozess macht scrypt + Config-Verifikation + Namenslängen-Probe (`maxCleartextFilenameLength == -1` und nicht read-only: `ciphertextLimit < shorteningThreshold ? cleartextLimit : i32::MAX`, persistiert wie `Vault.createCryptoFileSystem`), startet `current_exe() __daemon --vault-id ID --socket P --state-dir D [--settings …]` detached (`setsid`, cwd `/`, stdin `/dev/null`, stdout/stderr → `<id>.log`, Env ohne `CRYPTO_PASSWORD`), verbindet sich (Retry ≤ 30 s) und **schickt den 64-Byte-Rohkey als erste Nachricht über den Socket** (`{"op":"unlock","key":<base64>,…}`, Ruling: kein fd 3), wartet auf `ready`/`failed`, zeroized den Key. State-Dateien `<id>.sock` (0600), `<id>.pid`, `<id>.json`, `<id>.log` im State-Dir (0700; macOS `~/Library/Application Support/Cryptomator/cli-run`, Linux `$XDG_RUNTIME_DIR/crypto` sonst `/tmp/crypto-<uid>`; Override `--state-dir`/`CRYPTO_STATE_DIR`). Protokoll newline-JSON, Daemon grüßt zuerst `{"hello":"crypto-daemon","protocol":1,"vaultId":…,"pid":…}`; Requests `{"id":n,"op":…}`; Antworten `{"id":n,"ok":true,"result":{…}}` / `{"id":n,"ok":false,"error":{"code":…,"message":…}}`; Events mit `seq`, Ringpuffer 1000; Stats-Sampler 1 s (`lastActivity`), Auto-Lock-Tick 60 s (Settings je Tick neu lesen); Shutdown: unmount → join → `CryptoFs::close` → State-Dateien löschen → exit; Unmount-Fehler → weiterlaufen und melden.
-- Exit-Codes: 0 ok, 1 allgemein, 2 Usage, 3 Vault nicht gefunden, 4 Passwort ungültig, 5 falscher Zustand (auch „schon entsperrt“/„nicht entsperrt“), **6 Mount fehlgeschlagen, 7 Unmount fehlgeschlagen (Hinweis `--force`), 10 Daemon nicht erreichbar**, 9 Hub, 12 kein Vault-Verzeichnis. `--json`: ein Objekt, NDJSON bei `--follow`.
-- Passwörter/Keys nie in argv, Logs, Fehlermeldungen oder JSON; Rohkey nur `Zeroizing`; Socket-Nachricht mit Key wird nach dem Parsen gewischt; Log-Datei 0600.
-- Rulings (im Code kommentieren, in Task 16 dokumentieren): (1) fuser-Fork mit Laufzeit-`KernelAbi` statt Compile-Feature, damit ein Binary macFUSE (nativ) und FUSE-T (Linux-Layout) bedient; (2) Daemon mit std-Threads/`UnixListener` statt tokio (tokio kommt mit WebDAV in M5); (3) Key-Übergabe über den Socket statt fd 3; (4) `chmod` ist ein erfolgreicher No-op (cryptofs-Rechte kommen aus den Ciphertext-Dateien; Java setzt POSIX-Rechte auf dem Ciphertext, was den Vault nicht verändert); (5) `--port`, `--store-password`, `--no-store-password` erscheinen erst mit M5/M6; (6) ein eingebauter **Null-Mounter** (`org.cryptomator.cli.NullMountProvider`, nur aktiv bei `CRYPTO_ENABLE_NULL_MOUNTER=1`, in `mounters` nur mit `--all` sichtbar) macht Daemon- und CLI-Lebenszyklus ohne FUSE testbar; (7) macFUSE-Provider ist implementiert, aber unverifiziert (nicht installiert) und wird so dokumentiert; (8) FUSE-T ohne `backend=smb`.
-- M3-Zusagen, die M4 einlöst: `fs`-Schreibkommandos verweigern bei laufendem Daemon (Exit 5); `fs_loop` → `ELOOP`; Verzeichnis-Cache (20 s) und `DirIdLoader`-Cache mit Expiry; `CryptoFs` bekommt `Drop` → `close_all`.
+- Working directory `/Users/rfoerthe/work/cryptomator-cli`, branch `feature/m4-fuse-daemon` (from `main@dd5c038`).
+- License AGPL-3.0-only; `vendor/fuser` keeps its MIT `LICENSE` and gets a `README-VENDORED.md` with the patch list. `#![forbid(unsafe_code)]` stays in `cryptomator-core` and `cryptomator-app`; `cryptomator-mount` (dlopen/FFI) and the binary (`pre_exec`) may use `unsafe` with a `// SAFETY:` comment. No `unwrap()`/`expect()` on input data in library/binary code (tests may). MSRV 1.85 (no `io::ErrorKind` variants newer than 1.85).
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` clean before every commit; the commit message ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. After dependency changes, run `cargo build` once without `--locked` and commit `Cargo.lock`.
+- `tests/fixtures/` read-only; change nothing under `~/.m2` or in the desktop checkout; install **no** FUSE software (FUSE-T 1.2.7 is installed: `/usr/local/lib/libfuse-t.dylib`; macFUSE is NOT installed; `fusermount3` is missing on the Mac). Tests may only really mount under `CRYPTO_E2E_MOUNT=1` (and `#[ignore]`); all other tests run without FUSE, without root, without network.
+- Java parity (Desktop 1.19 / fuse-nio-adapter 6.0.1 / integrations-api 1.9): class names `org.cryptomator.frontend.fuse.mount.{LinuxFuseMountProvider,MacFuseMountProvider,FuseTMountProvider}`; capabilities exactly as in Java (Linux `{MOUNT_FLAGS, MOUNT_TO_EXISTING_DIR}`; macFUSE `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, MOUNT_TO_SYSTEM_CHOSEN_PATH, VOLUME_ID, VOLUME_NAME}`; FUSE-T `{MOUNT_FLAGS, UNMOUNT_FORCED, READ_ONLY, MOUNT_TO_EXISTING_DIR, VOLUME_NAME}`); default flags Linux `-oauto_unmount -ouid=<uid> -ogid=<gid> -oattr_timeout=5`, macFUSE `-ouid=<uid> -ogid=<gid> -oatomic_o_trunc -oauto_xattr -oauto_cache -onoappledouble -odefault_permissions`, FUSE-T `-ononamedattr -orwsize=262144 -ouid=<uid> -ogid=<gid>` (**without** `-obackend=smb`, Spike A); `-ononamedattr` is always appended for FUSE-T; flag parsing as in `AbstractMountBuilder.setMountFlags` (split on `\s+-`, set semantics); `-r` for read-only, `-ovolname=<name>` for VOLUME_NAME; `-obackend=fskit` rejected for macFUSE; mount point policy as in `Mounter.prepareMountPoint`; service selection `vault.mountService` → `settings.mountService` → first supported one in priority order (macOS `[MacFuse(100), FuseT(90)]`, Linux `[LinuxFuse(100)]`); macFUSE and FUSE-T are mutually exclusive (`CONFLICTING_MOUNT_SERVICES`); unmount Linux `fusermount3 -u -- <name>` (cwd = parent), forced `-uz`; macOS `umount -- <p>` / `umount -f -- <p>`; `uid`/`gid`/`attr_timeout`/`entry_timeout` are interpreted by the adapter (Java: libfuse high-level), `attr_timeout` defaults to 1 s when not set; directory listing returns `.`/`..`; `chown` no-op (Java), `chmod` no-op with success (ruling, see below); xattr → `ENOTSUP`; on macOS, `rmdir` first deletes `._*`/`.DS_Store` children (Java `deleteAppleDoubleFiles`); names NFD on the FUSE side (macOS) ↔ NFC in the vault.
+- Daemon design (spec, with deviations per ruling): the parent process does scrypt + config verification + name length probe (`maxCleartextFilenameLength == -1` and not read-only: `ciphertextLimit < shorteningThreshold ? cleartextLimit : i32::MAX`, persisted as in `Vault.createCryptoFileSystem`), starts `current_exe() __daemon --vault-id ID --socket P --state-dir D [--settings …]` detached (`setsid`, cwd `/`, stdin `/dev/null`, stdout/stderr → `<id>.log`, env without `CRYPTO_PASSWORD`), connects (retry ≤ 30 s) and **sends the 64-byte raw key as the first message over the socket** (`{"op":"unlock","key":<base64>,…}`, ruling: no fd 3), waits for `ready`/`failed`, zeroizes the key. State files `<id>.sock` (0600), `<id>.pid`, `<id>.json`, `<id>.log` in the state dir (0700; macOS `~/Library/Application Support/Cryptomator/cli-run`, Linux `$XDG_RUNTIME_DIR/crypto` otherwise `/tmp/crypto-<uid>`; override `--state-dir`/`CRYPTO_STATE_DIR`). Protocol is newline JSON, the daemon greets first with `{"hello":"crypto-daemon","protocol":1,"vaultId":…,"pid":…}`; requests `{"id":n,"op":…}`; responses `{"id":n,"ok":true,"result":{…}}` / `{"id":n,"ok":false,"error":{"code":…,"message":…}}`; events with `seq`, ring buffer 1000; stats sampler 1 s (`lastActivity`), auto-lock tick 60 s (settings re-read on every tick); shutdown: unmount → join → `CryptoFs::close` → delete state files → exit; unmount error → keep running and report.
+- Exit codes: 0 ok, 1 general, 2 usage, 3 vault not found, 4 invalid password, 5 wrong state (including "already unlocked"/"not unlocked"), **6 mount failed, 7 unmount failed (note `--force`), 10 daemon unreachable**, 9 hub, 12 no vault directory. `--json`: one object, NDJSON with `--follow`.
+- Passwords/keys never in argv, logs, error messages or JSON; raw key only as `Zeroizing`; the socket message containing the key is wiped after parsing; log file 0600.
+- Rulings (comment them in the code, document them in Task 16): (1) fuser fork with a runtime `KernelAbi` instead of a compile feature, so that one binary serves macFUSE (native) and FUSE-T (Linux layout); (2) daemon with std threads/`UnixListener` instead of tokio (tokio arrives with WebDAV in M5); (3) key handover over the socket instead of fd 3; (4) `chmod` is a successful no-op (cryptofs permissions come from the ciphertext files; Java sets POSIX permissions on the ciphertext, which does not change the vault); (5) `--port`, `--store-password`, `--no-store-password` only appear with M5/M6; (6) a built-in **null mounter** (`org.cryptomator.cli.NullMountProvider`, only active with `CRYPTO_ENABLE_NULL_MOUNTER=1`, visible in `mounters` only with `--all`) makes the daemon and CLI lifecycle testable without FUSE; (7) the macFUSE provider is implemented but unverified (not installed) and is documented as such; (8) FUSE-T without `backend=smb`.
+- M3 promises that M4 delivers: `fs` write commands refuse while a daemon is running (exit 5); `fs_loop` → `ELOOP`; directory cache (20 s) and `DirIdLoader` cache with expiry; `CryptoFs` gets `Drop` → `close_all`.
 
 ---
 
-## Dateistruktur
+## File structure
 
 ```
 Cargo.toml                                          + [patch.crates-io] fuser = { path = "vendor/fuser" }; deps nix, libc, signal-hook, log
-vendor/fuser/                                       Kopie von fuser 0.18.0 (src, Cargo.toml, LICENSE, build.rs) + README-VENDORED.md
-vendor/fuser/src/mnt/mount_options.rs               + `KernelAbi`, Feld `Config.abi`
-vendor/fuser/src/ll/fuse_abi.rs                     + Linux-Layouts unter macOS: fuse_attr_linux, fuse_setattr_in_linux, fuse_getxattr_in_linux, fuse_setxattr_in_linux
-vendor/fuser/src/ll/reply.rs, src/reply.rs          ABI-bewusste Antworten (entry/attr/create/readdirplus)
-vendor/fuser/src/ll/request.rs, src/request.rs      ABI-bewusstes Parsen (setattr/getxattr/setxattr)
-vendor/fuser/src/session.rs                         `abi` durchreichen (from_fd/new → event loop → requests/replies)
-crates/cryptomator-core/src/fs/mod.rs               + `FilesystemLoop` Marker-Fehler (für ELOOP)
-crates/cryptomator-core/src/fs/path_mapper.rs       + 20-s-Expiry im dir_cache
-crates/cryptomator-core/src/fs/dir_id.rs            + 20-s-Expiry im DirIdLoader-Cache
+vendor/fuser/                                       Copy of fuser 0.18.0 (src, Cargo.toml, LICENSE, build.rs) + README-VENDORED.md
+vendor/fuser/src/mnt/mount_options.rs               + `KernelAbi`, field `Config.abi`
+vendor/fuser/src/ll/fuse_abi.rs                     + Linux layouts on macOS: fuse_attr_linux, fuse_setattr_in_linux, fuse_getxattr_in_linux, fuse_setxattr_in_linux
+vendor/fuser/src/ll/reply.rs, src/reply.rs          ABI-aware replies (entry/attr/create/readdirplus)
+vendor/fuser/src/ll/request.rs, src/request.rs      ABI-aware parsing (setattr/getxattr/setxattr)
+vendor/fuser/src/session.rs                         pass `abi` through (from_fd/new → event loop → requests/replies)
+crates/cryptomator-core/src/fs/mod.rs               + `FilesystemLoop` marker error (for ELOOP)
+crates/cryptomator-core/src/fs/path_mapper.rs       + 20 s expiry in the dir_cache
+crates/cryptomator-core/src/fs/dir_id.rs            + 20 s expiry in the DirIdLoader cache
 crates/cryptomator-core/src/fs/crypto_fs.rs         + impl Drop (close_all)
-crates/cryptomator-mount/Cargo.toml                 features: fuse (default), null-mounter (immer kompiliert, Aktivierung per Env)
+crates/cryptomator-mount/Cargo.toml                 features: fuse (default), null-mounter (always compiled, activated via env)
 crates/cryptomator-mount/src/lib.rs
 crates/cryptomator-mount/src/api.rs                 MountCapability, MountService, MountBuilder, Mount, Mountpoint, MountError, UnmountError
 crates/cryptomator-mount/src/flags.rs               parse_mount_flags, MountFlags (adapter options + passthrough)
@@ -50,33 +50,33 @@ crates/cryptomator-mount/src/fuse/mod.rs
 crates/cryptomator-mount/src/fuse/errno.rs          io::Error → Errno
 crates/cryptomator-mount/src/fuse/inodes.rs         InodeTable
 crates/cryptomator-mount/src/fuse/handles.rs        FileHandles, DirHandles
-crates/cryptomator-mount/src/fuse/ops.rs            VaultOps (fuser-frei, testbar)
+crates/cryptomator-mount/src/fuse/ops.rs            VaultOps (fuser-free, testable)
 crates/cryptomator-mount/src/fuse/adapter.rs        CryptoFuse: impl fuser::Filesystem
 crates/cryptomator-mount/src/fuse/session.rs        FuseSessionHandle (BackgroundSession + unmount)
 crates/cryptomator-mount/src/fuse/linux.rs          LinuxFuseMountProvider
 crates/cryptomator-mount/src/fuse/macos_dl.rs       LibFuse (dlopen), fuse_mount/unmount
 crates/cryptomator-mount/src/fuse/fuset.rs          FuseTMountProvider
 crates/cryptomator-mount/src/fuse/macfuse.rs        MacFuseMountProvider
-crates/cryptomator-mount/examples/spike_macos_dlopen.rs  Spike C (KernelAbi::Linux für FUSE-T)
+crates/cryptomator-mount/examples/spike_macos_dlopen.rs  Spike C (KernelAbi::Linux for FUSE-T)
 crates/cryptomator-mount/tests/mount_e2e.rs         #[ignore], CRYPTO_E2E_MOUNT=1
 docs/superpowers/spikes/2026-09-06-spike-c-fuse-t-linux-abi.md
 crates/cryptomator-app/Cargo.toml                   + cryptomator-mount, log, nix, signal-hook, data-encoding
 crates/cryptomator-app/src/state_dir.rs             StateDir, VaultStateFiles, RunInfo
 crates/cryptomator-app/src/cli_config.rs            CliConfig (cli.json)
 crates/cryptomator-app/src/registry.rs              VaultRegistry, VaultInfo, RuntimeState
-crates/cryptomator-app/src/mounting/mod.rs, mounter.rs   Mounter (SettledMounter-Port), MountHandle
+crates/cryptomator-app/src/mounting/mod.rs, mounter.rs   Mounter (SettledMounter port), MountHandle
 crates/cryptomator-app/src/daemon/mod.rs, protocol.rs, client.rs, server.rs, logging.rs
 crates/cryptomator-app/src/error.rs                 + MountFailed, UnmountFailed, DaemonUnreachable, DaemonError
 crates/crypto/src/cli.rs                            + unlock/lock/status/stats/events/mounters/__daemon, --state-dir
 crates/crypto/src/commands/{unlock,lock,status,stats,events,mounters,daemon}.rs
-crates/crypto/src/commands/fs.rs                    + Verweigerung bei UNLOCKED
+crates/crypto/src/commands/fs.rs                    + refusal when UNLOCKED
 crates/crypto/src/exit.rs                           + 6/7/10
-crates/crypto/tests/cli_daemon.rs                   Lebenszyklus mit Null-Mounter
+crates/crypto/tests/cli_daemon.rs                   Lifecycle with the null mounter
 .github/workflows/ci.yml                            + Jobs mount-e2e-linux (fuse3), mount-e2e-macos (FUSE-T, continue-on-error)
-README.md, CHANGELOG.md, Spec                       aktualisiert
+README.md, CHANGELOG.md, Spec                       updated
 ```
 
-Gemeinsame Typen (Übersicht; Details in den Tasks):
+Shared types (overview; details in the tasks):
 
 - `fuser::KernelAbi::{Native, Linux}` in `fuser::Config.abi` (Task 1).
 - `cryptomator_mount::api::{MountCapability, MountService, MountBuilder, Mount, Mountpoint, MountError, UnmountError, ServiceInfo}` (Task 3); `flags::{MountFlags, parse_mount_flags, AdapterOptions}` (Task 3); `transcoder::NameTranscoder` (Task 3); `mounttab::is_mountpoint` (Task 3).
@@ -85,33 +85,33 @@ Gemeinsame Typen (Übersicht; Details in den Tasks):
 
 ---
 
-### Task 1: fuser vendoren und Laufzeit-ABI-Schalter
+### Task 1: Vendor fuser and add the runtime ABI switch
 
 **Files:**
-- Create: `vendor/fuser/**` (Kopie von `~/.cargo/registry/src/index.crates.io-*/fuser-0.18.0/`: `Cargo.toml`, `build.rs`, `LICENSE`, `README.md`, `src/**`; **ohne** `examples/`, `docs/`, `tests/`, `.github/`), `vendor/fuser/README-VENDORED.md`
+- Create: `vendor/fuser/**` (copy of `~/.cargo/registry/src/index.crates.io-*/fuser-0.18.0/`: `Cargo.toml`, `build.rs`, `LICENSE`, `README.md`, `src/**`; **without** `examples/`, `docs/`, `tests/`, `.github/`), `vendor/fuser/README-VENDORED.md`
 - Modify: `Cargo.toml` (Workspace), `vendor/fuser/src/mnt/mount_options.rs`, `vendor/fuser/src/ll/fuse_abi.rs`, `vendor/fuser/src/ll/reply.rs`, `vendor/fuser/src/reply.rs`, `vendor/fuser/src/ll/request.rs`, `vendor/fuser/src/request.rs`, `vendor/fuser/src/session.rs`
 
 **Interfaces:**
-- Produces: `fuser::KernelAbi { Native, Linux }` (`Copy`, `Default = Native`), `fuser::Config { …, pub abi: KernelAbi }`; `Session::from_fd(fs, fd, acl, config)` und `Session::new` respektieren `config.abi`. Auf Linux sind `Native` und `Linux` identisch.
+- Produces: `fuser::KernelAbi { Native, Linux }` (`Copy`, `Default = Native`), `fuser::Config { …, pub abi: KernelAbi }`; `Session::from_fd(fs, fd, acl, config)` and `Session::new` respect `config.abi`. On Linux, `Native` and `Linux` are identical.
 
-Hintergrund (Spike A): FUSE-T erkennt unseren Client als `libfuse3` und liest die **Linux**-Layouts; fuser schreibt unter `target_os = "macos"` die macFUSE-Layouts. Betroffen (alle `#[cfg(target_os = "macos")]`-Felder in `fuse_abi.rs`): Antworten `fuse_attr` (in `fuse_entry_out`, `fuse_attr_out`, `fuse_create`-Antwort = entry_out + open_out, `readdirplus`-Einträge); Anfragen `fuse_setattr_in` (macOS hängt `bkuptime, chgtime, crtime, bkuptimensec, chgtimensec, crtimensec, flags` an), `fuse_getxattr_in` / `fuse_setxattr_in` (macOS: `position`, `padding`). Die macOS-only-Operationen `FUSE_SETVOLNAME/GETXTIMES/EXCHANGE` schickt FUSE-T nicht. `FUSE_KERNEL_MINOR_VERSION = 19` bleibt (Handshake im Spike ok).
+Background (Spike A): FUSE-T detects our client as `libfuse3` and reads the **Linux** layouts; under `target_os = "macos"` fuser writes the macFUSE layouts. Affected (all `#[cfg(target_os = "macos")]` fields in `fuse_abi.rs`): replies `fuse_attr` (in `fuse_entry_out`, `fuse_attr_out`, the `fuse_create` reply = entry_out + open_out, `readdirplus` entries); requests `fuse_setattr_in` (macOS appends `bkuptime, chgtime, crtime, bkuptimensec, chgtimensec, crtimensec, flags`), `fuse_getxattr_in` / `fuse_setxattr_in` (macOS: `position`, `padding`). FUSE-T does not send the macOS-only operations `FUSE_SETVOLNAME/GETXTIMES/EXCHANGE`. `FUSE_KERNEL_MINOR_VERSION = 19` stays (handshake ok in the spike).
 
-- [ ] **Step 1: Vendoren und einbinden**
+- [ ] **Step 1: Vendor and wire up**
 
 ```bash
 SRC=$(ls -d ~/.cargo/registry/src/index.crates.io-*/fuser-0.18.0 | head -1)
 mkdir -p vendor/fuser && cp -R "$SRC"/{Cargo.toml,build.rs,LICENSE,README.md,src} vendor/fuser/
-rm -rf vendor/fuser/src/../examples  # (nur falls mitkopiert)
+rm -rf vendor/fuser/src/../examples  # (only if it was copied along)
 ```
 
-`Cargo.toml` (Workspace) ergänzen:
+Extend `Cargo.toml` (workspace):
 
 ```toml
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }
 ```
 
-und in `[workspace.dependencies]`: `nix = { version = "0.31", features = ["process", "signal", "user", "fs"] }`, `libc = "0.2"`, `signal-hook = "0.3"`, `log = "0.4"`. `vendor/fuser/Cargo.toml`: `[package] publish = false` ergänzen; `[[example]]`-Blöcke und `[dev-dependencies]`, die nur Beispiele/Tests brauchen, entfernen, damit `--locked`-Builds keine unnötigen Crates ziehen (behalten: alles, was `src/` braucht; `cargo build -p fuser` muss durchlaufen).
+and in `[workspace.dependencies]`: `nix = { version = "0.31", features = ["process", "signal", "user", "fs"] }`, `libc = "0.2"`, `signal-hook = "0.3"`, `log = "0.4"`. In `vendor/fuser/Cargo.toml`: add `[package] publish = false`; remove the `[[example]]` blocks and the `[dev-dependencies]` that only examples/tests need, so `--locked` builds do not pull unnecessary crates (keep everything `src/` needs; `cargo build -p fuser` must succeed).
 
 `vendor/fuser/README-VENDORED.md`:
 
@@ -131,9 +131,9 @@ Patches (all under `#[cfg(target_os = "macos")]`, no behaviour change on Linux):
 Upstream-worthy as a feature-less runtime switch; see docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md.
 ```
 
-- [ ] **Step 2: Failing test im Fork**
+- [ ] **Step 2: Failing test in the fork**
 
-In `vendor/fuser/src/ll/reply.rs` (Testmodul, nur macOS):
+In `vendor/fuser/src/ll/reply.rs` (test module, macOS only):
 
 ```rust
 #[cfg(all(test, target_os = "macos"))]
@@ -168,7 +168,7 @@ mod abi_tests {
 }
 ```
 
-(Die konkreten Konstruktor-Namen/-Signaturen sind an fusers vorhandene `ResponseStruct::new_attr/new_entry/new_create` anzupassen; der Test muss die Byte-Layouts prüfen, nicht Namen.)
+(The concrete constructor names/signatures must be adapted to fuser's existing `ResponseStruct::new_attr/new_entry/new_create`; the test must check the byte layouts, not names.)
 
 - [ ] **Step 3: Patch**
 
@@ -185,9 +185,9 @@ pub enum KernelAbi {
 }
 ```
 
-`Config` bekommt `pub abi: KernelAbi` (Default `Native`; `#[non_exhaustive]` bleibt, Konstruktion über `Config::default()` + Feldzuweisung). `lib.rs`: `pub use crate::mnt::mount_options::KernelAbi;`.
+`Config` gets `pub abi: KernelAbi` (default `Native`; `#[non_exhaustive]` stays, construction via `Config::default()` + field assignment). `lib.rs`: `pub use crate::mnt::mount_options::KernelAbi;`.
 
-`fuse_abi.rs` (macOS): Zwillinge ohne die macOS-Felder:
+`fuse_abi.rs` (macOS): twins without the macOS fields:
 
 ```rust
 #[cfg(target_os = "macos")]
@@ -201,35 +201,35 @@ pub(crate) struct fuse_attr_linux {
     pub(crate) rdev: u32, pub(crate) blksize: u32, pub(crate) flags: u32,
 }
 #[cfg(target_os = "macos")]
-impl From<&fuse_attr> for fuse_attr_linux { /* Feld für Feld, flags = 0 */ }
+impl From<&fuse_attr> for fuse_attr_linux { /* field by field, flags = 0 */ }
 ```
 
-analog `fuse_entry_out_linux { nodeid, generation, entry_valid, attr_valid, entry_valid_nsec, attr_valid_nsec, attr: fuse_attr_linux }`, `fuse_attr_out_linux { attr_valid, attr_valid_nsec, dummy, attr: fuse_attr_linux }`, `fuse_setattr_in_linux` (= die Felder bis einschließlich `unused5`), `fuse_getxattr_in_linux { size, padding }`, `fuse_setxattr_in_linux { size, flags }`.
+likewise `fuse_entry_out_linux { nodeid, generation, entry_valid, attr_valid, entry_valid_nsec, attr_valid_nsec, attr: fuse_attr_linux }`, `fuse_attr_out_linux { attr_valid, attr_valid_nsec, dummy, attr: fuse_attr_linux }`, `fuse_setattr_in_linux` (= the fields up to and including `unused5`), `fuse_getxattr_in_linux { size, padding }`, `fuse_setxattr_in_linux { size, flags }`.
 
-Antwortpfad: Die `Reply*`-Objekte (`src/reply.rs`) erhalten ein Feld `abi: KernelAbi`, gesetzt vom Request-Dispatcher (`src/request.rs` `reply::<T>()` → `Reply::new(unique, sender, abi)`); `ll::ResponseStruct::new_entry/new_attr/new_create` und `DirEntryPlus::new` bekommen den `abi`-Parameter und serialisieren unter macOS bei `Linux` die Zwillinge. Anfragepfad: `ll::request::AnyRequest`/`Operation`-Parsing bekommt `abi`; bei `Linux` werden `setattr/getxattr/setxattr` über die Zwillinge geparst und in dieselben `Operation`-Varianten überführt (`crtime/chgtime/bkuptime/flags` = `None`, `position` = 0). `session.rs`: `Session` speichert `abi` aus `config`, `SessionEventLoop` reicht es an `RequestWithSender::new` durch. Auf Linux (`not(target_os = "macos")`) sind alle Verzweigungen `Native`-Pfade (`let _ = abi;`), damit kein `dead_code` entsteht.
+Reply path: the `Reply*` objects (`src/reply.rs`) get an `abi: KernelAbi` field, set by the request dispatcher (`src/request.rs` `reply::<T>()` → `Reply::new(unique, sender, abi)`); `ll::ResponseStruct::new_entry/new_attr/new_create` and `DirEntryPlus::new` take the `abi` parameter and serialise the twins on macOS when `abi` is `Linux`. Request path: `ll::request::AnyRequest`/`Operation` parsing takes `abi`; with `Linux`, `setattr/getxattr/setxattr` are parsed via the twins and converted into the same `Operation` variants (`crtime/chgtime/bkuptime/flags` = `None`, `position` = 0). `session.rs`: `Session` stores `abi` from `config`, `SessionEventLoop` passes it through to `RequestWithSender::new`. On Linux (`not(target_os = "macos")`) all branches are `Native` paths (`let _ = abi;`), so that no `dead_code` arises.
 
 - [ ] **Step 4: Tests**
 
-Run: `cargo test -p fuser --locked` (macOS) und `cargo build --workspace --locked`
-Expected: PASS inkl. `abi_tests`; Workspace baut mit `fuser (path+vendor/fuser)` im `Cargo.lock`.
+Run: `cargo test -p fuser --locked` (macOS) and `cargo build --workspace --locked`
+Expected: PASS including `abi_tests`; the workspace builds with `fuser (path+vendor/fuser)` in `Cargo.lock`.
 
-- [ ] **Step 5: Gate + Commit** („Vendor fuser 0.18.0 with a runtime Linux-ABI switch for FUSE-T“)
+- [ ] **Step 5: Gate + Commit** ("Vendor fuser 0.18.0 with a runtime Linux-ABI switch for FUSE-T")
 
 ---
 
-### Task 2: Spike C – FUSE-T mit Linux-ABI verifizieren
+### Task 2: Spike C – verify FUSE-T with the Linux ABI
 
 **Files:**
 - Modify: `crates/cryptomator-mount/examples/spike_macos_dlopen.rs`
 - Create: `docs/superpowers/spikes/2026-09-06-spike-c-fuse-t-linux-abi.md`
 
-**Interfaces:** keine neuen; Gate für Task 6/7.
+**Interfaces:** none new; gate for Tasks 6/7.
 
-- [ ] **Step 1: Beispiel anpassen**
+- [ ] **Step 1: Adapt the example**
 
-Im Beispiel: für `fuse-t` die Optionen auf `["-o", "nonamedattr"]` reduzieren (kein `backend=smb`) und `config.abi = KernelAbi::Linux`; für `macfuse` `KernelAbi::Native`. `attr()` liefert `nlink: 2` für das Root-Verzeichnis; `statfs` mit `reply.statfs(1_000_000, 500_000, 500_000, 1000, 500, 4096, 255, 4096)` implementieren (FUSE-T fragt STATFS zuerst).
+In the example: for `fuse-t`, reduce the options to `["-o", "nonamedattr"]` (no `backend=smb`) and set `config.abi = KernelAbi::Linux`; for `macfuse`, `KernelAbi::Native`. `attr()` returns `nlink: 2` for the root directory; implement `statfs` with `reply.statfs(1_000_000, 500_000, 500_000, 1000, 500, 4096, 255, 4096)` (FUSE-T asks for STATFS first).
 
-- [ ] **Step 2: Ausführen (macOS, FUSE-T installiert)**
+- [ ] **Step 2: Run it (macOS, FUSE-T installed)**
 
 ```bash
 mkdir -p /tmp/spike-c-mnt
@@ -237,15 +237,15 @@ cargo run -p cryptomator-mount --example spike_macos_dlopen -- fuse-t /tmp/spike
 sleep 3; mount | grep spike-c-mnt; cat /tmp/spike-c-mnt/hello.txt; ls -la /tmp/spike-c-mnt; umount /tmp/spike-c-mnt; wait
 ```
 
-Expected: Mount erscheint in der mount-Tabelle, `cat` gibt `Hello from crypto spike A!`, `umount` beendet das Programm mit `session ended (unmounted)`. Bei Fehlschlag: FUSE-T-Log `~/Library/Logs/fuse-t/fuse-t.log` auswerten, Struct-Offsets nachrechnen (Spike-A-Tabelle), Fork nachbessern — **Task 2 endet erst, wenn der Mount funktioniert** (Root-Cause-Analyse im Spike-Dokument, ggf. ist `fuse_open_out`/`fuse_statfs_out`/`fuse_init_out` ebenfalls betroffen; alle Layouts gegen `fuse_kernel.h` von libfuse 3 prüfen).
+Expected: the mount appears in the mount table, `cat` prints `Hello from crypto spike A!`, `umount` terminates the program with `session ended (unmounted)`. On failure: inspect the FUSE-T log `~/Library/Logs/fuse-t/fuse-t.log`, recompute the struct offsets (Spike A table), fix up the fork — **Task 2 is not finished until the mount works** (root-cause analysis in the spike document; `fuse_open_out`/`fuse_statfs_out`/`fuse_init_out` may be affected as well; check all layouts against `fuse_kernel.h` from libfuse 3).
 
-- [ ] **Step 3: Spike-Dokument** nach dem Muster von Spike A (Setup, Tabelle Backend/Ergebnis, Beobachtungen, Konsequenz), plus manueller Befund zu `ls -la` (Attribute korrekt: `drwxr-xr-x`, uid/gid).
+- [ ] **Step 3: Spike document** following the pattern of Spike A (setup, backend/result table, observations, consequence), plus a manual finding on `ls -la` (attributes correct: `drwxr-xr-x`, uid/gid).
 
-- [ ] **Step 4: Gate + Commit** („Spike C: FUSE-T mounts with the Linux-ABI fuser session“)
+- [ ] **Step 4: Gate + Commit** ("Spike C: FUSE-T mounts with the Linux-ABI fuser session")
 
 ---
 
-### Task 3: Mount-API, Flag-Parser, Transcoder, Mount-Tabelle
+### Task 3: Mount API, flag parser, transcoder, mount table
 
 **Files:**
 - Modify: `crates/cryptomator-mount/Cargo.toml`, `crates/cryptomator-mount/src/lib.rs`
@@ -298,11 +298,11 @@ pub trait MountService: Send + Sync {
 pub struct ServiceInfo { pub class_name: String, pub display_name: String, pub alias: Option<String>, pub supported: bool, pub priority: u32, pub capabilities: Vec<String>, pub default_mount_flags: String }
 ```
 
-- Produces (`flags.rs`): `parse_mount_flags(&str) -> Vec<String>` (Java-Split, Set-Semantik: Reihenfolge der ersten Nennung, Duplikate entfernt); `struct MountFlags { pub read_only: bool, pub adapter: AdapterOptions, pub passthrough: Vec<String> /* "-o…"-Strings ohne Präfix, z. B. "volname=X" */ }`; `struct AdapterOptions { pub uid: u32, pub gid: u32, pub attr_timeout: Duration /* 1 s */, pub entry_timeout: Duration /* = attr_timeout wenn nicht gesetzt */, pub volname: Option<String>, pub no_apple_double: bool, pub default_permissions: bool, pub allow_other: bool, pub allow_root: bool, pub auto_unmount: bool }`; `MountFlags::from_flags(flags: &[String], current_uid: u32, current_gid: u32) -> Result<MountFlags, MountError>` (erkennt `-r`/`-oro` → read_only; `-ouid=`/`-ogid=` (u32), `-oattr_timeout=`/`-oentry_timeout=` (Sekunden, auch Dezimal), `-ovolname=`, `-onoappledouble`, `-odefault_permissions`, `-oallow_other`, `-oallow_root`, `-oauto_unmount`; alles andere landet in `passthrough`; Flags, die nicht mit `-o` oder `-r` beginnen → `UnsupportedFlag`); `MountFlags::linux_mount_options(&self) -> Vec<fuser::MountOption>` (typisiert: `ro`, `default_permissions`, `auto_unmount`, `fsname=`, `subtype=`, `dev/nodev/suid/nosuid/exec/noexec/atime/noatime/sync/async/dirsync`; **nicht** weitergegeben: `uid/gid/attr_timeout/entry_timeout/volname/noappledouble` (Adapter); Rest `CUSTOM`).
-- Produces (`transcoder.rs`): `#[derive(Clone, Copy)] pub enum FuseNormalization { Nfc, Nfd }`, `pub struct NameTranscoder { fuse: FuseNormalization }` mit `fuse_to_vault(&OsStr) -> Option<String>` (UTF-8 + NFC), `vault_to_fuse(&str) -> OsString` (NFD auf macOS-Providern), `for_platform_default()` (Linux Nfc, macOS Nfd).
-- Produces (`mounttab.rs`): `pub fn is_mountpoint(path: &Path) -> bool` (Linux `/proc/self/mountinfo` Feld 5 mit `\040`-Unescape; macOS `mount`-Kommando: Zeilen `… on <path> (…)`), `pub fn mounted_paths() -> Vec<PathBuf>`.
+- Produces (`flags.rs`): `parse_mount_flags(&str) -> Vec<String>` (Java split, set semantics: order of first mention, duplicates removed); `struct MountFlags { pub read_only: bool, pub adapter: AdapterOptions, pub passthrough: Vec<String> /* "-o…" strings without the prefix, e.g. "volname=X" */ }`; `struct AdapterOptions { pub uid: u32, pub gid: u32, pub attr_timeout: Duration /* 1 s */, pub entry_timeout: Duration /* = attr_timeout when not set */, pub volname: Option<String>, pub no_apple_double: bool, pub default_permissions: bool, pub allow_other: bool, pub allow_root: bool, pub auto_unmount: bool }`; `MountFlags::from_flags(flags: &[String], current_uid: u32, current_gid: u32) -> Result<MountFlags, MountError>` (recognises `-r`/`-oro` → read_only; `-ouid=`/`-ogid=` (u32), `-oattr_timeout=`/`-oentry_timeout=` (seconds, decimals allowed), `-ovolname=`, `-onoappledouble`, `-odefault_permissions`, `-oallow_other`, `-oallow_root`, `-oauto_unmount`; everything else ends up in `passthrough`; flags that do not start with `-o` or `-r` → `UnsupportedFlag`); `MountFlags::linux_mount_options(&self) -> Vec<fuser::MountOption>` (typed: `ro`, `default_permissions`, `auto_unmount`, `fsname=`, `subtype=`, `dev/nodev/suid/nosuid/exec/noexec/atime/noatime/sync/async/dirsync`; **not** passed on: `uid/gid/attr_timeout/entry_timeout/volname/noappledouble` (adapter); the rest `CUSTOM`).
+- Produces (`transcoder.rs`): `#[derive(Clone, Copy)] pub enum FuseNormalization { Nfc, Nfd }`, `pub struct NameTranscoder { fuse: FuseNormalization }` with `fuse_to_vault(&OsStr) -> Option<String>` (UTF-8 + NFC), `vault_to_fuse(&str) -> OsString` (NFD on macOS providers), `for_platform_default()` (Linux Nfc, macOS Nfd).
+- Produces (`mounttab.rs`): `pub fn is_mountpoint(path: &Path) -> bool` (Linux `/proc/self/mountinfo` field 5 with `\040` unescaping; macOS `mount` command: lines `… on <path> (…)`), `pub fn mounted_paths() -> Vec<PathBuf>`.
 
-- [ ] **Step 1: Failing tests** (Unit-Tests je Modul)
+- [ ] **Step 1: Failing tests** (unit tests per module)
 
 `flags.rs`:
 
@@ -362,25 +362,25 @@ fn parses_linux_mountinfo_and_macos_mount_output() {
 }
 ```
 
-`api.rs`: `capabilities` Java-Namen (`MountCapability::MountToExistingDir.java_name() == "MOUNT_TO_EXISTING_DIR"`), `Mountpoint` serialisiert als `{"path": …}` / `{"uri": …}`.
+`api.rs`: `capabilities` Java names (`MountCapability::MountToExistingDir.java_name() == "MOUNT_TO_EXISTING_DIR"`), `Mountpoint` serialises as `{"path": …}` / `{"uri": …}`.
 
-- [ ] **Step 2: Implementierung** gemäß Interfaces; `Cargo.toml` der Mount-Crate: `serde`, `serde_json`, `thiserror`, `unicode-normalization`, `nix` (features `fs`, `user`), `log`; `fuser`/`libloading` unter Feature `fuse` (default).
+- [ ] **Step 2: Implementation** per the interfaces; `Cargo.toml` of the mount crate: `serde`, `serde_json`, `thiserror`, `unicode-normalization`, `nix` (features `fs`, `user`), `log`; `fuser`/`libloading` behind the `fuse` feature (default).
 
 - [ ] **Step 3: Tests** `cargo test -p cryptomator-mount` → PASS
 
-- [ ] **Step 4: Gate + Commit** („Add mount service API, flag parser, name transcoder and mount table probe“)
+- [ ] **Step 4: Gate + Commit** ("Add mount service API, flag parser, name transcoder and mount table probe")
 
 ---
 
-### Task 4: Errno-Mapping, Inode- und Handle-Tabellen (+ `FilesystemLoop`-Marker im Core)
+### Task 4: Errno mapping, inode and handle tables (+ `FilesystemLoop` marker in the core)
 
 **Files:**
 - Create: `crates/cryptomator-mount/src/fuse/mod.rs`, `fuse/errno.rs`, `fuse/inodes.rs`, `fuse/handles.rs`
-- Modify: `crates/cryptomator-core/src/fs/mod.rs` (`FilesystemLoop`), `crates/cryptomator-core/src/fs/symlinks.rs` (nutzt ihn)
+- Modify: `crates/cryptomator-core/src/fs/mod.rs` (`FilesystemLoop`), `crates/cryptomator-core/src/fs/symlinks.rs` (uses it)
 
 **Interfaces:**
-- Core: `pub struct FilesystemLoop(pub String)` (`Display` „…: too many levels of symbolic links“, `std::error::Error`); `fs_loop(path)` erzeugt `io::Error::new(Other, FilesystemLoop(path.to_string()))`; Test: `err.get_ref().and_then(|e| e.downcast_ref::<FilesystemLoop>()).is_some()`.
-- `errno.rs`: `pub fn errno_for(err: &io::Error) -> fuser::Errno`: `raw_os_error()` → `Errno::from_i32`; sonst Kind: NotFound→ENOENT, AlreadyExists→EEXIST, NotADirectory→ENOTDIR, IsADirectory→EISDIR, DirectoryNotEmpty→ENOTEMPTY, PermissionDenied→EACCES, ReadOnlyFilesystem→EROFS, InvalidInput→EINVAL, InvalidData→EIO, UnexpectedEof→EIO, Unsupported→ENOTSUP, `Other` mit `FilesystemLoop` → ELOOP, sonst EIO.
+- Core: `pub struct FilesystemLoop(pub String)` (`Display` "…: too many levels of symbolic links", `std::error::Error`); `fs_loop(path)` creates `io::Error::new(Other, FilesystemLoop(path.to_string()))`; test: `err.get_ref().and_then(|e| e.downcast_ref::<FilesystemLoop>()).is_some()`.
+- `errno.rs`: `pub fn errno_for(err: &io::Error) -> fuser::Errno`: `raw_os_error()` → `Errno::from_i32`; otherwise by kind: NotFound→ENOENT, AlreadyExists→EEXIST, NotADirectory→ENOTDIR, IsADirectory→EISDIR, DirectoryNotEmpty→ENOTEMPTY, PermissionDenied→EACCES, ReadOnlyFilesystem→EROFS, InvalidInput→EINVAL, InvalidData→EIO, UnexpectedEof→EIO, Unsupported→ENOTSUP, `Other` carrying `FilesystemLoop` → ELOOP, otherwise EIO.
 - `inodes.rs`:
 
 ```rust
@@ -398,7 +398,7 @@ impl InodeTable {
 }
 ```
 
-- `handles.rs`: `pub struct FileHandles { … }` mit `insert(OpenFileEntry) -> u64` (ab 1, monoton), `get(u64) -> Option<Arc<OpenFileEntry>>`, `remove(u64) -> Option<OpenFileEntry>`; `pub struct OpenFileEntry { pub handle: cryptomator_core::fs::FileHandle, pub path: CleartextPath, pub append: bool, pub writable: bool }`; `pub struct DirHandles` analog mit `DirSnapshot { pub entries: Vec<DirListing> }`, `DirListing { pub name: OsString, pub ino: u64, pub kind: fuser::FileType }` (inkl. `.`/`..`).
+- `handles.rs`: `pub struct FileHandles { … }` with `insert(OpenFileEntry) -> u64` (starting at 1, monotonic), `get(u64) -> Option<Arc<OpenFileEntry>>`, `remove(u64) -> Option<OpenFileEntry>`; `pub struct OpenFileEntry { pub handle: cryptomator_core::fs::FileHandle, pub path: CleartextPath, pub append: bool, pub writable: bool }`; `pub struct DirHandles` likewise with `DirSnapshot { pub entries: Vec<DirListing> }`, `DirListing { pub name: OsString, pub ino: u64, pub kind: fuser::FileType }` (including `.`/`..`).
 
 - [ ] **Step 1: Failing tests** (`inodes.rs`)
 
@@ -426,17 +426,17 @@ fn lookup_forget_rename_and_remove() {
 }
 ```
 
-`errno.rs`: Tabelle aller Kinds oben + `raw_os_error(libc::ENOSPC)` → `Errno::ENOSPC` + `FilesystemLoop` → `ELOOP`.
+`errno.rs`: table of all kinds listed above + `raw_os_error(libc::ENOSPC)` → `Errno::ENOSPC` + `FilesystemLoop` → `ELOOP`.
 
-- [ ] **Step 2: Implementierung** (Mutex via `lock`-Helfer wie im Core, kein Poison-Panic).
+- [ ] **Step 2: Implementation** (mutex via the `lock` helper as in the core, no poison panic).
 
 - [ ] **Step 3: Tests** `cargo test -p cryptomator-mount fuse:: && cargo test -p cryptomator-core fs::symlinks` → PASS
 
-- [ ] **Step 4: Gate + Commit** („Add errno mapping, inode and handle tables for the FUSE adapter“)
+- [ ] **Step 4: Gate + Commit** ("Add errno mapping, inode and handle tables for the FUSE adapter")
 
 ---
 
-### Task 5: `VaultOps` – der fuser-freie Operationskern
+### Task 5: `VaultOps` – the fuser-free operation core
 
 **Files:**
 - Create: `crates/cryptomator-mount/src/fuse/ops.rs`
@@ -478,9 +478,9 @@ impl VaultOps {
 }
 ```
 
-Regeln: Klartextnamen über `transcoder.fuse_to_vault` (None → `EINVAL`); `Attr` aus `FileAttributes`: `kind` aus `file_type`, `perm = mode & 0o7777` (read-only: Schreibbits gelöscht durch CryptoFs), `nlink = 1` (Root 2), `uid/gid = cfg.options`, `blksize = 4096`, `blocks = size.div_ceil(512)`, Zeiten aus Attributen (`created`/`crtime` fällt auf `modified` zurück); `setattr` mit `size`: über `fh` (wenn gegeben) oder temporär `open_file(read_write)` + `truncate` + `close`; `atime/mtime`: `TimeOrNow::Now` → `SystemTime::now()`, dann `fs.set_times`; `readlink`: `read_link` → `vault_to_fuse` bytes; `rename`: `noreplace` → `replace_existing=false`, sonst `true`; danach `inodes.rename`; `unlink/rmdir`: `fs.delete` (rmdir: vorher `symlink_metadata` muss `is_dir` sein) → `inodes.remove_path`; `open`: `OpenAccMode::O_RDONLY` → `read_only()`, `O_WRONLY|O_RDWR` → `read_write()` (+ `truncate` bei `O_TRUNC`), `append` bei `O_APPEND`; Statistik-Zähler bleiben in `CryptoFs`.
+Rules: cleartext names go through `transcoder.fuse_to_vault` (None → `EINVAL`); `Attr` from `FileAttributes`: `kind` from `file_type`, `perm = mode & 0o7777` (read-only: write bits cleared by CryptoFs), `nlink = 1` (root 2), `uid/gid = cfg.options`, `blksize = 4096`, `blocks = size.div_ceil(512)`, times from the attributes (`created`/`crtime` falls back to `modified`); `setattr` with `size`: via `fh` (when given) or temporarily `open_file(read_write)` + `truncate` + `close`; `atime/mtime`: `TimeOrNow::Now` → `SystemTime::now()`, then `fs.set_times`; `readlink`: `read_link` → `vault_to_fuse` bytes; `rename`: `noreplace` → `replace_existing=false`, otherwise `true`; then `inodes.rename`; `unlink/rmdir`: `fs.delete` (rmdir: `symlink_metadata` must report `is_dir` beforehand) → `inodes.remove_path`; `open`: `OpenAccMode::O_RDONLY` → `read_only()`, `O_WRONLY|O_RDWR` → `read_write()` (+ `truncate` on `O_TRUNC`), `append` on `O_APPEND`; the statistics counters stay in `CryptoFs`.
 
-- [ ] **Step 1: Failing tests** (Testvault via `cryptomator_core` — die Mount-Crate braucht dafür `cryptomator-core` mit Feature `det-rng` als dev-dependency; Helfer `test_fs()` legt mit `initialize` + `open_vault_with_key` ein Vault an, wie `crates/cryptomator-core/src/fs/crypto_fs.rs::tests::test_fs`, aber über die öffentliche API: `initialize(dir, &key, SivGcm, 220, DEFAULT_KEY_ID, &mut DetRng::default())`, `open_vault_with_key`, `CryptoFs::open(opened, CryptoFsOptions::default())`)
+- [ ] **Step 1: Failing tests** (test vault via `cryptomator_core` — for this the mount crate needs `cryptomator-core` with the `det-rng` feature as a dev-dependency; the helper `test_fs()` creates a vault with `initialize` + `open_vault_with_key`, like `crates/cryptomator-core/src/fs/crypto_fs.rs::tests::test_fs`, but through the public API: `initialize(dir, &key, SivGcm, 220, DEFAULT_KEY_ID, &mut DetRng::default())`, `open_vault_with_key`, `CryptoFs::open(opened, CryptoFsOptions::default())`)
 
 ```rust
 #[test]
@@ -554,68 +554,68 @@ fn symlinks_transcoding_and_read_only() {
 fn rmdir_sweeps_apple_double_files_when_configured() { /* create "._x" and ".DS_Store" inside a dir via ops with delete_apple_double = true; rmdir succeeds; with false → ENOTEMPTY */ }
 ```
 
-(`test_ops(read_only)` konfiguriert `NameTranscoder::new(FuseNormalization::Nfd)` und `uid/gid` 501/20.)
+(`test_ops(read_only)` configures `NameTranscoder::new(FuseNormalization::Nfd)` and `uid/gid` 501/20.)
 
-- [ ] **Step 2: Implementierung** gemäß Regeln.
+- [ ] **Step 2: Implementation** per the rules.
 
-- [ ] **Step 3: Tests** `cargo test -p cryptomator-mount fuse::ops` → PASS (3 Tests)
+- [ ] **Step 3: Tests** `cargo test -p cryptomator-mount fuse::ops` → PASS (3 tests)
 
-- [ ] **Step 4: Gate + Commit** („Add the fuser-independent FUSE operation core over CryptoFs“)
+- [ ] **Step 4: Gate + Commit** ("Add the fuser-independent FUSE operation core over CryptoFs")
 
 ---
 
-### Task 6: `impl fuser::Filesystem` und Session-Handle
+### Task 6: `impl fuser::Filesystem` and session handle
 
 **Files:**
 - Create: `crates/cryptomator-mount/src/fuse/adapter.rs`, `fuse/session.rs`
 
 **Interfaces:**
-- `pub struct CryptoFuse { ops: Arc<VaultOps> }` mit `impl fuser::Filesystem`: jede Methode ruft `ops` und übersetzt `Result<_, Errno>` in `reply.*`/`reply.error`; TTLs aus `AdapterOptions` (`attr_timeout`, `entry_timeout`), `Generation(0)`; `init` setzt `KernelConfig` unverändert (Rückgabe `Ok(())`); `destroy` = no-op; `readdir` iteriert `ops.readdir(fh, offset)` und bricht bei `reply.add(..) == true` ab; `readdirplus` → `ENOSYS` (FUSE-T/libfuse fallen auf readdir zurück); `setattr` reicht `size/atime/mtime/fh` durch; `mknod` → `ENOSYS`; `link` → `EPERM`; `getxattr/listxattr/setxattr/removexattr` → `ENOTSUP`; `getlk/setlk/bmap/ioctl/poll/fallocate/lseek/copy_file_range` → Defaults (ENOSYS); macOS: `setvolname` → `reply.ok()`, `getxtimes` → `xtimes(UNIX_EPOCH, crtime)`, `exchange` → `EINVAL`.
-- `session.rs`: `pub struct FuseSessionHandle { bg: Option<fuser::BackgroundSession>, ops: Arc<VaultOps>, mountpoint: PathBuf, unmounter: Box<dyn Fn(bool /*forced*/) -> Result<(), UnmountError> + Send> }` mit `spawn_from_fd(ops, fd: OwnedFd, abi: KernelAbi, unmounter) -> io::Result<Self>` (`Session::from_fd(CryptoFuse, fd, SessionACL::Owner, config)` → `spawn()`), `spawn_mounted(ops, mountpoint, options: Vec<MountOption>, acl, unmounter)` (Linux: `Session::new`), `unmount(&mut self, forced: bool) -> Result<(), UnmountError>` (ruft `unmounter`, wartet bis zu 10 s auf das Ende des Session-Threads (`guard` via `join` in einem Hilfsthread mit Timeout — oder `is_mountpoint`-Polling), bei Timeout ohne `forced` → `UnmountError::Busy`), `join(self) -> io::Result<()>`, `is_in_use()`.
+- `pub struct CryptoFuse { ops: Arc<VaultOps> }` with `impl fuser::Filesystem`: every method calls `ops` and translates `Result<_, Errno>` into `reply.*`/`reply.error`; TTLs from `AdapterOptions` (`attr_timeout`, `entry_timeout`), `Generation(0)`; `init` leaves `KernelConfig` unchanged (returns `Ok(())`); `destroy` = no-op; `readdir` iterates `ops.readdir(fh, offset)` and stops at `reply.add(..) == true`; `readdirplus` → `ENOSYS` (FUSE-T/libfuse fall back to readdir); `setattr` passes `size/atime/mtime/fh` through; `mknod` → `ENOSYS`; `link` → `EPERM`; `getxattr/listxattr/setxattr/removexattr` → `ENOTSUP`; `getlk/setlk/bmap/ioctl/poll/fallocate/lseek/copy_file_range` → defaults (ENOSYS); macOS: `setvolname` → `reply.ok()`, `getxtimes` → `xtimes(UNIX_EPOCH, crtime)`, `exchange` → `EINVAL`.
+- `session.rs`: `pub struct FuseSessionHandle { bg: Option<fuser::BackgroundSession>, ops: Arc<VaultOps>, mountpoint: PathBuf, unmounter: Box<dyn Fn(bool /*forced*/) -> Result<(), UnmountError> + Send> }` with `spawn_from_fd(ops, fd: OwnedFd, abi: KernelAbi, unmounter) -> io::Result<Self>` (`Session::from_fd(CryptoFuse, fd, SessionACL::Owner, config)` → `spawn()`), `spawn_mounted(ops, mountpoint, options: Vec<MountOption>, acl, unmounter)` (Linux: `Session::new`), `unmount(&mut self, forced: bool) -> Result<(), UnmountError>` (calls `unmounter`, waits up to 10 s for the session thread to end (`guard` via `join` on a helper thread with a timeout — or polling `is_mountpoint`), on timeout without `forced` → `UnmountError::Busy`), `join(self) -> io::Result<()>`, `is_in_use()`.
 
-- [ ] **Step 1: Failing test** (Compile-/Typtest ohne Mount): `fn assert_filesystem<T: fuser::Filesystem>() {}` mit `CryptoFuse`; plus `errno`-Roundtrip in `reply`-freien Helfern (`ttl()` liefert `attr_timeout`).
+- [ ] **Step 1: Failing test** (compile/type test without a mount): `fn assert_filesystem<T: fuser::Filesystem>() {}` with `CryptoFuse`; plus an `errno` round trip in `reply`-free helpers (`ttl()` returns `attr_timeout`).
 
-- [ ] **Step 2: Implementierung**; Achtung: `Filesystem: Send + Sync + 'static`; `CryptoFuse` hält nur `Arc<VaultOps>` (`VaultOps: Send + Sync` — compile-time assert wie in M3).
+- [ ] **Step 2: Implementation**; note: `Filesystem: Send + Sync + 'static`; `CryptoFuse` holds only `Arc<VaultOps>` (`VaultOps: Send + Sync` — compile-time assert as in M3).
 
-- [ ] **Step 3: Tests + Gate + Commit** („Add fuser Filesystem adapter and session handle“)
+- [ ] **Step 3: Tests + Gate + Commit** ("Add fuser Filesystem adapter and session handle")
 
 ---
 
-### Task 7: Provider (Linux, FUSE-T, macFUSE, Null) und Registry
+### Task 7: Providers (Linux, FUSE-T, macFUSE, null) and registry
 
 **Files:**
 - Create: `crates/cryptomator-mount/src/fuse/macos_dl.rs`, `fuse/linux.rs`, `fuse/fuset.rs`, `fuse/macfuse.rs`, `crates/cryptomator-mount/src/registry.rs`
-- Modify: `crates/cryptomator-mount/src/lib.rs`, `crates/cryptomator-app/src/mounters.rs` (Alias `null` → `org.cryptomator.cli.NullMountProvider`)
+- Modify: `crates/cryptomator-mount/src/lib.rs`, `crates/cryptomator-app/src/mounters.rs` (alias `null` → `org.cryptomator.cli.NullMountProvider`)
 
 **Interfaces:**
-- `macos_dl.rs` (macOS only): `pub struct LibFuse { lib: libloading::Library, path: PathBuf }` mit `load(path) -> Result<Self, MountError>`, `mount(&self, mountpoint: &Path, opts: &[String] /* "-o" values */) -> Result<OwnedFd, MountError>` (argv `["cryptomator-cli", "-o", opt, …]`, `fuse_mount_compat25`), `unmount(&self, mountpoint)` (`fuse_unmount_compat22`). `// SAFETY:`-Kommentare wie im Spike-Beispiel.
-- `fuset.rs`: `pub struct FuseTMountProvider` (`FUSE_T_DYLIB = "/usr/local/lib/libfuse-t.dylib"`, Env-Override `CRYPTO_FUSE_T_LIB` für Tests), `priority 90`, `display_name "FUSE-T (Experimental)"`, Caps/Defaults wie Global Constraints, Builder: `set_mountpoint` verlangt existierendes Verzeichnis, `combined_flags` = flags ∪ `-r` ∪ `-ovolname=` ∪ `-ononamedattr`; `mount()`: `LibFuse::load` → `MountFlags::from_flags` → `LibFuse::mount(mountpoint, passthrough ∪ ["uid=", "gid=" bleiben enthalten? NEIN: uid/gid werden NICHT weitergereicht, sie gelten dem Adapter; `volname`, `nonamedattr`, `rwsize` etc. werden weitergereicht])` → `FuseSessionHandle::spawn_from_fd(.., KernelAbi::Linux, umount-Kommando)` → `Box<dyn Mount>` (`FuseMount { session, mountpoint, forced_supported: true }`); Unmount: `umount -- <p>` (10 s), forced `umount -f -- <p>`; „not currently mounted“ im stderr → ok.
-- `macfuse.rs`: `MacFuseMountProvider` (`/usr/local/lib/libosxfuse.2.dylib`, `/usr/local/lib/libfuse.2.dylib`; Env `CRYPTO_MACFUSE_LIB`), `priority 100`, `display_name "macFUSE"`, `set_mountpoint` erlaubt `/Volumes/<x>` (nicht existent) oder existierendes Verzeichnis; ohne Mountpoint `/Volumes/<volumeId>`; `-obackend=fskit` → `UnsupportedFlag`; `KernelAbi::Native`; Transcoder Nfd; **im Doc-Kommentar und in `ServiceInfo.display_name` als „(unverified)“ markiert**.
-- `linux.rs`: `LinuxFuseMountProvider`, `priority 100`, `display_name "FUSE"`, supported wenn `fusermount3 -V` (2 s Timeout, `std::process::Command` + Thread mit `wait_timeout` via Polling); `mount()`: `FuseSessionHandle::spawn_mounted(ops, mountpoint, flags.linux_mount_options(), acl)` mit `acl` = `All` bei `allow_other`, `RootAndOwner` bei `allow_root`, sonst `Owner` — **`auto_unmount` verlangt in fuser `acl != Owner`**: Ruling: wenn `auto_unmount` ohne `allow_*` gesetzt ist (Java-Default!), wird `AutoUnmount` NICHT an fuser übergeben (wir unmounten selbst beim Lock; Kommentar). Unmount `fusermount3 -u -- <name>` mit cwd Parent (10 s), forced `-uz`; „not mounted“/„entry for … not found“ → ok.
-- `registry.rs`: `pub const NULL_MOUNTER_CLASS: &str = "org.cryptomator.cli.NullMountProvider"`; `pub struct NullMountProvider` (`is_supported()` ⇔ Env `CRYPTO_ENABLE_NULL_MOUNTER=1`; Caps `{MOUNT_FLAGS, MOUNT_TO_EXISTING_DIR, READ_ONLY, VOLUME_NAME, UNMOUNT_FORCED}`; `mount()` legt im Mountpoint eine Datei `.crypto-null-mount` mit dem Volume-Namen an und entfernt sie beim Unmount; `unmount` schlägt fehl (`Busy`), solange die Env-Variable `CRYPTO_NULL_MOUNT_BUSY=1` gesetzt ist — für Lock-Tests); `pub fn all_services() -> Vec<Box<dyn MountService>>` (Plattform-Reihenfolge nach Priorität, Null zuletzt), `pub fn services() -> Vec<Box<dyn MountService>>` (nur `is_supported`), `pub fn service_by_class(class: &str) -> Option<Box<dyn MountService>>`, `pub fn conflicting_classes(class: &str) -> &'static [&'static str]`, `pub fn service_infos(all: bool) -> Vec<ServiceInfo>`.
+- `macos_dl.rs` (macOS only): `pub struct LibFuse { lib: libloading::Library, path: PathBuf }` with `load(path) -> Result<Self, MountError>`, `mount(&self, mountpoint: &Path, opts: &[String] /* "-o" values */) -> Result<OwnedFd, MountError>` (argv `["cryptomator-cli", "-o", opt, …]`, `fuse_mount_compat25`), `unmount(&self, mountpoint)` (`fuse_unmount_compat22`). `// SAFETY:` comments as in the spike example.
+- `fuset.rs`: `pub struct FuseTMountProvider` (`FUSE_T_DYLIB = "/usr/local/lib/libfuse-t.dylib"`, env override `CRYPTO_FUSE_T_LIB` for tests), `priority 90`, `display_name "FUSE-T (Experimental)"`, caps/defaults as in the Global Constraints, builder: `set_mountpoint` requires an existing directory, `combined_flags` = flags ∪ `-r` ∪ `-ovolname=` ∪ `-ononamedattr`; `mount()`: `LibFuse::load` → `MountFlags::from_flags` → `LibFuse::mount(mountpoint, passthrough ∪ ["uid=", "gid=" still included? NO: uid/gid are NOT passed on, they are for the adapter; `volname`, `nonamedattr`, `rwsize` etc. are passed on])` → `FuseSessionHandle::spawn_from_fd(.., KernelAbi::Linux, umount command)` → `Box<dyn Mount>` (`FuseMount { session, mountpoint, forced_supported: true }`); unmount: `umount -- <p>` (10 s), forced `umount -f -- <p>`; "not currently mounted" on stderr → ok.
+- `macfuse.rs`: `MacFuseMountProvider` (`/usr/local/lib/libosxfuse.2.dylib`, `/usr/local/lib/libfuse.2.dylib`; env `CRYPTO_MACFUSE_LIB`), `priority 100`, `display_name "macFUSE"`, `set_mountpoint` allows `/Volumes/<x>` (non-existent) or an existing directory; without a mountpoint, `/Volumes/<volumeId>`; `-obackend=fskit` → `UnsupportedFlag`; `KernelAbi::Native`; transcoder Nfd; **marked as "(unverified)" in the doc comment and in `ServiceInfo.display_name`**.
+- `linux.rs`: `LinuxFuseMountProvider`, `priority 100`, `display_name "FUSE"`, supported when `fusermount3 -V` works (2 s timeout, `std::process::Command` + thread with `wait_timeout` via polling); `mount()`: `FuseSessionHandle::spawn_mounted(ops, mountpoint, flags.linux_mount_options(), acl)` with `acl` = `All` for `allow_other`, `RootAndOwner` for `allow_root`, otherwise `Owner` — **in fuser, `auto_unmount` requires `acl != Owner`**: ruling: when `auto_unmount` is set without `allow_*` (the Java default!), `AutoUnmount` is NOT handed to fuser (we unmount ourselves on lock; add a comment). Unmount `fusermount3 -u -- <name>` with cwd = parent (10 s), forced `-uz`; "not mounted"/"entry for … not found" → ok.
+- `registry.rs`: `pub const NULL_MOUNTER_CLASS: &str = "org.cryptomator.cli.NullMountProvider"`; `pub struct NullMountProvider` (`is_supported()` ⇔ env `CRYPTO_ENABLE_NULL_MOUNTER=1`; caps `{MOUNT_FLAGS, MOUNT_TO_EXISTING_DIR, READ_ONLY, VOLUME_NAME, UNMOUNT_FORCED}`; `mount()` creates a file `.crypto-null-mount` containing the volume name in the mountpoint and removes it on unmount; `unmount` fails (`Busy`) as long as the environment variable `CRYPTO_NULL_MOUNT_BUSY=1` is set — for lock tests); `pub fn all_services() -> Vec<Box<dyn MountService>>` (platform order by priority, null last), `pub fn services() -> Vec<Box<dyn MountService>>` (only `is_supported`), `pub fn service_by_class(class: &str) -> Option<Box<dyn MountService>>`, `pub fn conflicting_classes(class: &str) -> &'static [&'static str]`, `pub fn service_infos(all: bool) -> Vec<ServiceInfo>`.
 
-- [ ] **Step 1: Failing tests**: Capability-Sets und Default-Flags je Provider (uid/gid aus `nix::unistd::geteuid/getegid`), `FuseT` `combined_flags` enthält `-ononamedattr` genau einmal und `-r` bei read-only, macFUSE lehnt `-obackend=fskit` ab, `is_supported` per Env-Override auf eine Temp-Datei; Null-Mounter: `all_services()` enthält ihn, `services()` nur mit Env; ein vollständiger Null-Mount (mount → `.crypto-null-mount` existiert → unmount → weg; `CRYPTO_NULL_MOUNT_BUSY=1` → `Busy`, forced → ok).
+- [ ] **Step 1: Failing tests**: capability sets and default flags per provider (uid/gid from `nix::unistd::geteuid/getegid`), `FuseT` `combined_flags` contains `-ononamedattr` exactly once and `-r` when read-only, macFUSE rejects `-obackend=fskit`, `is_supported` via an env override pointing at a temp file; null mounter: `all_services()` contains it, `services()` only with the env var; one complete null mount (mount → `.crypto-null-mount` exists → unmount → gone; `CRYPTO_NULL_MOUNT_BUSY=1` → `Busy`, forced → ok).
 
-- [ ] **Step 2: Implementierung**; `mounters.rs` (app) Alias `null` ergänzen.
+- [ ] **Step 2: Implementation**; add the `null` alias in `mounters.rs` (app).
 
-- [ ] **Step 3: Tests + Gate + Commit** („Add FUSE mount providers for Linux, FUSE-T, macFUSE and a null mounter for tests“)
+- [ ] **Step 3: Tests + Gate + Commit** ("Add FUSE mount providers for Linux, FUSE-T, macFUSE and a null mounter for tests")
 
 ---
 
-### Task 8: Mount-E2E-Test (FUSE-T auf diesem Mac) + Java-Gegenprobe
+### Task 8: Mount E2E test (FUSE-T on this Mac) + Java cross-check
 
 **Files:**
 - Create: `crates/cryptomator-mount/tests/mount_e2e.rs`
-- Modify: `crates/crypto/tests/java_interop.rs` (Test `java_reads_files_written_through_the_mount`, `#[ignore]`, nur mit `CRYPTO_E2E_MOUNT=1`)
+- Modify: `crates/crypto/tests/java_interop.rs` (test `java_reads_files_written_through_the_mount`, `#[ignore]`, only with `CRYPTO_E2E_MOUNT=1`)
 
-- [ ] **Step 1: Test** (`#[ignore = "mounts a real FUSE filesystem; CRYPTO_E2E_MOUNT=1"]`): Vault per `initialize` in Tempdir, bester unterstützter Service (`registry::services()[0]`, Null-Mounter ausgeschlossen; ohne FUSE → Test meldet „skipped“ und endet ok), Mountpoint = Tempdir, `set_mount_flags(default)`, `set_volume_name("e2e")`, `mount()`; dann über `std::fs` auf dem Mountpoint: `create_dir`, `write` 100 000 Bytes (Muster), `read` zurück, `metadata().len()`, `rename`, `symlink` + `read_link`, `remove_file`, Listing enthält `.`-lose Namen, NFD-Name `cafe\u{301}.txt` → erscheint im Vault als NFC (per `CryptoFs::read_dir` nach dem Unmount prüfen), `unmount()` + `close()`; danach `is_mountpoint == false` und `CryptoFs` liest den Baum. Timeout-Schutz: alle Zugriffe in einem Thread mit 30-s-Limit.
-- [ ] **Step 2: Java-Gegenprobe**: derselbe Baum, danach `verify_with_java` → Manifest gleicht `crypto fs tree --json --hash`.
-- [ ] **Step 3: Lokal ausführen**: `CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e -- --ignored --nocapture` und der Interop-Test; Ergebnis (inkl. `mount`-Zeile) in den Report; Abweichungen (z. B. FUSE-T-Eigenheiten wie zusätzliche `._`-Dateien) dokumentieren und ggf. im Adapter behandeln.
-- [ ] **Step 4: Gate + Commit** („Add end-to-end mount test and Java verification of mount-written files“)
+- [ ] **Step 1: Test** (`#[ignore = "mounts a real FUSE filesystem; CRYPTO_E2E_MOUNT=1"]`): vault created with `initialize` in a temp dir, best supported service (`registry::services()[0]`, null mounter excluded; without FUSE → the test reports "skipped" and ends ok), mountpoint = temp dir, `set_mount_flags(default)`, `set_volume_name("e2e")`, `mount()`; then via `std::fs` on the mountpoint: `create_dir`, `write` 100 000 bytes (pattern), `read` back, `metadata().len()`, `rename`, `symlink` + `read_link`, `remove_file`, the listing contains names without `.`, NFD name `cafe\u{301}.txt` → appears in the vault as NFC (check with `CryptoFs::read_dir` after the unmount), `unmount()` + `close()`; afterwards `is_mountpoint == false` and `CryptoFs` reads the tree. Timeout protection: all accesses on a thread with a 30 s limit.
+- [ ] **Step 2: Java cross-check**: the same tree, then `verify_with_java` → the manifest matches `crypto fs tree --json --hash`.
+- [ ] **Step 3: Run locally**: `CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e -- --ignored --nocapture` and the interop test; put the result (including the `mount` line) in the report; document deviations (e.g. FUSE-T quirks such as extra `._` files) and handle them in the adapter if needed.
+- [ ] **Step 4: Gate + Commit** ("Add end-to-end mount test and Java verification of mount-written files")
 
 ---
 
-### Task 9: State-Dir, `cli.json`, Vault-Registry, `Mounter`
+### Task 9: State dir, `cli.json`, vault registry, `Mounter`
 
 **Files:**
 - Modify: `crates/cryptomator-app/Cargo.toml` (+ `cryptomator-mount`, `log`, `nix`, `data-encoding`), `crates/cryptomator-app/src/lib.rs`, `src/error.rs`
@@ -646,7 +646,7 @@ impl VaultStateFiles {
 pub fn process_alive(pid: u32) -> bool;              // nix::sys::signal::kill(pid, None)
 ```
 
-- `cli_config.rs`: `cli.json` neben `settings.json` (`SettingsStore::preferred_path().with_file_name("cli.json")`):
+- `cli_config.rs`: `cli.json` next to `settings.json` (`SettingsStore::preferred_path().with_file_name("cli.json")`):
 
 ```rust
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)] #[serde(rename_all = "camelCase", default)]
@@ -670,7 +670,7 @@ impl VaultRegistry {
 }
 ```
 
-- `mounting/mounter.rs` (Port `Mounter` + `SettledMounter`):
+- `mounting/mounter.rs` (port of `Mounter` + `SettledMounter`):
 
 ```rust
 pub struct MountRequest<'a> { pub vault: &'a VaultSettingsJson, pub settings: &'a SettingsJson, pub cli: &'a CliConfig, pub home: &'a Path, pub overrides: MountOverrides }
@@ -680,22 +680,22 @@ pub fn choose_service(req: &MountRequest, services: &[Box<dyn MountService>]) ->
 pub fn mount(req: &MountRequest, fs: Arc<CryptoFs>) -> Result<MountHandle>;
 ```
 
-Mount-Point-Policy exakt wie `Mounter.prepareMountPoint`: user path (`overrides.mount_point` → `vault.mount_point`) → validieren (existierendes Verzeichnis für `MountToExistingDir`; `/Volumes/…` nicht existent für `MountToSystemChosenPath`), sonst `MountPointInvalid`; ohne user path: `MountToSystemChosenPath` → kein Mountpoint; `MountToExistingDir` → `mountPointsDir/<mountName>` anlegen (`cleanup = Some(dir)`); Capabilities anwenden wie `SettledMounter.prepare` (`FILE_SYSTEM_NAME="cryptoFs"`, `READ_ONLY`, `MOUNT_FLAGS` (leer → Default) + `overrides.mount_options` angehängt, `VOLUME_ID=id`, `VOLUME_NAME=mount_name`; `LOOPBACK_PORT` erst M5).
+Mount point policy exactly as in `Mounter.prepareMountPoint`: user path (`overrides.mount_point` → `vault.mount_point`) → validate (existing directory for `MountToExistingDir`; non-existent `/Volumes/…` for `MountToSystemChosenPath`), otherwise `MountPointInvalid`; without a user path: `MountToSystemChosenPath` → no mountpoint; `MountToExistingDir` → create `mountPointsDir/<mountName>` (`cleanup = Some(dir)`); apply capabilities as in `SettledMounter.prepare` (`FILE_SYSTEM_NAME="cryptoFs"`, `READ_ONLY`, `MOUNT_FLAGS` (empty → default) with `overrides.mount_options` appended, `VOLUME_ID=id`, `VOLUME_NAME=mount_name`; `LOOPBACK_PORT` not before M5).
 
-- [ ] **Step 1: Failing tests**: State-Dir Defaults je OS (mit `HOME`/`XDG_RUNTIME_DIR`-Overrides über Parameter, nicht globale Env), `ensure` setzt 0700, `RunInfo` Roundtrip, `process_alive(std::process::id())`; `CliConfig` Default/Load/Save/unknown keys preserved; `runtime_state`: kein State → `Locked` (Disk); Info+PID eines beendeten Prozesses + nicht gemounteter Pfad → Dateien entfernt, `Locked`; Info mit `mountpoint = "/"` (immer gemountet) + toter PID → `StaleMount`; `choose_service` Reihenfolge mit Fake-Services (`is_supported` per Konstruktor); `mount` mit `NullMountProvider`: Mountpoint-Policy legt `mountPointsDir/<mountName>` an, `cleanup` gesetzt, `.crypto-null-mount` existiert; user path, der nicht existiert → `MountPointInvalid`.
+- [ ] **Step 1: Failing tests**: state dir defaults per OS (with `HOME`/`XDG_RUNTIME_DIR` overrides passed as parameters, not as global env), `ensure` sets 0700, `RunInfo` round trip, `process_alive(std::process::id())`; `CliConfig` default/load/save/unknown keys preserved; `runtime_state`: no state → `Locked` (disk); info + PID of a terminated process + a path that is not mounted → files removed, `Locked`; info with `mountpoint = "/"` (always mounted) + dead PID → `StaleMount`; `choose_service` ordering with fake services (`is_supported` via the constructor); `mount` with `NullMountProvider`: the mount point policy creates `mountPointsDir/<mountName>`, `cleanup` is set, `.crypto-null-mount` exists; a user path that does not exist → `MountPointInvalid`.
 
-- [ ] **Step 2: Implementierung**; `lib.rs` re-exportiert `state_dir::*`, `cli_config::CliConfig`, `registry::*`, `mounting::*`.
+- [ ] **Step 2: Implementation**; `lib.rs` re-exports `state_dir::*`, `cli_config::CliConfig`, `registry::*`, `mounting::*`.
 
-- [ ] **Step 3: Tests + Gate + Commit** („Add state dir, cli.json, vault registry and the mounter port“)
+- [ ] **Step 3: Tests + Gate + Commit** ("Add state dir, cli.json, vault registry and the mounter port")
 
 ---
 
-### Task 10: Daemon-Protokoll und Client
+### Task 10: Daemon protocol and client
 
 **Files:**
 - Create: `crates/cryptomator-app/src/daemon/mod.rs`, `daemon/protocol.rs`, `daemon/client.rs`
 
-**Interfaces (`protocol.rs`, alles `serde` + `Serialize/Deserialize`, camelCase):**
+**Interfaces (`protocol.rs`, everything `serde` + `Serialize/Deserialize`, camelCase):**
 
 ```rust
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -716,7 +716,7 @@ pub fn write_line<W: Write>(w: &mut W, value: &impl Serialize) -> io::Result<()>
 pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<String>>;  // None on EOF; max 1 MiB
 ```
 
-Der Key in `Request::Unlock` ist ein `String` — nach dem Decodieren wird die Zeile/das Struct via `zeroize` gewischt (`Zeroizing<String>` für die Rohzeile; `key` in `Zeroizing<String>` via `#[serde(with = …)]`-freiem Umweg: `Request::Unlock` hält `key: Zeroizing<String>`? `serde` für `Zeroizing<String>` ist nicht verfügbar → Ruling: Feld `key: String`, `impl Drop for Request` wischt (`key.zeroize()`) — plus explizites `zeroize` nach dem Decodieren).
+The key in `Request::Unlock` is a `String` — after decoding, the line/struct is wiped via `zeroize` (`Zeroizing<String>` for the raw line; `key` in a `Zeroizing<String>` via a detour that avoids `#[serde(with = …)]`: should `Request::Unlock` hold `key: Zeroizing<String>`? `serde` support for `Zeroizing<String>` is not available → ruling: field `key: String`, `impl Drop for Request` wipes it (`key.zeroize()`) — plus an explicit `zeroize` after decoding).
 
 **`client.rs`:**
 
@@ -731,15 +731,15 @@ impl DaemonClient {
 }
 ```
 
-- [ ] **Step 1: Failing tests**: Serialisierung exakt (`{"op":"lock","id":3,"force":true}`; `Response` ohne `result`-Feld bei Fehler; `StreamItem`); `read_line` EOF/Limit; `DaemonClient` gegen einen In-Prozess-Fake-Server (Thread mit `UnixListener` in Tempdir: schreibt Hello, beantwortet `Ping` mit `ok`, `Lock{force:false}` mit Fehler `UNMOUNT_FAILED`, `Events{follow:true}` mit zwei `StreamItem`s + abschließender Response); `connect` auf nicht existierenden Socket → `DaemonUnreachable`; `connect_with_retry` findet einen Socket, der 300 ms später erscheint.
+- [ ] **Step 1: Failing tests**: exact serialisation (`{"op":"lock","id":3,"force":true}`; `Response` without the `result` field on error; `StreamItem`); `read_line` EOF/limit; `DaemonClient` against an in-process fake server (thread with a `UnixListener` in a temp dir: writes Hello, answers `Ping` with `ok`, `Lock{force:false}` with error `UNMOUNT_FAILED`, `Events{follow:true}` with two `StreamItem`s + a closing Response); `connect` to a non-existent socket → `DaemonUnreachable`; `connect_with_retry` finds a socket that appears 300 ms later.
 
-- [ ] **Step 2: Implementierung**
+- [ ] **Step 2: Implementation**
 
-- [ ] **Step 3: Tests + Gate + Commit** („Add daemon protocol and client“)
+- [ ] **Step 3: Tests + Gate + Commit** ("Add daemon protocol and client")
 
 ---
 
-### Task 11: Daemon-Server
+### Task 11: Daemon server
 
 **Files:**
 - Create: `crates/cryptomator-app/src/daemon/server.rs`, `daemon/logging.rs`
@@ -751,25 +751,25 @@ pub struct DaemonConfig { pub vault_id: String, pub state_dir: StateDir, pub sto
 pub fn run_daemon(config: DaemonConfig, shutdown: Arc<AtomicBool> /* set by signal handler */) -> Result<()>;
 ```
 
-Ablauf (`run_daemon`): `state_dir.ensure()`; Socket-Datei entfernen falls Reste; `UnixListener::bind` + chmod 0600; PID schreiben; Logger (`logging.rs`: `log::Log`-Impl in `<id>.log`, 0600, Level aus `cli.log_level`, Format `2026-09-06T10:00:00Z INFO target: msg`); **Phase 1 (STARTING)**: Verbindungen annehmen (jede in eigenem Thread), Hello senden; nur `Ping`/`Status`/`Shutdown` sowie genau ein `Unlock` erlaubt; ohne `Unlock` binnen `unlock_timeout` → Cleanup + Exit 1. `Unlock`: Key base64 → `[u8;64]` (`Zeroizing`) → `Masterkey::from_raw` → `open_vault_with_key(path, key)` → `CryptoFs::open(opened, CryptoFsOptions { read_only, max_cleartext_name_length, events: sink → Ringpuffer })` → `mounting::mount(MountRequest{… overrides aus Unlock}, Arc<CryptoFs>)` → `RunInfo` schreiben → Antwort `ok` mit `{"mountpoint": …}`; Fehler → Antwort `MOUNT_FAILED` + Cleanup + Exit 6. **Phase 2 (UNLOCKED)**: Requests `Status/Stats/Lock/Events/Ping/Shutdown`; Stats-Sampler-Thread (1 s): Snapshot-Deltas → `StatsResult`-Felder (`bytes_per_second_*`, `cache_hit_rate = hits/accesses` des Intervalls), `last_activity` bei Zuwachs von `accesses_read + accesses_written`; Auto-Lock-Thread (Tick): Settings neu laden (`store.load()`), `auto_lock_when_idle && idle >= auto_lock_idle_seconds` → graceful lock (Fehler loggen, weiter); `Lock{force}`: `handle.mount.unmount()`/`unmount_forced()` (nur wenn `supports_forced`, sonst Fehler `UNMOUNT_FAILED` mit Hinweis) → bei Erfolg `close()`, `cleanup`-Dir entfernen, `fs.close()`, Antwort `ok`, dann Shutdown; bei Fehler Antwort `UNMOUNT_FAILED` und weiterlaufen; `Events{follow}`: Ringpuffer (`VecDeque<EventRecord>` max 1000, `seq` ab 1) ab `since`; bei `follow` bleibt die Verbindung offen und bekommt neue Events (Condvar) bis Client trennt oder Shutdown; `shutdown` (Signal/Request): wie Lock graceful, nach `force_unmount_after` forced; am Ende `remove_all()`, Exit 0.
+Flow (`run_daemon`): `state_dir.ensure()`; remove the socket file if leftovers exist; `UnixListener::bind` + chmod 0600; write the PID; logger (`logging.rs`: `log::Log` impl writing to `<id>.log`, 0600, level from `cli.log_level`, format `2026-09-06T10:00:00Z INFO target: msg`); **Phase 1 (STARTING)**: accept connections (each on its own thread), send Hello; only `Ping`/`Status`/`Shutdown` plus exactly one `Unlock` are allowed; without an `Unlock` within `unlock_timeout` → cleanup + exit 1. `Unlock`: key base64 → `[u8;64]` (`Zeroizing`) → `Masterkey::from_raw` → `open_vault_with_key(path, key)` → `CryptoFs::open(opened, CryptoFsOptions { read_only, max_cleartext_name_length, events: sink → ring buffer })` → `mounting::mount(MountRequest{… overrides from Unlock}, Arc<CryptoFs>)` → write `RunInfo` → reply `ok` with `{"mountpoint": …}`; error → reply `MOUNT_FAILED` + cleanup + exit 6. **Phase 2 (UNLOCKED)**: requests `Status/Stats/Lock/Events/Ping/Shutdown`; stats sampler thread (1 s): snapshot deltas → `StatsResult` fields (`bytes_per_second_*`, `cache_hit_rate = hits/accesses` for the interval), `last_activity` when `accesses_read + accesses_written` grows; auto-lock thread (tick): reload the settings (`store.load()`), `auto_lock_when_idle && idle >= auto_lock_idle_seconds` → graceful lock (log errors, continue); `Lock{force}`: `handle.mount.unmount()`/`unmount_forced()` (only if `supports_forced`, otherwise error `UNMOUNT_FAILED` with a note) → on success `close()`, remove the `cleanup` dir, `fs.close()`, reply `ok`, then shutdown; on error reply `UNMOUNT_FAILED` and keep running; `Events{follow}`: ring buffer (`VecDeque<EventRecord>` max 1000, `seq` starting at 1) from `since`; with `follow` the connection stays open and receives new events (condvar) until the client disconnects or shutdown; `shutdown` (signal/request): graceful like lock, forced after `force_unmount_after`; finally `remove_all()`, exit 0.
 
-Daemon-`Status.state`: `STARTING` bis Mount fertig, `UNLOCKED`, `LOCKING` während des Unmounts. Der Daemon verweigert einen zweiten `Unlock` (`ALREADY_UNLOCKED`).
+The daemon's `Status.state`: `STARTING` until the mount is done, `UNLOCKED`, `LOCKING` during the unmount. The daemon refuses a second `Unlock` (`ALREADY_UNLOCKED`).
 
-- [ ] **Step 1: Failing tests** (In-Prozess, Null-Mounter, Tempdir, `DaemonConfig` mit `services = vec![Box::new(NullMountProvider)]`, `CRYPTO_ENABLE_NULL_MOUNTER=1` per Konstruktor-Flag statt Env, kleine Intervalle): Thread startet `run_daemon`; `DaemonClient::connect_with_retry`; `Status` → `STARTING`; `Unlock` mit Key eines per `initialize` erzeugten Vaults (Settings-Eintrag in einer Tempdir-`settings.json`) → `ok`, Mountpoint = `mountPointsDir/<mountName>`, `.crypto-null-mount` existiert, `RunInfo` geschrieben; zweiter `Unlock` → `ALREADY_UNLOCKED`; `Stats` liefert Felder; Events: Sink-Event (über `fs`-Zugriff auf eine kaputte `dir.c9r` ausgelöst, oder einfacher: der Server bietet in Tests `inject_event`) → `Events{since:0}` liefert es; `Lock{force:false}` mit `CRYPTO_NULL_MOUNT_BUSY=1` (Konstruktor-Flag) → `UNMOUNT_FAILED`, Daemon lebt (`Ping` ok); `Lock{force:true}` → ok, Thread endet, State-Dateien weg, Mount-Dir entfernt. Zweiter Test: Auto-Lock mit `autoLockWhenIdle=true`, `autoLockIdleSeconds=1`, Tick 1 s → Daemon beendet sich binnen 5 s. Dritter Test: Unlock-Timeout (200 ms) ohne Unlock → Exit-Result Err, Dateien weg. Vierter: falscher Key (`open_vault_with_key` → `VaultKeyInvalid`) → `MOUNT_FAILED` … Ruling: Code `MOUNT_FAILED` mit Message `vault key does not match` (Exit 6 im CLI).
+- [ ] **Step 1: Failing tests** (in-process, null mounter, temp dir, `DaemonConfig` with `services = vec![Box::new(NullMountProvider)]`, `CRYPTO_ENABLE_NULL_MOUNTER=1` via a constructor flag instead of env, small intervals): a thread starts `run_daemon`; `DaemonClient::connect_with_retry`; `Status` → `STARTING`; `Unlock` with the key of a vault created via `initialize` (settings entry in a temp-dir `settings.json`) → `ok`, mountpoint = `mountPointsDir/<mountName>`, `.crypto-null-mount` exists, `RunInfo` written; second `Unlock` → `ALREADY_UNLOCKED`; `Stats` returns the fields; events: sink event (triggered by an `fs` access to a broken `dir.c9r`, or more simply: in tests the server offers `inject_event`) → `Events{since:0}` returns it; `Lock{force:false}` with `CRYPTO_NULL_MOUNT_BUSY=1` (constructor flag) → `UNMOUNT_FAILED`, the daemon is alive (`Ping` ok); `Lock{force:true}` → ok, the thread ends, state files gone, mount dir removed. Second test: auto-lock with `autoLockWhenIdle=true`, `autoLockIdleSeconds=1`, tick 1 s → the daemon terminates within 5 s. Third test: unlock timeout (200 ms) without an unlock → exit result Err, files gone. Fourth: wrong key (`open_vault_with_key` → `VaultKeyInvalid`) → `MOUNT_FAILED` … ruling: code `MOUNT_FAILED` with message `vault key does not match` (exit 6 in the CLI).
 
-- [ ] **Step 2: Implementierung** (Threads: accept-loop, pro Verbindung, stats, autolock; gemeinsamer `Arc<Mutex<DaemonState>>`; `shutdown: Arc<AtomicBool>` + Condvar; keine Busy-Loops).
+- [ ] **Step 2: Implementation** (threads: accept loop, one per connection, stats, autolock; shared `Arc<Mutex<DaemonState>>`; `shutdown: Arc<AtomicBool>` + condvar; no busy loops).
 
-- [ ] **Step 3: Tests + Gate + Commit** („Add the vault daemon server“)
+- [ ] **Step 3: Tests + Gate + Commit** ("Add the vault daemon server")
 
 ---
 
-### Task 12: CLI `unlock`, `lock`, `__daemon`, `--state-dir`, `fs`-Verweigerung
+### Task 12: CLI `unlock`, `lock`, `__daemon`, `--state-dir`, `fs` refusal
 
 **Files:**
 - Modify: `crates/crypto/Cargo.toml` (+ `libc`, `signal-hook`, `cryptomator-mount`), `src/cli.rs`, `src/main.rs`, `src/exit.rs`, `src/commands/mod.rs`, `src/commands/fs.rs`
 - Create: `src/commands/unlock.rs`, `src/commands/lock.rs`, `src/commands/daemon.rs`, `crates/crypto/tests/cli_daemon.rs`
 
-**Grammatik:**
+**Grammar:**
 
 ```rust
 /// Unlock and mount a vault in a background daemon
@@ -779,82 +779,82 @@ Lock(LockArgs),       // vaults: Vec<String> (allow_hyphen_values) | --all; --fo
 #[command(name = "__daemon", hide = true)] Daemon(DaemonArgs),  // --vault-id, --socket, --state-dir
 ```
 
-Global: `#[arg(long, global = true, value_name = "PATH", env = "CRYPTO_STATE_DIR")] state_dir: Option<PathBuf>` → `Ctx.state_dir: StateDir`. `exit.rs`: `MOUNT_FAILED = 6`, `UNMOUNT_FAILED = 7`, `DAEMON_UNREACHABLE = 10`; Mapping `AppError::MountFailed/MountPointInvalid → 6`, `UnmountFailed → 7`, `DaemonUnreachable → 10`, `DaemonError{code}`: `UNMOUNT_FAILED → 7`, `MOUNT_FAILED → 6`, `ALREADY_UNLOCKED/NOT_UNLOCKED → 5`, sonst 1.
+Global: `#[arg(long, global = true, value_name = "PATH", env = "CRYPTO_STATE_DIR")] state_dir: Option<PathBuf>` → `Ctx.state_dir: StateDir`. `exit.rs`: `MOUNT_FAILED = 6`, `UNMOUNT_FAILED = 7`, `DAEMON_UNREACHABLE = 10`; mapping `AppError::MountFailed/MountPointInvalid → 6`, `UnmountFailed → 7`, `DaemonUnreachable → 10`, `DaemonError{code}`: `UNMOUNT_FAILED → 7`, `MOUNT_FAILED → 6`, `ALREADY_UNLOCKED/NOT_UNLOCKED → 5`, otherwise 1.
 
-`unlock` (`commands/unlock.rs`): Registry-Zustand prüfen (`Unlocked` → Exit 5 „already unlocked at <mp>“; `StaleMount` → Exit 5 mit Hinweis `crypto lock --force`); `locked_vault`; Hub-Check; Passwort; `open_vault` (scrypt) → Namenslängen-Probe/Persistenz wie in den Global Constraints (nur wenn nicht read-only und `max_cleartext_filename_length == -1`; Ergebnis via `store.update`) → `max_cleartext_name_length` bestimmen; `masterkey.raw()` base64 in `Zeroizing<String>`; Daemon-Spawn (`current_exe()`, Args `__daemon --vault-id … --socket … --state-dir …` + `--settings` wenn gesetzt; `env_remove("CRYPTO_PASSWORD")`; `stdin(null)`, stdout/stderr → Log-Datei (append, 0600); `// SAFETY` `pre_exec(|| { libc::setsid(); Ok(()) })`; `current_dir("/")`); `--foreground`: stattdessen `run_daemon` im Prozess in einem Thread + Client im Hauptthread, Signale (`signal_hook::flag::register(SIGINT/SIGTERM, shutdown)`); Client `connect_with_retry(30 s)` → `Unlock{…}` → Ergebnis: Human `Unlocked <name> at <mountpoint>` / JSON `{ "id", "mountpoint", "mounter", "pid" }`; `--reveal` oder `actionAfterUnlock == REVEAL` → `open <mp>` (macOS) / `xdg-open <mp>` (Linux), Fehler ignorieren; bei `failed` → Log-Tail (letzte 20 Zeilen) auf stderr, Exit 6.
+`unlock` (`commands/unlock.rs`): check the registry state (`Unlocked` → exit 5 "already unlocked at <mp>"; `StaleMount` → exit 5 with a note about `crypto lock --force`); `locked_vault`; hub check; password; `open_vault` (scrypt) → name length probe/persistence as in the Global Constraints (only when not read-only and `max_cleartext_filename_length == -1`; result via `store.update`) → determine `max_cleartext_name_length`; `masterkey.raw()` base64 in a `Zeroizing<String>`; daemon spawn (`current_exe()`, args `__daemon --vault-id … --socket … --state-dir …` + `--settings` when set; `env_remove("CRYPTO_PASSWORD")`; `stdin(null)`, stdout/stderr → log file (append, 0600); `// SAFETY` `pre_exec(|| { libc::setsid(); Ok(()) })`; `current_dir("/")`); `--foreground`: instead run `run_daemon` in-process on a thread + the client on the main thread, signals (`signal_hook::flag::register(SIGINT/SIGTERM, shutdown)`); client `connect_with_retry(30 s)` → `Unlock{…}` → result: human `Unlocked <name> at <mountpoint>` / JSON `{ "id", "mountpoint", "mounter", "pid" }`; `--reveal` or `actionAfterUnlock == REVEAL` → `open <mp>` (macOS) / `xdg-open <mp>` (Linux), ignore errors; on `failed` → log tail (last 20 lines) to stderr, exit 6.
 
-`lock`: für jede Referenz (oder alle `Unlocked/StaleMount` bei `--all`): `Unlocked` → Client `Lock{force}` → Erfolg/Fehler (7); `StaleMount` → Unmount-Kommando direkt (`registry`/Provider `unmount_stale(mountpoint, forced)` → `cryptomator_mount::registry::service_by_class(info.mounter).unmount_path(...)` — ergänze der `MountService`-Trait um `fn unmount_path(&self, mountpoint: &Path, forced: bool) -> Result<(), UnmountError>` in Task 7 (Default `Err`) → **Nachtrag zu Task 7 in diesem Task erlaubt**), danach State-Dateien entfernen; `Locked` → Exit 5 „not unlocked“. JSON `{ "locked": [ids] }`. `--all` ohne unlocked Vaults → ok, „nothing to lock“.
+`lock`: for every reference (or all `Unlocked/StaleMount` with `--all`): `Unlocked` → client `Lock{force}` → success/error (7); `StaleMount` → unmount command directly (`registry`/provider `unmount_stale(mountpoint, forced)` → `cryptomator_mount::registry::service_by_class(info.mounter).unmount_path(...)` — extend the `MountService` trait with `fn unmount_path(&self, mountpoint: &Path, forced: bool) -> Result<(), UnmountError>` in Task 7 (default `Err`) → **an addendum to Task 7 is allowed within this task**), then remove the state files; `Locked` → exit 5 "not unlocked". JSON `{ "locked": [ids] }`. `--all` without unlocked vaults → ok, "nothing to lock".
 
-`fs`-Kommandos (M3-Zusage): `open_fs` prüft `registry.runtime_state` → `Unlocked|StaleMount` → `WrongState { expected: "LOCKED", actual: "UNLOCKED (mounted at …)" }` (Exit 5), auch für Lesekommandos (Ruling: einfacher und sicher).
+`fs` commands (M3 promise): `open_fs` checks `registry.runtime_state` → `Unlocked|StaleMount` → `WrongState { expected: "LOCKED", actual: "UNLOCKED (mounted at …)" }` (exit 5), for read commands too (ruling: simpler and safer).
 
-- [ ] **Step 1: Failing tests (`tests/cli_daemon.rs`)** mit `Sandbox` (+ `--state-dir <sandbox>/state`, Env `CRYPTO_ENABLE_NULL_MOUNTER=1`, `CRYPTO_AUTOLOCK_TICK_SECS=1`): `vault create v` → `unlock v --mounter null --json` → Felder, `mountpoint` = `<sandbox>/home/…/mnt/v`? (`HOME` auf Sandbox setzen; `cli.json` mit `mountPointsDir=<sandbox>/mnt` schreiben) → `.crypto-null-mount` existiert; `status v --json` → `UNLOCKED`; zweites `unlock v` → Exit 5; `fs ls v` → Exit 5; `lock v` → ok, Datei weg, `status` → `LOCKED`; `lock v` erneut → Exit 5; `unlock` mit `CRYPTO_NULL_MOUNT_BUSY=1` dann `lock v` → Exit 7, `lock v --force` → ok; `unlock v --foreground` in einem Hintergrundprozess (`std::process::Command` spawn) + `lock v` beendet ihn (Exit 0 binnen 10 s); Stale: nach `unlock`, Daemon mit `kill -9 <pid>` beenden, `status` → `STALE_MOUNT` … mit Null-Mounter ist nichts wirklich gemountet → `is_mountpoint` false → Registry räumt auf → `LOCKED` (Test prüft genau das). Wrong password → Exit 4 ohne Daemon; `unlock nope` → Exit 3; `--mounter bogus` → Exit 2.
+- [ ] **Step 1: Failing tests (`tests/cli_daemon.rs`)** with `Sandbox` (+ `--state-dir <sandbox>/state`, env `CRYPTO_ENABLE_NULL_MOUNTER=1`, `CRYPTO_AUTOLOCK_TICK_SECS=1`): `vault create v` → `unlock v --mounter null --json` → fields, `mountpoint` = `<sandbox>/home/…/mnt/v`? (point `HOME` at the sandbox; write a `cli.json` with `mountPointsDir=<sandbox>/mnt`) → `.crypto-null-mount` exists; `status v --json` → `UNLOCKED`; a second `unlock v` → exit 5; `fs ls v` → exit 5; `lock v` → ok, file gone, `status` → `LOCKED`; `lock v` again → exit 5; `unlock` with `CRYPTO_NULL_MOUNT_BUSY=1`, then `lock v` → exit 7, `lock v --force` → ok; `unlock v --foreground` in a background process (`std::process::Command` spawn) + `lock v` terminates it (exit 0 within 10 s); stale: after `unlock`, kill the daemon with `kill -9 <pid>`, `status` → `STALE_MOUNT` … with the null mounter nothing is really mounted → `is_mountpoint` false → the registry cleans up → `LOCKED` (the test checks exactly that). Wrong password → exit 4 without a daemon; `unlock nope` → exit 3; `--mounter bogus` → exit 2.
 
-- [ ] **Step 2: Implementierung**
+- [ ] **Step 2: Implementation**
 
-- [ ] **Step 3: Tests + Gate + Commit** („Add crypto unlock and lock with a detached vault daemon“)
+- [ ] **Step 3: Tests + Gate + Commit** ("Add crypto unlock and lock with a detached vault daemon")
 
 ---
 
-### Task 13: CLI `status`, `stats`, `events`, `mounters`, `config` für `cli.json`
+### Task 13: CLI `status`, `stats`, `events`, `mounters`, `config` for `cli.json`
 
 **Files:**
 - Modify: `src/cli.rs`, `src/main.rs`, `src/commands/config.rs`
-- Create: `src/commands/{status,stats,events,mounters}.rs`; Tests in `tests/cli_daemon.rs` ergänzen
+- Create: `src/commands/{status,stats,events,mounters}.rs`; extend the tests in `tests/cli_daemon.rs`
 
-**Grammatik:** `Status { vault: Option<String> }`; `Stats(StatsArgs { vault, --follow, --interval <SECS=1> })`; `Events(EventsArgs { vault, --follow, --since <SEQ=0> })`; `Mounters { --all }`.
+**Grammar:** `Status { vault: Option<String> }`; `Stats(StatsArgs { vault, --follow, --interval <SECS=1> })`; `Events(EventsArgs { vault, --follow, --since <SEQ=0> })`; `Mounters { --all }`.
 
-Ausgabe: `status` human Tabelle `ID  NAME  STATE  MOUNTPOINT` (alle Vaults; mit Argument nur einer), JSON `VaultInfo`(-Array); `stats` human `read 0 B/s  write 0 B/s  cache 0%  total read …  files …  last activity …`, JSON `StatsResult`, `--follow` → NDJSON pro Intervall bis Ctrl-C; `events` human `seq  time  KIND  message`, JSON `EventRecord`-Array / NDJSON bei `--follow`; `mounters` human `ALIAS  CLASS  SUPPORTED  CAPABILITIES`, JSON `ServiceInfo`-Array (ohne `--all` nur unterstützte; Null-Mounter nur mit `--all`). `config get|set` Keys `mountPointsDir`, `defaultMounter` (Alias oder Klasse), `logLevel` (`error|warn|info|debug|trace`), `forceUnmountOnSignalAfterSecs` → `cli.json`.
+Output: `status` human table `ID  NAME  STATE  MOUNTPOINT` (all vaults; with an argument only one), JSON `VaultInfo` (array); `stats` human `read 0 B/s  write 0 B/s  cache 0%  total read …  files …  last activity …`, JSON `StatsResult`, `--follow` → NDJSON per interval until Ctrl-C; `events` human `seq  time  KIND  message`, JSON `EventRecord` array / NDJSON with `--follow`; `mounters` human `ALIAS  CLASS  SUPPORTED  CAPABILITIES`, JSON `ServiceInfo` array (without `--all` only the supported ones; the null mounter only with `--all`). `config get|set` keys `mountPointsDir`, `defaultMounter` (alias or class), `logLevel` (`error|warn|info|debug|trace`), `forceUnmountOnSignalAfterSecs` → `cli.json`.
 
-- [ ] **Step 1: Failing tests**: `status --json` vor/nach Unlock; `stats v --json` Felder; `events v --json` leer → `[]`; `mounters --json` enthält den Null-Mounter nur mit `--all` und `supported=true` nur mit Env; `config set mountPointsDir <dir>` wirkt beim nächsten `unlock`; `config get logLevel` → `info`.
+- [ ] **Step 1: Failing tests**: `status --json` before/after unlock; `stats v --json` fields; `events v --json` empty → `[]`; `mounters --json` contains the null mounter only with `--all` and `supported=true` only with the env var; `config set mountPointsDir <dir>` takes effect on the next `unlock`; `config get logLevel` → `info`.
 
-- [ ] **Step 2: Implementierung + Tests + Gate + Commit** („Add status, stats, events, mounters and cli.json settings“)
+- [ ] **Step 2: Implementation + tests + Gate + Commit** ("Add status, stats, events, mounters and cli.json settings")
 
 ---
 
-### Task 14: Signale, forced-Unmount-Eskalation, Auto-Lock im Foreground-Modus, Reveal
+### Task 14: Signals, forced-unmount escalation, auto-lock in foreground mode, reveal
 
 **Files:**
 - Modify: `src/commands/unlock.rs`, `crates/cryptomator-app/src/daemon/server.rs`
 
-- SIGINT/SIGTERM/SIGHUP im Daemon (detached und foreground) → `shutdown` → graceful unmount; nach `force_unmount_on_signal_after_secs` forced; danach Exit 0 (bzw. 7 wenn auch forced scheitert, Mount bleibt bestehen → Log + State-Dateien bleiben, damit `status` `STALE_MOUNT` zeigt).
-- Auto-Lock-Test über CLI: `vault set v --auto-lock-idle 1` + `unlock` (Tick 1 s) → binnen 5 s `status` → `LOCKED`.
-- Reveal: `--reveal` ruft `open`/`xdg-open`; im Test per Env `CRYPTO_REVEAL_CMD=<script>` überschreibbar (schreibt den Pfad in eine Datei).
+- SIGINT/SIGTERM/SIGHUP in the daemon (detached and foreground) → `shutdown` → graceful unmount; forced after `force_unmount_on_signal_after_secs`; then exit 0 (or 7 if forced fails as well, the mount stays in place → log + state files remain, so that `status` shows `STALE_MOUNT`).
+- Auto-lock test via the CLI: `vault set v --auto-lock-idle 1` + `unlock` (tick 1 s) → within 5 s `status` → `LOCKED`.
+- Reveal: `--reveal` calls `open`/`xdg-open`; overridable in tests via the env var `CRYPTO_REVEAL_CMD=<script>` (writes the path into a file).
 
-- [ ] **Step 1/2/3**: Tests (`tests/cli_daemon.rs`: `--foreground` + SIGTERM → Prozess endet mit 0 und Null-Mount ist weg; Busy + SIGTERM → forced nach 1 s (`config set forceUnmountOnSignalAfterSecs 1`)), Implementierung, Gate + Commit („Handle signals, forced unmount escalation, auto-lock and reveal“)
+- [ ] **Step 1/2/3**: tests (`tests/cli_daemon.rs`: `--foreground` + SIGTERM → the process ends with 0 and the null mount is gone; busy + SIGTERM → forced after 1 s (`config set forceUnmountOnSignalAfterSecs 1`)), implementation, Gate + Commit ("Handle signals, forced unmount escalation, auto-lock and reveal")
 
 ---
 
-### Task 15: M3-Nachträge für den Daemon-Betrieb
+### Task 15: M3 addenda for daemon operation
 
 **Files:**
 - Modify: `crates/cryptomator-core/src/fs/path_mapper.rs`, `fs/dir_id.rs`, `fs/crypto_fs.rs`, `fs/open_files.rs`
 
-- `CryptoPathMapper::dir_cache`: Einträge mit `Instant`; Treffer älter als 20 s werden verworfen und neu geladen (Java `CiphertextDirCache` `expireAfterWrite(20 s)`); `DirIdLoader`: gleiches Expiry (Java hat keins, aber ohne Expiry sieht ein langlebiger Daemon Fremdänderungen an `dir.c9r` nie — Ruling); `CryptoFs`: `impl Drop` → `open_files.close_all()` (Fehler ignoriert, geloggt via `log::warn`); `FileHandle::release`: Flush **außerhalb** des Registry-Locks (Datei-Lock halten, Registry-Lock nur für das Entfernen) — Lock-Reihenfolge bleibt Registry → Datei, indem `release` zuerst den Datei-Lock nimmt, flusht, freigibt, dann Registry+Datei sperrt und die Handle-Zählung prüft; Tests: Expiry über einen injizierbaren Clock-Offset (`#[cfg(test)] fn advance(&self, d: Duration)`), Drop schließt Handles (Datei ist danach flushed), `release` unter Nebenläufigkeit (zwei Threads schreiben zwei Dateien parallel ohne Deadlock).
+- `CryptoPathMapper::dir_cache`: entries carry an `Instant`; hits older than 20 s are discarded and reloaded (Java `CiphertextDirCache` `expireAfterWrite(20 s)`); `DirIdLoader`: same expiry (Java has none, but without an expiry a long-running daemon never sees foreign changes to `dir.c9r` — ruling); `CryptoFs`: `impl Drop` → `open_files.close_all()` (errors ignored, logged via `log::warn`); `FileHandle::release`: flush **outside** the registry lock (hold the file lock, take the registry lock only for the removal) — the lock order stays registry → file, because `release` first takes the file lock, flushes, releases it, then locks registry + file and checks the handle count; tests: expiry via an injectable clock offset (`#[cfg(test)] fn advance(&self, d: Duration)`), Drop closes handles (the file is flushed afterwards), `release` under concurrency (two threads write two files in parallel without a deadlock).
 
-- [ ] **Step 1/2/3**: Tests, Implementierung, Gate + Commit („Add cache expiry, Drop-close and lock-free flush for long-running mounts“)
+- [ ] **Step 1/2/3**: tests, implementation, Gate + Commit ("Add cache expiry, Drop-close and lock-free flush for long-running mounts")
 
 ---
 
-### Task 16: CI, Dokumentation, Spec
+### Task 16: CI, documentation, spec
 
 **Files:**
-- Modify: `.github/workflows/ci.yml`, `README.md`, `CHANGELOG.md`, `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`, `docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md` (Verweis auf Spike C)
+- Modify: `.github/workflows/ci.yml`, `README.md`, `CHANGELOG.md`, `docs/superpowers/specs/2026-09-04-crypto-cli-design.md`, `docs/superpowers/spikes/2026-09-04-spike-a-fuse-t.md` (reference to Spike C)
 
-- CI: Job `mount-e2e-linux` (ubuntu-22.04: `sudo apt-get install -y fuse3`, `CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored`), Job `mount-e2e-macos` (macos-15: `brew install --cask macos-fuse-t/homebrew-cask/fuse-t`, gleicher Test, `continue-on-error: true` — FUSE-T braucht ggf. eine Freigabe), `test`-Job setzt `CRYPTO_ENABLE_NULL_MOUNTER=1` für `cli_daemon`.
-- README: Abschnitte „Mounting“ (Voraussetzungen macOS FUSE-T/macFUSE, Linux `fuse3`; `unlock/lock/status/stats/events/mounters`; State-Dir; `cli.json`-Keys; Signale; `--foreground`), Kommandotabelle ergänzen, Exit-Codes 6/7/10, Hinweis macFUSE unverifiziert, FUSE-T-Einschränkungen (kein xattr, NFS-Backend).
-- CHANGELOG `### M4 – FUSE mount and daemon` inkl. der acht Rulings und der M3-Nachträge; Spec: M4 ✅ (Fußnote: WebDAV/Port M5, Keychain M6), `cryptomator-mount`-Abschnitt an die Implementierung angleichen (`ops.rs`, Null-Mounter, `KernelAbi`, kein `backend=smb`, Key über Socket, std-Threads), Daemon-Design entsprechend korrigieren.
+- CI: job `mount-e2e-linux` (ubuntu-22.04: `sudo apt-get install -y fuse3`, `CRYPTO_E2E_MOUNT=1 cargo test -p cryptomator-mount --test mount_e2e --locked -- --ignored`), job `mount-e2e-macos` (macos-15: `brew install --cask macos-fuse-t/homebrew-cask/fuse-t`, same test, `continue-on-error: true` — FUSE-T may need an approval), the `test` job sets `CRYPTO_ENABLE_NULL_MOUNTER=1` for `cli_daemon`.
+- README: sections "Mounting" (prerequisites macOS FUSE-T/macFUSE, Linux `fuse3`; `unlock/lock/status/stats/events/mounters`; state dir; `cli.json` keys; signals; `--foreground`), extend the command table, exit codes 6/7/10, note that macFUSE is unverified, FUSE-T limitations (no xattr, NFS backend).
+- CHANGELOG `### M4 – FUSE mount and daemon` including the eight rulings and the M3 addenda; spec: M4 ✅ (footnote: WebDAV/port M5, keychain M6), align the `cryptomator-mount` section with the implementation (`ops.rs`, null mounter, `KernelAbi`, no `backend=smb`, key over the socket, std threads), correct the daemon design accordingly.
 
-- [ ] **Step 1/2/3**: Änderungen, Gate (inkl. `cargo test -p crypto --test java_interop --locked -- --ignored` und lokal `CRYPTO_E2E_MOUNT=1 … mount_e2e`), Commit („Document M4 and add mount end-to-end CI jobs“)
+- [ ] **Step 1/2/3**: changes, Gate (including `cargo test -p crypto --test java_interop --locked -- --ignored` and locally `CRYPTO_E2E_MOUNT=1 … mount_e2e`), Commit ("Document M4 and add mount end-to-end CI jobs")
 
 ---
 
-## Selbstprüfung
+## Self-check
 
-- **Spec-Abdeckung M4:** `api.rs`/`registry.rs`/`flags.rs`/`transcoder.rs` (3, 7); `fuse/adapter.rs` + Inode-/Handle-Tabellen + Errno-Mapping (4–6); `fuse/linux.rs`, `macos_dl.rs`, `macfuse.rs`, `fuset.rs` (7) mit fuser-Linux-ABI (1) und Folge-Spike (2); `Mounter` (9); `daemon/{protocol,client,server}` (10, 11); `state_dir.rs`, `cli_config.rs`, `registry.rs` (9); CLI `unlock/lock/status/stats/events/mounters/__daemon` (12–14); Auto-Lock (11, 14); Mount-E2E Linux-CI + FUSE-T macOS (8, 16); Koexistenz mit Desktop-App = manueller Schritt. Nicht in M4 (Spec ordnet zu): WebDAV/`--port` (M5), Keychain/`--store-password` (M6), `fs`-Zugriff auf gemountete Vaults (bleibt verweigert).
-- **Typkonsistenz:** `KernelAbi` (1) in 2, 6, 7; `MountService/MountBuilder/Mount/MountCapability/MountError/UnmountError/ServiceInfo` (3) in 7, 9, 11, 12, 13; `MountFlags/AdapterOptions/parse_mount_flags` (3) in 5, 7; `NameTranscoder` (3) in 5, 7; `is_mountpoint` (3) in 6, 9, 12; `FilesystemLoop`/`errno_for` (4) in 5, 6; `InodeTable/FileHandles/DirHandles/DirListing` (4) in 5; `VaultOps/VaultOpsConfig/Attr` (5) in 6, 7; `CryptoFuse/FuseSessionHandle` (6) in 7; `NullMountProvider/services/all_services/service_by_class/conflicting_classes/service_infos` (7) in 9, 11, 12, 13; `StateDir/VaultStateFiles/RunInfo/process_alive`, `CliConfig`, `VaultRegistry/VaultInfo/RuntimeState`, `Mounter::{choose_service, mount}/MountRequest/MountOverrides/MountHandle` (9) in 11, 12, 13; `protocol::*`, `DaemonClient` (10) in 11, 12, 13; `DaemonConfig/run_daemon` (11) in 12, 14; `unmount_path` (Nachtrag 12→7) in 12.
-- **Platzhalter:** keine; wo Signaturen an fuser-Interna anzupassen sind (Task 1), ist das Zielverhalten byte-genau vorgegeben.
-- **Exit-Code-Mapping:** `MountFailed/MountPointInvalid` → 6, `UnmountFailed`/Daemon `UNMOUNT_FAILED` → 7, `DaemonUnreachable` → 10, `ALREADY_UNLOCKED/NOT_UNLOCKED`/`WrongState` → 5, `MountFailed` beim falschen Key im Daemon → 6 (Passwortfehler werden bereits im Elternprozess mit 4 abgefangen).
+- **Spec coverage M4:** `api.rs`/`registry.rs`/`flags.rs`/`transcoder.rs` (3, 7); `fuse/adapter.rs` + inode/handle tables + errno mapping (4–6); `fuse/linux.rs`, `macos_dl.rs`, `macfuse.rs`, `fuset.rs` (7) with the fuser Linux ABI (1) and the follow-up spike (2); `Mounter` (9); `daemon/{protocol,client,server}` (10, 11); `state_dir.rs`, `cli_config.rs`, `registry.rs` (9); CLI `unlock/lock/status/stats/events/mounters/__daemon` (12–14); auto-lock (11, 14); mount E2E Linux CI + FUSE-T macOS (8, 16); coexistence with the desktop app = a manual step. Not in M4 (assigned elsewhere by the spec): WebDAV/`--port` (M5), keychain/`--store-password` (M6), `fs` access to mounted vaults (stays refused).
+- **Type consistency:** `KernelAbi` (1) in 2, 6, 7; `MountService/MountBuilder/Mount/MountCapability/MountError/UnmountError/ServiceInfo` (3) in 7, 9, 11, 12, 13; `MountFlags/AdapterOptions/parse_mount_flags` (3) in 5, 7; `NameTranscoder` (3) in 5, 7; `is_mountpoint` (3) in 6, 9, 12; `FilesystemLoop`/`errno_for` (4) in 5, 6; `InodeTable/FileHandles/DirHandles/DirListing` (4) in 5; `VaultOps/VaultOpsConfig/Attr` (5) in 6, 7; `CryptoFuse/FuseSessionHandle` (6) in 7; `NullMountProvider/services/all_services/service_by_class/conflicting_classes/service_infos` (7) in 9, 11, 12, 13; `StateDir/VaultStateFiles/RunInfo/process_alive`, `CliConfig`, `VaultRegistry/VaultInfo/RuntimeState`, `Mounter::{choose_service, mount}/MountRequest/MountOverrides/MountHandle` (9) in 11, 12, 13; `protocol::*`, `DaemonClient` (10) in 11, 12, 13; `DaemonConfig/run_daemon` (11) in 12, 14; `unmount_path` (addendum 12→7) in 12.
+- **Placeholders:** none; where signatures have to be adapted to fuser internals (Task 1), the target behaviour is specified byte-exactly.
+- **Exit code mapping:** `MountFailed/MountPointInvalid` → 6, `UnmountFailed`/daemon `UNMOUNT_FAILED` → 7, `DaemonUnreachable` → 10, `ALREADY_UNLOCKED/NOT_UNLOCKED`/`WrongState` → 5, `MountFailed` on a wrong key in the daemon → 6 (password errors are already caught in the parent process with 4).
 
-## Ausführung
+## Execution
 
-`superpowers:subagent-driven-development` mit Opus-5-Subagenten; Reihenfolge 1 → 16. Task 2 und 8 laufen echte FUSE-T-Mounts auf diesem Mac (kein Root nötig); der Implementierer muss die Ergebnisse (mount-Tabelle, `cat`, `umount`) im Report belegen. Tasks 12–14 setzen `CRYPTO_ENABLE_NULL_MOUNTER=1` in den Tests.
+`superpowers:subagent-driven-development` with Opus 5 subagents; order 1 → 16. Tasks 2 and 8 perform real FUSE-T mounts on this Mac (no root required); the implementer must document the results (mount table, `cat`, `umount`) in the report. Tasks 12–14 set `CRYPTO_ENABLE_NULL_MOUNTER=1` in the tests.
