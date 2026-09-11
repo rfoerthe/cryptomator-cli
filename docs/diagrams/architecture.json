@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "crypto — Cryptomator CLI: Workspace Architecture",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/rfoerthe/cryptomator-cli",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "a764e608baaa681eae3b9ffcdc0683aa776a30cc"
+    },
+    "viewBox": [
+      1360,
+      705
+    ],
+    "views": [
+      {
+        "id": "unlock-path",
+        "label": "Unlock path",
+        "focus": [
+          "user",
+          "cli",
+          "app",
+          "daemon",
+          "mount"
+        ],
+        "note": "How a command becomes a running per-vault daemon that owns the mount."
+      },
+      {
+        "id": "crypto-path",
+        "label": "Ciphertext path",
+        "focus": [
+          "cli",
+          "daemon",
+          "core",
+          "vault"
+        ],
+        "note": "Every byte and every file name passes cryptomator-core before it reaches the vault directory."
+      },
+      {
+        "id": "desktop-compat",
+        "label": "Shared with the desktop app",
+        "focus": [
+          "app",
+          "settings",
+          "keychain",
+          "vault"
+        ],
+        "note": "settings.json, the keychain items and the vault format are the three compatibility surfaces."
+      }
+    ],
+    "output": "architecture.html"
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "User / scripts",
+      "sublabel": "terminal, CI",
+      "pos": [
+        40,
+        325
+      ],
+      "size": [
+        124,
+        66
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "crypto",
+      "sublabel": "clap grammar, --json",
+      "tag": "crates/crypto",
+      "pos": [
+        300,
+        325
+      ],
+      "size": [
+        146,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/crypto/src/cli.rs",
+          "label": "grammar"
+        },
+        {
+          "path": "crates/crypto/src/commands/mod.rs",
+          "label": "commands"
+        }
+      ]
+    },
+    {
+      "id": "app",
+      "type": "backend",
+      "label": "cryptomator-app",
+      "sublabel": "settings, keychain, vaults",
+      "tag": "app layer",
+      "pos": [
+        585,
+        325
+      ],
+      "size": [
+        168,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-app/src/lib.rs",
+          "label": "lib.rs"
+        },
+        {
+          "path": "crates/cryptomator-app/src/mounting/mounter.rs",
+          "label": "mounter"
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "crypto __daemon",
+      "sublabel": "one process per vault",
+      "tag": "detached, setsid",
+      "pos": [
+        880,
+        325
+      ],
+      "size": [
+        158,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-app/src/daemon/server.rs",
+          "label": "server"
+        },
+        {
+          "path": "docs/daemon-protocol.md",
+          "label": "wire protocol"
+        }
+      ]
+    },
+    {
+      "id": "mount",
+      "type": "backend",
+      "label": "cryptomator-mount",
+      "sublabel": "MountService registry",
+      "tag": "features: fuse, webdav",
+      "pos": [
+        1160,
+        325
+      ],
+      "size": [
+        160,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-mount/src/api.rs",
+          "label": "traits"
+        },
+        {
+          "path": "crates/cryptomator-mount/src/registry.rs",
+          "label": "registry"
+        }
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "cryptomator-core",
+      "sublabel": "vault format 8, CryptoFs",
+      "tag": "forbid(unsafe_code)",
+      "pos": [
+        585,
+        595
+      ],
+      "size": [
+        166,
+        68
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-core/src/lib.rs",
+          "label": "lib.rs"
+        },
+        {
+          "path": "crates/cryptomator-core/src/fs/crypto_fs.rs",
+          "label": "CryptoFs"
+        }
+      ]
+    },
+    {
+      "id": "settings",
+      "type": "database",
+      "label": "settings.json + cli.json",
+      "sublabel": "unknown keys preserved",
+      "pos": [
+        310,
+        85
+      ],
+      "size": [
+        170,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-app/src/settings/store.rs",
+          "label": "store"
+        }
+      ]
+    },
+    {
+      "id": "keychain",
+      "type": "security",
+      "label": "OS keychain",
+      "sublabel": "macOS + Secret Service",
+      "pos": [
+        580,
+        85
+      ],
+      "size": [
+        168,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-app/src/keychain/mod.rs",
+          "label": "provider"
+        }
+      ]
+    },
+    {
+      "id": "statedir",
+      "type": "database",
+      "label": "State directory",
+      "sublabel": "<id>.sock .pid .json .log",
+      "pos": [
+        880,
+        85
+      ],
+      "size": [
+        160,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-app/src/state_dir.rs",
+          "label": "state_dir"
+        }
+      ]
+    },
+    {
+      "id": "fuse",
+      "type": "external",
+      "label": "FUSE backend",
+      "sublabel": "libfuse3, macFUSE, FUSE-T",
+      "pos": [
+        1160,
+        145
+      ],
+      "size": [
+        160,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-mount/src/fuse/mod.rs",
+          "label": "fuse"
+        }
+      ]
+    },
+    {
+      "id": "webdav",
+      "type": "external",
+      "label": "WebDAV client",
+      "sublabel": "Finder, gio, curl",
+      "pos": [
+        1160,
+        495
+      ],
+      "size": [
+        160,
+        66
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-mount/src/webdav/server.rs",
+          "label": "server"
+        }
+      ]
+    },
+    {
+      "id": "vault",
+      "type": "database",
+      "label": "Vault directory",
+      "sublabel": "d/, vault.cryptomator",
+      "pos": [
+        890,
+        595
+      ],
+      "size": [
+        170,
+        68
+      ],
+      "sources": [
+        {
+          "path": "crates/cryptomator-core/src/vault/open.rs",
+          "label": "open_vault"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "same-uid trust boundary — state dir 0700, socket 0600",
+      "wraps": [
+        "daemon",
+        "statedir"
+      ],
+      "pad": 18
+    }
+  ],
+  "connections": [
+    {
+      "id": "user-cli",
+      "from": "user",
+      "to": "cli",
+      "label": "commands, --json",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cli-app",
+      "from": "cli",
+      "to": "app",
+      "label": "vault ref, passphrase"
+    },
+    {
+      "id": "app-settings",
+      "from": "app",
+      "to": "settings",
+      "label": "flock + tmp-rename",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "app-keychain",
+      "from": "app",
+      "to": "keychain",
+      "label": "load / store passphrase",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDx": 80
+    },
+    {
+      "id": "app-daemon",
+      "from": "app",
+      "to": "daemon",
+      "label": "spawn, then NDJSON",
+      "variant": "emphasis"
+    },
+    {
+      "id": "daemon-statedir",
+      "from": "daemon",
+      "to": "statedir",
+      "label": "pid, socket, run info",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "daemon-mount",
+      "from": "daemon",
+      "to": "mount",
+      "label": "MountBuilder"
+    },
+    {
+      "id": "daemon-core",
+      "from": "daemon",
+      "to": "core",
+      "label": "Cryptor to CryptoFs",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "cli-core",
+      "from": "cli",
+      "to": "core",
+      "label": "mountless fs, health",
+      "variant": "dashed"
+    },
+    {
+      "id": "core-vault",
+      "from": "core",
+      "to": "vault",
+      "label": "SIV names, GCM content",
+      "variant": "security"
+    },
+    {
+      "id": "mount-fuse",
+      "from": "mount",
+      "to": "fuse",
+      "label": "dlopen / fusermount3",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "mount-webdav",
+      "from": "mount",
+      "to": "webdav",
+      "label": "hyper on loopback",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 30
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Four crates, one binary",
+      "items": [
+        "cryptomator-core: std only, no tokio, no unsafe code",
+        "cryptomator-mount: FUSE and WebDAV behind cargo features",
+        "crypto: a thin clap shell that xtask turns into 43 manpages"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Process model",
+      "items": [
+        "unlock spawns one detached daemon per vault",
+        "lock, stats and events are round trips on its socket",
+        "fs, health and migrate open the vault without a daemon"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Compatibility surfaces",
+      "items": [
+        "settings.json is shared; unknown keys survive a write",
+        "Keychain items follow the desktop schema",
+        "The 64-byte key never enters argv, the environment or a file"
+      ]
+    }
+  ]
+}

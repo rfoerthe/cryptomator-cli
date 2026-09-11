@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Vault format 8 — how a cleartext file becomes ciphertext",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      540
+    ],
+    "views": [
+      {
+        "id": "key-material",
+        "label": "Key material",
+        "focus": [
+          "masterkey",
+          "names",
+          "content"
+        ],
+        "note": "One 64-byte masterkey feeds both the name cipher and the content cipher."
+      },
+      {
+        "id": "name-path",
+        "label": "Name path",
+        "focus": [
+          "path",
+          "names",
+          "dirhash",
+          "c9rname"
+        ],
+        "note": "Directory ids are hashed, names are encrypted deterministically with the directory id as associated data."
+      },
+      {
+        "id": "content-path",
+        "label": "Content path",
+        "focus": [
+          "bytes",
+          "content",
+          "chunks",
+          "file"
+        ],
+        "note": "Contents become a header plus independently authenticated 32 KiB chunks."
+      }
+    ],
+    "output": "ciphertext-pipeline.html"
+  },
+  "stages": [
+    {
+      "label": "Input"
+    },
+    {
+      "label": "Encrypt"
+    },
+    {
+      "label": "Ciphertext parts"
+    },
+    {
+      "label": "Vault directory"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "path",
+      "type": "frontend",
+      "label": "Cleartext path",
+      "sublabel": "/docs/report.pdf",
+      "stage": 0,
+      "row": 0,
+      "width": 118,
+      "height": 66,
+      "tag": "UTF-8 NFC"
+    },
+    {
+      "id": "bytes",
+      "type": "frontend",
+      "label": "File contents",
+      "sublabel": "any length",
+      "stage": 0,
+      "row": 2,
+      "width": 118,
+      "height": 66,
+      "tag": "0 .. n bytes"
+    },
+    {
+      "id": "masterkey",
+      "type": "security",
+      "label": "Masterkey 64 B",
+      "sublabel": "encKey + macKey",
+      "stage": 0,
+      "row": 1,
+      "tag": "scrypt N=2^15",
+      "width": 118,
+      "height": 66
+    },
+    {
+      "id": "names",
+      "type": "security",
+      "label": "FileNameCryptor",
+      "sublabel": "AES-SIV",
+      "stage": 1,
+      "row": 0,
+      "tag": "deterministic",
+      "width": 118,
+      "height": 66,
+      "yOffset": 7
+    },
+    {
+      "id": "content",
+      "type": "security",
+      "label": "ContentCryptor",
+      "sublabel": "GCM or CTR+HMAC",
+      "stage": 1,
+      "row": 2,
+      "tag": "random nonce",
+      "width": 118,
+      "height": 66,
+      "yOffset": -7
+    },
+    {
+      "id": "dirhash",
+      "type": "backend",
+      "label": "Hashed dir id",
+      "sublabel": "BASE32(SHA1(SIV))",
+      "stage": 2,
+      "row": 0,
+      "width": 118,
+      "height": 66,
+      "tag": "2 + 30 chars"
+    },
+    {
+      "id": "c9rname",
+      "type": "backend",
+      "label": "Encrypted name",
+      "sublabel": "SIV ciphertext",
+      "stage": 2,
+      "row": 1,
+      "width": 118,
+      "height": 66,
+      "tag": "base64url"
+    },
+    {
+      "id": "chunks",
+      "type": "backend",
+      "label": "Header + chunks",
+      "sublabel": "68 B + n x 32 KiB",
+      "stage": 2,
+      "row": 2,
+      "width": 118,
+      "height": 66,
+      "tag": "AEAD per chunk",
+      "yOffset": -7
+    },
+    {
+      "id": "file",
+      "type": "database",
+      "label": "Vault directory",
+      "sublabel": "d/XX/YYY.../name.c9r",
+      "stage": 3,
+      "row": 1,
+      "tag": "flat layout",
+      "width": 118,
+      "height": 66
+    }
+  ],
+  "flows": [
+    {
+      "id": "f1",
+      "from": "path",
+      "to": "names",
+      "label": "path segments",
+      "classification": "cleartext",
+      "variant": "emphasis"
+    },
+    {
+      "id": "f2",
+      "from": "bytes",
+      "to": "content",
+      "label": "byte stream",
+      "classification": "cleartext",
+      "variant": "emphasis",
+      "labelDy": 16
+    },
+    {
+      "id": "f3",
+      "from": "masterkey",
+      "to": "names",
+      "label": "macKey || encKey",
+      "classification": "never on disk",
+      "variant": "security"
+    },
+    {
+      "id": "f4",
+      "from": "masterkey",
+      "to": "content",
+      "label": "header key wrap",
+      "classification": "never on disk",
+      "variant": "security"
+    },
+    {
+      "id": "f5",
+      "from": "names",
+      "to": "dirhash",
+      "label": "hashed dir id",
+      "classification": "2 + 30 chars"
+    },
+    {
+      "id": "f6",
+      "from": "names",
+      "to": "c9rname",
+      "label": "AD = dir id",
+      "classification": "220 char cap"
+    },
+    {
+      "id": "f7",
+      "from": "content",
+      "to": "chunks",
+      "label": "header + chunks",
+      "classification": "authenticated",
+      "variant": "emphasis"
+    },
+    {
+      "id": "f8",
+      "from": "dirhash",
+      "to": "file",
+      "label": "target dir",
+      "classification": "d/XX/YYY...",
+      "channelX": 598,
+      "route": "vertical-channel"
+    },
+    {
+      "id": "f9",
+      "from": "c9rname",
+      "to": "file",
+      "label": "file name",
+      "labelDx": -2
+    },
+    {
+      "id": "f10",
+      "from": "chunks",
+      "to": "file",
+      "label": "ciphertext body",
+      "classification": "authenticated",
+      "variant": "emphasis",
+      "channelX": 670,
+      "route": "vertical-channel"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Two ciphers, one key",
+      "items": [
+        "encKey is the first 32 bytes, macKey the second",
+        "AES-SIV makes a name deterministic within its directory",
+        "RFC 5297 orders macKey then encKey, the reverse of the Java call"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Chunked content",
+      "items": [
+        "SIV_GCM: 68-byte header, 12 + 32768 + 16 per chunk",
+        "SIV_CTRMAC: 88-byte header, 16 + 32768 + 32 per chunk",
+        "Chunk number and header nonce are the AAD, so no reordering"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Flat on-disk layout",
+      "items": [
+        "Every directory is a 2 + 30 character BASE32 hash under d/",
+        "The tree lives in dir.c9r files, not in directory names",
+        "Names over the threshold become name.c9s plus contents.c9r"
+      ]
+    }
+  ]
+}
