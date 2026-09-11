@@ -1,0 +1,242 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Vault state as the CLI reports it",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      640
+    ],
+    "views": [
+      {
+        "id": "happy-path",
+        "label": "Unlock and lock",
+        "focus": [
+          "directory",
+          "detect",
+          "locked",
+          "unlocked",
+          "relocked"
+        ],
+        "note": "The ordinary round trip: a vault directory becomes a served mount and goes back to rest."
+      },
+      {
+        "id": "recoverable",
+        "label": "Blocked unlocks",
+        "focus": [
+          "locked",
+          "migrate"
+        ],
+        "note": "An older vault format refuses the unlock and has exactly one command that leads back to LOCKED."
+      },
+      {
+        "id": "stale",
+        "label": "When the daemon dies",
+        "focus": [
+          "unlocked",
+          "stale",
+          "relocked"
+        ],
+        "note": "The volume outlives its daemon; only lock --force can take it down."
+      },
+      {
+        "id": "terminal",
+        "label": "No way back",
+        "focus": [
+          "locked",
+          "hub",
+          "relocked",
+          "removed"
+        ],
+        "note": "A Hub vault is refused outright; vault remove only drops the settings entry."
+      }
+    ],
+    "output": "vault-states.html"
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "Vault lifecycle"
+    },
+    {
+      "id": "degraded",
+      "label": "States that block an unlock"
+    },
+    {
+      "id": "terminal",
+      "label": "Terminal outcomes"
+    }
+  ],
+  "states": [
+    {
+      "id": "directory",
+      "type": "start",
+      "label": "Vault directory",
+      "sublabel": "d/ plus key files",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "on disk"
+    },
+    {
+      "id": "detect",
+      "type": "decision",
+      "label": "State check",
+      "sublabel": "on-disk, then runtime",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "no daemon call"
+    },
+    {
+      "id": "locked",
+      "type": "active",
+      "label": "LOCKED",
+      "sublabel": "nobody serves it",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "at rest"
+    },
+    {
+      "id": "unlocked",
+      "type": "active",
+      "label": "UNLOCKED",
+      "sublabel": "daemon owns the mount",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "socket answers"
+    },
+    {
+      "id": "relocked",
+      "type": "success",
+      "label": "LOCKED again",
+      "sublabel": "unmount, flush, zeroize",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "exit 0"
+    },
+    {
+      "id": "migrate",
+      "type": "failure",
+      "label": "NEEDS_MIGRATION",
+      "sublabel": "format 5, 6 or 7",
+      "lane": "degraded",
+      "col": 0,
+      "tag": "exit 5"
+    },
+    {
+      "id": "stale",
+      "type": "failure",
+      "label": "STALE_MOUNT",
+      "sublabel": "daemon gone, volume up",
+      "lane": "degraded",
+      "col": 1,
+      "tag": "exit 7"
+    },
+    {
+      "id": "hub",
+      "type": "failure",
+      "label": "Hub vault",
+      "sublabel": "kid starts with hub+",
+      "lane": "terminal",
+      "col": 0,
+      "tag": "exit 9"
+    },
+    {
+      "id": "removed",
+      "type": "neutral",
+      "label": "No longer registered",
+      "sublabel": "directory stays untouched",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "vault remove"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "to-migrate",
+      "from": "locked",
+      "to": "migrate",
+      "label": "older format",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "from-migrate",
+      "from": "migrate",
+      "to": "locked",
+      "label": "crypto migrate --yes",
+      "variant": "emphasis",
+      "route": "left-channel",
+      "channelX": 325,
+      "labelDy": 40
+    },
+    {
+      "id": "to-stale",
+      "from": "unlocked",
+      "to": "stale",
+      "label": "daemon died",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "from-stale",
+      "from": "stale",
+      "to": "relocked",
+      "label": "lock --force",
+      "variant": "emphasis"
+    },
+    {
+      "id": "to-hub",
+      "from": "locked",
+      "to": "hub",
+      "label": "kid is hub+",
+      "variant": "security",
+      "route": "right-channel",
+      "channelX": 478,
+      "labelDy": -45
+    },
+    {
+      "id": "to-removed",
+      "from": "relocked",
+      "to": "removed",
+      "label": "vault remove",
+      "variant": "dashed",
+      "route": "drop"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "How the state is decided",
+      "items": [
+        "Socket connects: UNLOCKED",
+        "Pid alive, no socket: UNLOCKED",
+        "Volume up, no daemon: STALE_MOUNT"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Ways back to LOCKED",
+      "items": [
+        "crypto migrate walks 5 to 6 to 7 to 8",
+        "recovery-key restore rebuilds keys",
+        "lock --force drops an orphan volume"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "No way back",
+      "items": [
+        "Hub vaults are refused (exit 9)",
+        "vault remove drops only the entry",
+        "status never opens the socket"
+      ]
+    }
+  ]
+}

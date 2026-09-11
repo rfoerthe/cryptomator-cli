@@ -55,6 +55,7 @@ Cargo.toml                 workspace, [workspace.dependencies], profiles (releas
 LICENSE (AGPL-3.0)  README.md  CHANGELOG.md  rust-toolchain.toml (stable)
 docs/superpowers/specs/2026-09-04-crypto-cli-design.md   spec (from this plan)
 docs/{cli.md, daemon-protocol.md, compat.md}
+docs/diagrams/             four diagrams of the delivered code (JSON source + rendered HTML)
 crates/
   cryptomator-core/        vault format 8, crypto, FS logic, health, migration, recovery (std only, no tokio)
   cryptomator-mount/       MountService API + backends (features: fuse, webdav; both by default)
@@ -66,6 +67,11 @@ tests/fixtures/            committed reference vaults + manifests + KAT vectors
 packaging/{homebrew/crypto.rb, README.md}   deb metadata in crates/crypto/Cargo.toml, manpages to target/man (ruling 3)
 .github/workflows/{ci.yml, release.yml}
 ```
+
+The sections below describe the target; [`docs/diagrams/`](../../diagrams/README.md) draws the
+result. Four views — the crate landscape, the `unlock` sequence, the ciphertext pipeline and the
+vault state machine — read out of the delivered code rather than out of this plan, which is why
+they are worth consulting when the two disagree.
 
 ### `cryptomator-core` – modules and Java templates
 

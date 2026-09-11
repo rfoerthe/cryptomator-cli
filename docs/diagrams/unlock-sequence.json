@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "crypto unlock — from passphrase to mounted volume",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1080,
+      575
+    ],
+    "views": [
+      {
+        "id": "before-the-key",
+        "label": "Before any key exists",
+        "focus": [
+          "user",
+          "cli",
+          "keychain",
+          "core"
+        ],
+        "note": "The passphrase is resolved and the key derived in the parent process."
+      },
+      {
+        "id": "handshake",
+        "label": "Spawn and handshake",
+        "focus": [
+          "cli",
+          "daemon"
+        ],
+        "note": "The daemon greets first; the client checks magic and protocol before it sends the key."
+      },
+      {
+        "id": "mount-and-report",
+        "label": "Mount and report",
+        "focus": [
+          "daemon",
+          "mount",
+          "state",
+          "cli"
+        ],
+        "note": "The run info is written only after the volume is really usable."
+      }
+    ],
+    "output": "unlock-sequence.html"
+  },
+  "participants": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "Shell",
+      "sublabel": "user or script"
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "crypto",
+      "sublabel": "parent process"
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "core",
+      "sublabel": "cryptomator-core"
+    },
+    {
+      "id": "keychain",
+      "type": "security",
+      "label": "Keychain",
+      "sublabel": "OS provider"
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "__daemon",
+      "sublabel": "detached child"
+    },
+    {
+      "id": "state",
+      "type": "database",
+      "label": "State dir",
+      "sublabel": "0700 per user"
+    },
+    {
+      "id": "mount",
+      "type": "backend",
+      "label": "MountService",
+      "sublabel": "FUSE or WebDAV"
+    }
+  ],
+  "segments": [
+    {
+      "from": 155,
+      "to": 289,
+      "label": "Passphrase and key"
+    },
+    {
+      "from": 303,
+      "to": 379,
+      "label": "Spawn and handshake"
+    },
+    {
+      "from": 393,
+      "to": 497,
+      "label": "Mount and report"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m01",
+      "from": "user",
+      "to": "cli",
+      "y": 165,
+      "label": "crypto unlock <vault>",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m04",
+      "from": "cli",
+      "to": "keychain",
+      "y": 195,
+      "label": "load passphrase by vault id",
+      "variant": "security"
+    },
+    {
+      "id": "m05",
+      "from": "keychain",
+      "to": "cli",
+      "y": 223,
+      "label": "passphrase",
+      "variant": "return"
+    },
+    {
+      "id": "m06",
+      "from": "cli",
+      "to": "core",
+      "y": 251,
+      "label": "open_vault: scrypt + AES-KW unwrap",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m07",
+      "from": "core",
+      "to": "cli",
+      "y": 279,
+      "label": "64-byte masterkey, name limit",
+      "variant": "return"
+    },
+    {
+      "id": "m08",
+      "from": "cli",
+      "to": "daemon",
+      "y": 313,
+      "label": "spawn __daemon: setsid, cwd /",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m10",
+      "from": "daemon",
+      "to": "cli",
+      "y": 341,
+      "label": "hello: magic, protocol 1, pid",
+      "variant": "return"
+    },
+    {
+      "id": "m11",
+      "from": "cli",
+      "to": "daemon",
+      "y": 369,
+      "label": "op unlock: base64 key + options",
+      "variant": "security"
+    },
+    {
+      "id": "m12",
+      "from": "daemon",
+      "to": "mount",
+      "y": 403,
+      "label": "mount CryptoFs, wait for mount table",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m14",
+      "from": "daemon",
+      "to": "state",
+      "y": 431,
+      "label": "pid, socket, run info",
+      "variant": "dashed"
+    },
+    {
+      "id": "m15",
+      "from": "daemon",
+      "to": "cli",
+      "y": 459,
+      "label": "{ mountpoint }",
+      "variant": "return"
+    },
+    {
+      "id": "m16",
+      "from": "cli",
+      "to": "user",
+      "y": 487,
+      "label": "mount point printed, key zeroized",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "cli",
+      "from": 160,
+      "to": 492,
+      "type": "frontend"
+    },
+    {
+      "participant": "keychain",
+      "from": 190,
+      "to": 228,
+      "type": "security"
+    },
+    {
+      "participant": "core",
+      "from": 246,
+      "to": 284,
+      "type": "backend"
+    },
+    {
+      "participant": "daemon",
+      "from": 308,
+      "to": 470,
+      "type": "backend"
+    },
+    {
+      "participant": "mount",
+      "from": 398,
+      "to": 436,
+      "type": "backend"
+    },
+    {
+      "participant": "state",
+      "from": 426,
+      "to": 444,
+      "type": "database"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Where the key lives",
+      "items": [
+        "scrypt runs in the parent, so a wrong passphrase fails at once",
+        "The key travels base64 as the first message on the socket",
+        "Both copies are Zeroizing buffers and are wiped after the send"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Why the daemon greets first",
+      "items": [
+        "The client checks magic and protocol 1 before it sends anything",
+        "A socket left by another program is never fed a vault key",
+        "A missing socket is retried every 100 ms; both failures exit 10"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Ordering guarantees",
+      "items": [
+        "Hub vault, bad mounter and missing keychain fail before the prompt",
+        "Write order is pid, then socket, then run info",
+        "The answer waits until the mount point is in the mount table"
+      ]
+    }
+  ]
+}
