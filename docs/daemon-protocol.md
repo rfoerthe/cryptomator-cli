@@ -274,6 +274,10 @@ therefore ask, in this order:
    absolute path is never a stale mount: it is a WebDAV URL, and that server died with its daemon.
 5. Nothing mounted either → any leftover files are removed on the spot and the vault falls back to
    its on-disk state (`LOCKED`, `MISSING`, …).
+6. A vault that is `LOCKED` on disk but has a volume in the mount table at its configured
+   `mountPoint`, or at `<the desktop app's mountPointsDir>/<name>` without one, →
+   **`UNLOCKED_EXTERNAL`**: another application (the Cryptomator desktop app, which writes no state
+   files) has it unlocked. `crypto` has no daemon to ask and refuses to lock or unlock it.
 
 A daemon whose *own* unmount failed on shutdown deliberately keeps its run info and exits `7`, so
 the volume it left behind stays addressable through exactly this path.

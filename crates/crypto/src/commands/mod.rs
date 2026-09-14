@@ -23,8 +23,8 @@ use cryptomator_app::settings::{
     normalize_vault_path, resolve_vault_index, SettingsStore, VaultSettingsJson,
 };
 use cryptomator_app::{
-    AppError, ErrorBody, Keychain, KeychainError, KeychainSource, RuntimeState, StateDir,
-    VaultInfo, VaultRegistry,
+    default_mount_points_dir, AppError, ErrorBody, Keychain, KeychainError, KeychainSource,
+    Platform, RuntimeState, StateDir, VaultInfo, VaultRegistry,
 };
 use cryptomator_core::constants::DATA_DIR_NAME;
 use cryptomator_core::{determine_vault_state, VaultState};
@@ -74,8 +74,15 @@ impl Ctx {
     }
 
     /// The vaults of `settings.json` together with what the state directory says about them.
+    ///
+    /// Without `$HOME` there is no desktop mount-points directory to look in, and only a vault's
+    /// own `mountPoint` can reveal that the desktop app has it unlocked.
     pub fn registry(&self) -> VaultRegistry {
+        let desktop_mount_points_dir = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| default_mount_points_dir(Platform::current(), Path::new(&home)));
         VaultRegistry::new(self.store.clone(), self.state_dir.clone())
+            .with_desktop_mount_points_dir(desktop_mount_points_dir)
     }
 
     /// The keychain provider for this run, or `None` when there is none to use: `--no-keychain`,

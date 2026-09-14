@@ -36,16 +36,14 @@ pub fn key_loader_scheme(vault_path: &Path) -> Option<String> {
 /// unlocked vault `LOCKED` -- the ciphertext on disk looks the same either way.
 ///
 /// `mountedAt` and `mountPoint` are two different things and both are here on purpose: the first
-/// is where the volume *is* mounted (`null` unless a daemon is serving it), the second the mount
+/// is where the volume *is* mounted (`null` unless a daemon or another application is serving
+/// it), the second the mount
 /// point `vault set --mount-point` configured, which is `null` for a vault that takes the default
 /// under `mountPointsDir`.
 pub fn vault_json(registry: &VaultRegistry, vault: &VaultSettingsJson) -> Result<Value> {
-    let (state, run_info) = registry.state_of(vault)?;
-    // `is_mounted`, the same guard `VaultRegistry::info_of` uses: a run info that outlived its
-    // daemon would otherwise report a mount point that is not there any more.
-    let mounted_at = run_info
-        .filter(|_| state.is_mounted())
-        .and_then(|i| i.mountpoint);
+    // The same answer `crypto status` gives, mount point included.
+    let info = registry.info_of(vault)?;
+    let (state, mounted_at) = (info.state, info.mountpoint);
     let mut value = json!({
         "id": vault.id,
         "displayName": vault.display_name,
