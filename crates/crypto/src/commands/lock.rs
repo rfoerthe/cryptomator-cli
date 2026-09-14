@@ -8,6 +8,7 @@ use crate::cli::LockArgs;
 use crate::commands::Ctx;
 use crate::exit;
 use anyhow::{Context, Result};
+use cryptomator_app::registry::EXTERNAL_HINT;
 use cryptomator_app::{AppError, DaemonClient, RuntimeState, VaultInfo};
 use cryptomator_mount::registry;
 use serde_json::json;
@@ -104,6 +105,18 @@ fn lock_one(ctx: &Ctx, info: &VaultInfo, force: bool) -> Result<()> {
             Ok(())
         }
         RuntimeState::StaleMount => unmount_stale(ctx, info, force),
+        // No daemon of ours to ask, and unmounting behind the other application's back would
+        // leave it serving a volume that is gone.
+        RuntimeState::UnlockedExternal => Err(AppError::WrongState {
+            expected: RuntimeState::Unlocked.as_str().to_owned(),
+            actual: format!(
+                "{} (mounted at {}){}",
+                info.state,
+                info.mountpoint.as_deref().unwrap_or("-"),
+                EXTERNAL_HINT
+            ),
+        }
+        .into()),
         other => Err(AppError::WrongState {
             expected: RuntimeState::Unlocked.as_str().to_owned(),
             actual: other.as_str().to_owned(),

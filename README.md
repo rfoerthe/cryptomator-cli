@@ -230,10 +230,12 @@ format 8 config over their BASE32 names would make the vault unmigratable and un
 first, restore afterwards. A format 7 vault has no `m/` and shares its layout with format 8, so a
 restore on one is fine — it does the 7 → 8 step's job with new key files.
 
-`crypto` checks that *its own* daemon is not serving the vault, and nothing else: a vault the
-**Cryptomator desktop app** has unlocked looks `LOCKED` here. `restore` therefore prints a warning
-to stderr when the app answers on its IPC socket (see [Settings file](#settings-file)); lock the
-vault in the app before restoring its key files.
+`crypto` checks that its own daemon is not serving the vault and that no other application has it
+mounted where `crypto` can see it (`UNLOCKED_EXTERNAL`, see
+[Watching an unlocked vault](#watching-an-unlocked-vault)). A vault the **Cryptomator desktop app**
+mounted anywhere else still looks `LOCKED` here, so `restore` also prints a warning to stderr when
+the app answers on its IPC socket (see [Settings file](#settings-file)); lock the vault in the app
+before restoring its key files.
 
 ## Limits on the masterkey file
 
@@ -606,14 +608,26 @@ request, so it works for locked, unlocked and crashed vaults alike:
     crypto status Secret --json                # one object: id, displayName, path, state,
                                                # mountpoint, mounter, pid, readOnly
 
-The states are `LOCKED`, `UNLOCKED`, `STALE_MOUNT`, `MISSING`, `VAULT_CONFIG_MISSING`,
-`ALL_MISSING`, `NEEDS_MIGRATION` and `ERROR`. `crypto vault list` and `crypto vault info` read the
+The states are `LOCKED`, `UNLOCKED`, `STALE_MOUNT`, `UNLOCKED_EXTERNAL`, `MISSING`,
+`VAULT_CONFIG_MISSING`, `ALL_MISSING`, `NEEDS_MIGRATION` and `ERROR`. `crypto vault list` and `crypto vault info` read the
 same registry and report the same state for the same vault, so no two commands disagree about
 whether a vault is unlocked. Naming a vault that is not registered is exit `3`; without an argument
 the output is an array, with one it is that vault's object.
 
+`UNLOCKED_EXTERNAL` is a vault **another application — the Cryptomator desktop app —** has
+unlocked. The app writes no state files, so `crypto` recognises it by a volume in the mount table
+at the place the app mounts that vault: the vault's own `mountPoint`, or else
+`<mountPointsDir>/<name>` under the app's default directory
+(`~/Library/Application Support/Cryptomator/mnt` on macOS, `~/.local/share/Cryptomator/mnt` on
+Linux — `cli.json`'s `mountPointsDir` plays no part, the app never reads it). `MOUNTPOINT` shows
+that path; `mounter`, `pid` and `readOnly` stay empty. Such a vault is refused like an unlocked one
+by `unlock`, `fs`, `health`, `migrate`, `password change` and the `recovery-key` commands (exit
+`5`), and `crypto lock` refuses it too — lock it in the app. `lock --all` skips it. A vault the app
+mounted anywhere else — over WebDAV, or at a path the mount service chose itself — is not
+recognised and still looks `LOCKED`.
+
 `crypto vault info` shows the mount point under `mountedAt` — where the volume *is* mounted, `-`
-unless a daemon is serving the vault. Do not confuse it with `mountPoint` further down, which is
+unless a daemon or another application is serving the vault. Do not confuse it with `mountPoint` further down, which is
 the mount point `crypto vault set --mount-point` configured and stays `-` for a vault that takes
 the default under `mountPointsDir`. The other runtime values of an unlocked vault — `mounter`,
 `pid` and `readOnly` — are `crypto status --json`'s; `mountService`, `usesReadOnlyMode` and `port`
@@ -707,8 +721,9 @@ if you can):
 
 The vault must be `LOCKED` (exit `5` otherwise), and a vault of an older format is sent to
 `crypto migrate` rather than checked. "Locked" here means locked *as far as `crypto` can tell*: the
-runtime check only asks `crypto`'s own daemon, and a vault the **Cryptomator desktop app** has
-unlocked and mounted is indistinguishable from a locked one on disk. `--fix` moves, renames and
+runtime check asks `crypto`'s own daemon and recognises a vault the **Cryptomator desktop app**
+mounted at its usual mount point (`UNLOCKED_EXTERNAL`), but one the app mounted anywhere else is
+indistinguishable from a locked one on disk. `--fix` moves, renames and
 deletes nodes, so it prints a warning to stderr when the desktop app answers on its IPC socket (see
 [Settings file](#settings-file)) — lock the vault there first. A run without `--fix` only reads and
 stays silent.
@@ -806,8 +821,9 @@ While it works, the migration probes the storage by creating and deleting `<vaul
 created it. A `c/` directory of your own in the vault root will be gone afterwards. `--dry-run`
 never probes and never deletes anything.
 
-Like `crypto health --fix`, `crypto migrate` only knows about `crypto`'s own daemon. A vault the
-**Cryptomator desktop app** has unlocked looks `LOCKED` here, so the command warns on stderr when
+Like `crypto health --fix`, `crypto migrate` refuses a vault that is `UNLOCKED` or
+`UNLOCKED_EXTERNAL`, but a vault the **Cryptomator desktop app** mounted at a place `crypto` does
+not recognise looks `LOCKED` here, so the command warns on stderr when
 the app answers on its IPC socket (see [Settings file](#settings-file)); `--dry-run` writes nothing
 and stays silent.
 
@@ -850,8 +866,8 @@ deliberately does **not** fall back to `$CRYPTO_PASSWORD` for the *new* password
 the current one, and silently reusing it would keep the old password.
 
 `password change` and `recovery-key show` / `recovery-key reset-password` need the vault to be
-`LOCKED` in the same sense `crypto fs` does (exit `5` otherwise): a vault a daemon is serving, or one
-a crashed daemon left mounted, holds a live key that rewriting the masterkey file would invalidate.
+`LOCKED` in the same sense `crypto fs` does (exit `5` otherwise): a vault a daemon is serving, one
+a crashed daemon left mounted, or one the desktop app has mounted (`UNLOCKED_EXTERNAL`) holds a live key that rewriting the masterkey file would invalidate.
 `crypto lock` — with `--force` for the volume a crashed daemon left behind — is the way out.
 `recovery-key validate` takes no vault and is unaffected.
 
@@ -1009,8 +1025,9 @@ nobody listening — what a crashed app leaves behind — does not count as runn
 
 The same probe carries a second, larger warning: `crypto health --fix`, `crypto migrate` and
 `crypto recovery-key restore` rewrite the *contents* of a vault, and the automatic "is anybody
-serving this vault?" check only asks `crypto`'s own daemon. A vault the desktop app has unlocked
-and mounted looks `LOCKED` on disk, so those three commands say **lock this vault in the app
+serving this vault?" check only recognises the desktop app's mount at its usual mount point
+(`UNLOCKED_EXTERNAL`). A vault the app mounted elsewhere looks `LOCKED` on disk, so those three
+commands say **lock this vault in the app
 first** when it answers.
 A `settings.json` that cannot be parsed is reported as an error — unlike the desktop app, `crypto`
 never silently replaces it.

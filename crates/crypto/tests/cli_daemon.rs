@@ -853,6 +853,51 @@ fn a_space_separated_mount_option_is_a_usage_error() {
         .code(2);
 }
 
+/// A vault the Cryptomator desktop app unlocked: no state files, only a volume at
+/// `<the app's mountPointsDir>/<name>`. A symlink to `/` stands in for that volume, since `/` is in
+/// every mount table and the lookup compares canonical paths.
+#[test]
+fn a_vault_the_desktop_app_mounted_is_unlocked_external_and_refused() {
+    let fx = Fixture::new("d");
+    let desktop_mnt = if cfg!(target_os = "macos") {
+        fx.path("Library/Application Support/Cryptomator/mnt")
+    } else {
+        fx.path(".local/share/Cryptomator/mnt")
+    };
+    std::fs::create_dir_all(&desktop_mnt).unwrap();
+    std::os::unix::fs::symlink("/", desktop_mnt.join("d")).unwrap();
+    let mountpoint = desktop_mnt.join("d").to_string_lossy().into_owned();
+
+    let status = json_out(&fx, &["--json", "status", "d"]);
+    assert_eq!(status["state"], "UNLOCKED_EXTERNAL", "{status}");
+    assert_eq!(status["mountpoint"], mountpoint.as_str());
+    let info = json_out(&fx, &["--json", "vault", "info", "d"]);
+    assert_eq!(info["state"], "UNLOCKED_EXTERNAL", "{info}");
+    assert_eq!(info["mountedAt"], mountpoint.as_str());
+
+    for args in [
+        &["unlock", "d", "--mounter", "null"][..],
+        &["lock", "d"][..],
+    ] {
+        let stderr = fx
+            .crypto_daemon(args)
+            .assert()
+            .code(5)
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(stderr.contains("UNLOCKED_EXTERNAL"), "{args:?}: {stderr}");
+        assert!(stderr.contains("desktop app"), "{args:?}: {stderr}");
+    }
+    assert!(!fx.state_file(".sock").exists(), "no daemon was started");
+    // Not ours to take down, so `--all` leaves it alone rather than failing on it.
+    fx.crypto_daemon(&["lock", "--all"])
+        .assert()
+        .success()
+        .stdout("nothing to lock\n");
+}
+
 #[test]
 fn lock_all_with_nothing_unlocked_prints_nothing_to_lock() {
     let fx = Fixture::new("v");

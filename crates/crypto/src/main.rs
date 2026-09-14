@@ -217,9 +217,10 @@ fn writes_settings(command: &Command) -> bool {
 /// This is a different hazard from [`writes_settings`], and a much larger one: `settings.json` is
 /// a list that can be retyped, while `health --fix` moves and deletes nodes, `migrate` renames
 /// every file in the vault and `recovery-key restore` swaps the masterkey. All three refuse a
-/// vault *`crypto`'s own daemon* is serving (`commands::vault_in_state`), but a vault the desktop
-/// app has unlocked looks LOCKED from here -- its key files are untouched -- so the warning is the
-/// only thing standing between the user and a repair applied to a live mount.
+/// vault *`crypto`'s own daemon* is serving or the desktop app has mounted at its usual mount point
+/// (`commands::vault_in_state`), but a vault the app mounted anywhere else looks LOCKED from here
+/// -- its key files are untouched -- so the warning is the only thing standing between the user
+/// and a repair applied to a live mount.
 ///
 /// `password change` and `recovery-key reset-password` are deliberately left out: they need a
 /// LOCKED vault and rewrite only the masterkey file, which a running mount does not re-read. The

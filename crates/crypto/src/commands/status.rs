@@ -2,7 +2,8 @@
 //!
 //! Everything shown here comes from `settings.json` and the state directory, through
 //! [`VaultRegistry`](cryptomator_app::VaultRegistry): the registry probes a daemon's socket to
-//! tell an unlocked vault from a leftover, but no request is ever sent. So `status` answers for
+//! tell an unlocked vault from a leftover, and the mount table to spot a vault another application
+//! unlocked, but no request is ever sent. So `status` answers for
 //! locked, unlocked, crashed and missing vaults alike, and never blocks on a daemon.
 use crate::cli::StatusArgs;
 use crate::commands::Ctx;

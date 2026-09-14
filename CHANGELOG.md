@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Fixed: `crypto status`, `crypto vault list` and `crypto vault info` called a vault the
+  Cryptomator desktop app had unlocked `LOCKED`. The registry only knew `crypto`'s own daemons, and
+  the app writes no state files, so its FUSE-T mount under
+  `~/Library/Application Support/Cryptomator/mnt/<name>` went unnoticed -- and `crypto unlock` would
+  have mounted the same vault a second time.
+- Added: the runtime state `UNLOCKED_EXTERNAL`. A vault that is `LOCKED` on disk but has a volume in
+  the mount table at its configured `mountPoint`, or at `<the app's mountPointsDir>/<name>` without
+  one, is reported as unlocked by another application, with that path as its mount point (`mountedAt`
+  in `vault info`). `unlock`, `fs`, `health`, `migrate`, `password change` and the `recovery-key`
+  commands refuse it like an unlocked vault, and `crypto lock` refuses it with the hint to lock it in
+  the app (exit `5` for all of them); `lock --all` skips it. `cli.json`'s `mountPointsDir` plays no
+  part -- the app never reads it. A vault the app mounted over WebDAV or at a path the mount service
+  chose itself is still not recognised.
 - Packaging: `packaging/homebrew/crypto.rb` carries the four real sha256 values of the 0.1.1
   archives instead of the sixty-four-zero placeholders, so the formula installs. Back-ported from
   the release asset as `docs/release.md` step 3 describes.

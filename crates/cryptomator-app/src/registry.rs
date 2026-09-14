@@ -9,7 +9,12 @@
 //! 2. no socket, but the pid is alive ⇒ `UNLOCKED` (the daemon is still starting up);
 //! 3. neither, but the mount point is still in the mount table ⇒ `STALE_MOUNT` (the daemon died
 //!    and left the volume behind; `crypto lock --force` takes it down);
-//! 4. otherwise the files are leftovers: they are removed and the vault directory decides.
+//! 4. otherwise the files are leftovers: they are removed and the vault directory decides;
+//! 5. a vault the directory calls `LOCKED` that has a volume in the mount table at the mount point
+//!    it is configured for ⇒ `UNLOCKED_EXTERNAL`. The Cryptomator desktop app writes no state
+//!    files, so this is the only trace a vault it unlocked leaves: the vault's own `mountPoint`, or
+//!    `<the app's mountPointsDir>/<mountName>` without one. A vault the app mounts anywhere else
+//!    (WebDAV, a system-chosen path) stays `LOCKED` here.
 use crate::error::{AppError, Result};
 use crate::settings::{resolve_vault_index, SettingsStore, VaultSettingsJson};
 use crate::state_dir::{process_alive, RunInfo, StateDir};
@@ -17,10 +22,10 @@ use cryptomator_core::{determine_vault_state, VaultState};
 use cryptomator_mount::mounttab::is_mountpoint;
 use serde::Serialize;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// A vault's state as the CLI reports it: [`VaultState`] plus the two states only a running
-/// daemon can produce.
+/// A vault's state as the CLI reports it: [`VaultState`] plus the states only a mounted volume can
+/// produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RuntimeState {
@@ -30,6 +35,10 @@ pub enum RuntimeState {
     Unlocked,
     /// The daemon is gone but its volume is still mounted.
     StaleMount,
+    /// No daemon of `crypto` serves the vault, but a volume is mounted where the vault is
+    /// configured to be mounted: another application -- the Cryptomator desktop app -- has
+    /// unlocked it.
+    UnlockedExternal,
     /// The path is not a vault directory (or does not exist).
     Missing,
     /// `vault.cryptomator` is gone but a masterkey file is there.
@@ -49,6 +58,7 @@ impl RuntimeState {
             Self::Locked => "LOCKED",
             Self::Unlocked => "UNLOCKED",
             Self::StaleMount => "STALE_MOUNT",
+            Self::UnlockedExternal => "UNLOCKED_EXTERNAL",
             Self::Missing => "MISSING",
             Self::VaultConfigMissing => "VAULT_CONFIG_MISSING",
             Self::AllMissing => "ALL_MISSING",
@@ -93,7 +103,8 @@ pub struct VaultInfo {
     pub path: Option<String>,
     /// The state, see [`RuntimeState`].
     pub state: RuntimeState,
-    /// Where the volume is mounted (only when a daemon is running or left a mount behind).
+    /// Where the volume is mounted (only when a daemon is running or left a mount behind, or
+    /// another application has the vault mounted).
     pub mountpoint: Option<String>,
     /// The Java class name of the mount service in use.
     pub mounter: Option<String>,
@@ -108,12 +119,30 @@ pub struct VaultInfo {
 pub struct VaultRegistry {
     store: SettingsStore,
     state_dir: StateDir,
+    /// Where the desktop app mounts a vault that has no mount point of its own, see
+    /// [`VaultRegistry::with_desktop_mount_points_dir`].
+    desktop_mount_points_dir: Option<PathBuf>,
 }
 
 impl VaultRegistry {
     /// The registry over `store`'s vaults and the daemons in `state_dir`.
     pub fn new(store: SettingsStore, state_dir: StateDir) -> Self {
-        Self { store, state_dir }
+        Self {
+            store,
+            state_dir,
+            desktop_mount_points_dir: None,
+        }
+    }
+
+    /// The directory the desktop app mounts a vault under when the vault names no mount point
+    /// (`Environment.getMountPointsDir`), so that a vault the app unlocked is reported as
+    /// [`RuntimeState::UnlockedExternal`]. `None` looks only at the vault's own `mountPoint`.
+    ///
+    /// This is the platform default and not `cli.json`'s `mountPointsDir`: the app never reads
+    /// that file, and a volume `crypto` mounted there has a run info and is found by it.
+    pub fn with_desktop_mount_points_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.desktop_mount_points_dir = dir;
+        self
     }
 
     /// The settings the registry reads.
@@ -142,39 +171,38 @@ impl VaultRegistry {
     pub fn runtime_state(&self, vault_id: &str) -> Result<(RuntimeState, Option<RunInfo>)> {
         let settings = self.store.load()?;
         let vault = settings.directories.iter().find(|v| v.id == vault_id);
-        self.runtime_state_of(
-            vault_id,
-            vault.and_then(VaultSettingsJson::path_buf).as_deref(),
-        )
+        let observed = self.observe(vault_id, vault)?;
+        Ok((observed.state, observed.run_info))
     }
 
-    /// [`VaultRegistry::runtime_state`] for a vault that has already been looked up; `path` is the
-    /// vault directory from `settings.json`, if it has one.
+    /// [`VaultRegistry::runtime_state`] for a vault that has already been looked up; `vault` is
+    /// its entry in `settings.json`, if it has one.
     ///
     /// # Errors
     /// [`StateDir::validate`]: everything below reads the state files, connects to the socket and
     /// deletes leftovers, so a state directory that is not ours is refused here rather than
     /// trusted -- see that method for what a foreign one could otherwise claim.
-    fn runtime_state_of(
-        &self,
-        vault_id: &str,
-        path: Option<&Path>,
-    ) -> Result<(RuntimeState, Option<RunInfo>)> {
+    fn observe(&self, vault_id: &str, vault: Option<&VaultSettingsJson>) -> Result<Observed> {
         self.state_dir.validate()?;
         let files = self.state_dir.files(vault_id);
         let info = files.read_info();
+        let daemon = |state| Observed {
+            state,
+            mountpoint: info.as_ref().and_then(|i| i.mountpoint.clone()),
+            run_info: info.clone(),
+        };
         // A socket file that nobody listens on is a leftover; only a successful connect proves
         // that a daemon is there.
         if files.socket.exists() && UnixStream::connect(&files.socket).is_ok() {
-            return Ok((RuntimeState::Unlocked, info));
+            return Ok(daemon(RuntimeState::Unlocked));
         }
         // Between fork and `bind` there is no socket yet, but there is a pid file.
         if files.read_pid().is_some_and(process_alive) {
-            return Ok((RuntimeState::Unlocked, info));
+            return Ok(daemon(RuntimeState::Unlocked));
         }
         if let Some(mountpoint) = info.as_ref().and_then(|i| i.mountpoint.as_deref()) {
             if is_local_path(mountpoint) && is_mountpoint(Path::new(mountpoint)) {
-                return Ok((RuntimeState::StaleMount, info));
+                return Ok(daemon(RuntimeState::StaleMount));
             }
         }
         // `files.info.exists()`, not `info.is_some()`: a corrupt `<id>.json` cannot be parsed but
@@ -186,26 +214,49 @@ impl VaultRegistry {
                 log::warn!("cannot remove the state files of vault {vault_id}: {e}");
             }
         }
-        let Some(path) = path else {
-            return Ok((RuntimeState::Missing, None));
+        let Some((vault, path)) = vault.and_then(|v| v.path_buf().map(|p| (v, p))) else {
+            return Ok(Observed::on_disk(RuntimeState::Missing));
         };
-        Ok(match determine_vault_state(path) {
-            Ok(state) => (state.into(), None),
+        let state = match determine_vault_state(&path) {
+            Ok(state) => RuntimeState::from(state),
             Err(e) => {
                 log::debug!("cannot determine the state of {}: {e}", path.display());
-                (RuntimeState::Error, None)
+                RuntimeState::Error
             }
-        })
+        };
+        // Only a vault that could be unlocked at all can have been unlocked by somebody else; the
+        // mount table is not consulted for a missing or outdated one.
+        if state == RuntimeState::Locked {
+            if let Some(mountpoint) = self.external_mountpoint(vault) {
+                return Ok(Observed {
+                    state: RuntimeState::UnlockedExternal,
+                    run_info: None,
+                    mountpoint: Some(mountpoint.to_string_lossy().into_owned()),
+                });
+            }
+        }
+        Ok(Observed::on_disk(state))
     }
 
-    /// [`VaultRegistry::runtime_state`] for a settings entry the caller has already loaded, so a
-    /// command that is holding `settings.json` open does not read it a second time just to learn
-    /// whether a daemon is serving the vault.
+    /// The mount point another application has `vault` mounted at, if any: its configured
+    /// `mountPoint`, then `<desktop mountPointsDir>/<mountName>`, whichever is in the mount table.
     ///
-    /// # Errors
-    /// Anything [`runtime_state_of`](Self::runtime_state_of) reports.
-    pub fn state_of(&self, vault: &VaultSettingsJson) -> Result<(RuntimeState, Option<RunInfo>)> {
-        self.runtime_state_of(&vault.id, vault.path_buf().as_deref())
+    /// A path that is not a directory is not looked up -- a mount point always is one, and on
+    /// macOS every lookup runs `mount(8)`.
+    fn external_mountpoint(&self, vault: &VaultSettingsJson) -> Option<PathBuf> {
+        let configured = vault
+            .mount_point
+            .as_deref()
+            .filter(|p| is_local_path(p))
+            .map(PathBuf::from);
+        let default = self
+            .desktop_mount_points_dir
+            .as_ref()
+            .map(|dir| dir.join(vault.mount_name()));
+        configured
+            .into_iter()
+            .chain(default)
+            .find(|candidate| candidate.is_dir() && is_mountpoint(candidate))
     }
 
     /// Every vault in `settings.json`, in the order the file lists them.
@@ -233,20 +284,25 @@ impl VaultRegistry {
         self.info_of(&settings.directories[index])
     }
 
-    /// The settings entry plus its runtime state.
+    /// The settings entry plus its runtime state, for an entry the caller has already loaded -- a
+    /// command that is holding `settings.json` open does not read it a second time just to learn
+    /// whether the vault is unlocked.
     ///
     /// # Errors
-    /// Anything [`runtime_state_of`](Self::runtime_state_of) reports.
-    fn info_of(&self, vault: &VaultSettingsJson) -> Result<VaultInfo> {
-        let path = vault.path_buf();
-        let (state, info) = self.runtime_state_of(&vault.id, path.as_deref())?;
-        let running = info.filter(|_| state.is_mounted());
+    /// Anything [`observe`](Self::observe) reports.
+    pub fn info_of(&self, vault: &VaultSettingsJson) -> Result<VaultInfo> {
+        let Observed {
+            state,
+            run_info,
+            mountpoint,
+        } = self.observe(&vault.id, Some(vault))?;
+        let running = run_info.filter(|_| state.is_mounted());
         Ok(VaultInfo {
             id: vault.id.clone(),
             display_name: vault.display_name.clone(),
             path: vault.path.clone(),
             state,
-            mountpoint: running.as_ref().and_then(|i| i.mountpoint.clone()),
+            mountpoint,
             mounter: running.as_ref().map(|i| i.mounter.clone()),
             pid: running.as_ref().map(|i| i.pid),
             read_only: running.as_ref().map(|i| i.read_only),
@@ -275,19 +331,22 @@ impl VaultRegistry {
     /// mount out of the way.
     ///
     /// # Errors
-    /// [`AppError::WrongState`] when a daemon serves the vault or left a mount behind, plus
+    /// [`AppError::WrongState`] when a daemon serves the vault or left a mount behind, or another
+    /// application has it mounted, plus
     /// anything [`StateDir::validate`] reports.
     pub fn require_locked(&self, vault: &VaultSettingsJson) -> Result<()> {
-        let path = vault.path_buf();
-        let (state, info) = self.runtime_state_of(&vault.id, path.as_deref())?;
-        if !state.is_mounted() {
+        let observed = self.observe(&vault.id, Some(vault))?;
+        let state = observed.state;
+        if !state.is_mounted() && state != RuntimeState::UnlockedExternal {
             return Ok(());
         }
-        let where_ = info
-            .and_then(|i| i.mountpoint)
+        let where_ = observed
+            .mountpoint
             .map(|mp| format!(" (mounted at {mp})"))
             .unwrap_or_default();
-        let hint = if state == RuntimeState::StaleMount {
+        let hint = if state == RuntimeState::UnlockedExternal {
+            EXTERNAL_HINT.to_string()
+        } else if state == RuntimeState::StaleMount {
             format!(
                 " -- a previous daemon left the volume behind; take it down with \
                  `crypto lock {} --force`",
@@ -300,6 +359,34 @@ impl VaultRegistry {
             expected: VaultState::Locked.to_string(),
             actual: format!("{state}{where_}{hint}"),
         })
+    }
+}
+
+/// What [`VaultRegistry::require_locked`] and `crypto lock` add to a refusal of a vault another
+/// application has unlocked: `crypto` has no daemon to ask, and taking the volume down behind the
+/// application's back would leave it serving a vault that is gone.
+pub const EXTERNAL_HINT: &str =
+    " -- another application, such as the Cryptomator desktop app, has \
+     unlocked it; lock it there";
+
+/// What [`VaultRegistry::observe`] found out about one vault.
+struct Observed {
+    state: RuntimeState,
+    /// The daemon's run info, whatever the state.
+    run_info: Option<RunInfo>,
+    /// Where the volume is mounted: the run info's mount point, or the one another application
+    /// has mounted the vault at.
+    mountpoint: Option<String>,
+}
+
+impl Observed {
+    /// A state the vault directory decided, with no daemon and no volume.
+    fn on_disk(state: RuntimeState) -> Self {
+        Self {
+            state,
+            run_info: None,
+            mountpoint: None,
+        }
     }
 }
 
@@ -350,11 +437,23 @@ mod tests {
         store.save(&mut settings).expect("save settings");
         let state_dir = StateDir::at(dir.path().join("state"));
         state_dir.ensure().expect("ensure");
+        // Never the real `~/Library/Application Support/Cryptomator/mnt`: a vault named "V" the
+        // developer happens to have open in the desktop app must not change these tests.
+        let registry = VaultRegistry::new(store, state_dir)
+            .with_desktop_mount_points_dir(Some(dir.path().join("desktop-mnt")));
         Fixture {
             _dir: dir,
-            registry: VaultRegistry::new(store, state_dir),
+            registry,
             vault_path,
         }
+    }
+
+    /// Stores `mount_point` as vault "V"'s configured mount point.
+    fn set_mount_point(f: &Fixture, mount_point: &str) {
+        let store = f.registry.store();
+        let mut settings = store.load().expect("load settings");
+        settings.directories[0].mount_point = Some(mount_point.to_owned());
+        store.save(&mut settings).expect("save settings");
     }
 
     /// A state directory another local user planted: on the shared default locations the loser of
@@ -598,6 +697,69 @@ mod tests {
         );
     }
 
+    /// The Cryptomator desktop app writes no state files, so a vault it unlocked is only visible
+    /// as a volume at the mount point the vault is configured for. `/` stands in for that volume:
+    /// it is a mount point on every system this runs on.
+    #[test]
+    fn a_volume_at_the_configured_mount_point_without_a_daemon_is_unlocked_external() {
+        let f = fixture();
+        set_mount_point(&f, "/");
+
+        let (state, run_info) = f.registry.runtime_state("AAAAAAAAAAAA").expect("state");
+        assert_eq!(state, RuntimeState::UnlockedExternal);
+        assert!(run_info.is_none(), "nobody wrote a run info");
+
+        let info = f.registry.info("V").expect("info");
+        assert_eq!(info.state, RuntimeState::UnlockedExternal);
+        assert_eq!(info.mountpoint.as_deref(), Some("/"));
+        assert!(info.pid.is_none() && info.mounter.is_none() && info.read_only.is_none());
+
+        let settings = f.registry.store().load().expect("load");
+        let err = f
+            .registry
+            .require_locked(&settings.directories[0])
+            .expect_err("an unlock or an fs command must not touch a vault the app is serving");
+        assert!(matches!(err, AppError::WrongState { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("UNLOCKED_EXTERNAL"), "{message}");
+        assert!(message.contains("mounted at /"), "{message}");
+        assert!(message.contains("desktop app"), "{message}");
+    }
+
+    /// Without a configured mount point the desktop app mounts to
+    /// `<its mountPointsDir>/<mountName>`. A symlink to `/` makes that path resolve to a mount
+    /// point, the way the real volume would.
+    #[test]
+    fn a_volume_under_the_desktop_apps_mount_points_dir_is_unlocked_external() {
+        let f = fixture();
+        let desktop_mnt = f._dir.path().join("desktop-mnt");
+        std::fs::create_dir_all(&desktop_mnt).expect("desktop mnt");
+        std::os::unix::fs::symlink("/", desktop_mnt.join("V")).expect("symlink");
+
+        let info = f.registry.info("V").expect("info");
+        assert_eq!(info.state, RuntimeState::UnlockedExternal);
+        assert_eq!(
+            info.mountpoint.as_deref(),
+            Some(desktop_mnt.join("V").to_string_lossy().as_ref())
+        );
+    }
+
+    /// The directory alone is not a volume: the app leaves `mnt/<name>` behind (or the user made
+    /// it), and only the mount table can say whether something is mounted there.
+    #[test]
+    fn an_unmounted_mount_point_directory_leaves_the_vault_locked() {
+        let f = fixture();
+        let desktop_mnt = f._dir.path().join("desktop-mnt/V");
+        std::fs::create_dir_all(&desktop_mnt).expect("desktop mnt");
+        let configured = f._dir.path().join("configured");
+        std::fs::create_dir_all(&configured).expect("configured mount point");
+        set_mount_point(&f, &configured.to_string_lossy());
+
+        let info = f.registry.info("V").expect("info");
+        assert_eq!(info.state, RuntimeState::Locked);
+        assert!(info.mountpoint.is_none());
+    }
+
     #[test]
     fn runtime_states_carry_the_java_names() {
         assert_eq!(RuntimeState::StaleMount.as_str(), "STALE_MOUNT");
@@ -614,6 +776,11 @@ mod tests {
             "\"VAULT_CONFIG_MISSING\""
         );
         assert!(RuntimeState::Unlocked.is_mounted() && !RuntimeState::Locked.is_mounted());
+        assert_eq!(RuntimeState::UnlockedExternal.as_str(), "UNLOCKED_EXTERNAL");
+        assert!(
+            !RuntimeState::UnlockedExternal.is_mounted(),
+            "`is_mounted` means a volume `crypto` can take down itself"
+        );
         assert_eq!(RuntimeState::Error.to_string(), "ERROR");
     }
 }
